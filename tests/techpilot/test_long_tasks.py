@@ -104,6 +104,19 @@ def test_interruption_after_effect_start_requires_reconciliation_never_auto_retr
         _start_effect(store, "execute-migration")
 
 
+def test_explicitly_rejected_effect_is_not_recorded_as_completed(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+    store.plan_action("repair-task", action_id="write-fix", kind="tool_effect", effect_id="write-fix-v1")
+    _start_effect(store, "write-fix")
+
+    projection = store.fail_effect("repair-task", "write-fix", reason="Permission denied write_file: user rejected")
+
+    assert projection.completed_effect_ids == ()
+    assert projection.actions["write-fix"].status.value == "failed"
+    assert store.effect_disposition("repair-task", "write-fix") is EffectDisposition.BLOCKED_FAILED
+
+
 def test_restart_recovers_a_running_task_when_no_pause_event_was_durable(tmp_path):
     store = LongTaskStore.for_repository(tmp_path)
     _create(store, tmp_path)

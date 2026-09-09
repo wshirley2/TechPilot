@@ -28,6 +28,7 @@ from .extensions import (
     ToolAllowlist,
     ToolRequest,
 )
+from .long_task_workflow import LongTaskRecoveryRequired, LongTaskWorkflow, LongTaskWorkflowResult
 from .long_tasks import (
     EffectDisposition,
     LongTaskAction,
@@ -58,10 +59,13 @@ __all__ = [
     "LongTaskLease",
     "LongTaskLeaseError",
     "LongTaskProjection",
+    "LongTaskRecoveryRequired",
     "LongTaskStateError",
     "LongTaskStatus",
     "LongTaskStore",
     "LongTaskStoreError",
+    "LongTaskWorkflow",
+    "LongTaskWorkflowResult",
     "PayloadContract",
     "RoleActivation",
     "RoleHostConfiguration",

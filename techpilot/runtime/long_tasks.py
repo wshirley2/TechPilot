@@ -64,6 +64,7 @@ class EffectDisposition(str, Enum):
     BLOCKED_CANCELLED = "blocked_cancelled"
     BLOCKED_LIMIT = "blocked_limit"
     BLOCKED_DEPENDENCY = "blocked_dependency"
+    BLOCKED_FAILED = "blocked_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,6 +453,8 @@ class LongTaskStore:
             return EffectDisposition.SKIP_SUCCEEDED
         if action.status is LongTaskActionStatus.STARTED:
             return EffectDisposition.RECONCILE_REQUIRED
+        if action.status is LongTaskActionStatus.FAILED:
+            return EffectDisposition.BLOCKED_FAILED
         if projection.status is LongTaskStatus.CANCELLED:
             return EffectDisposition.BLOCKED_CANCELLED
         if projection.status is LongTaskStatus.LIMIT_REACHED:
@@ -492,6 +495,26 @@ class LongTaskStore:
             task_id=projection.task_id,
             event_type="effect_completed",
             payload={"action_id": action.action_id, "effect_id": action.effect_id, "result": result},
+        ))
+        return self.replay(projection.task_id)
+
+    def fail_effect(self, task_id: str, action_id: str, *, reason: str) -> LongTaskProjection:
+        """Record an explicitly rejected or blocked effect as not executed.
+
+        Unknown execution failures stay ``STARTED`` and require reconciliation;
+        only a policy result proving the effect did not start may use this path.
+        """
+
+        projection = self.replay(task_id)
+        action = self._action(projection, action_id)
+        if action.effect_id is None or action.status is not LongTaskActionStatus.STARTED:
+            raise LongTaskStateError("Only a durably started side effect can fail")
+        if not reason.strip():
+            raise ValueError("Effect failure reason cannot be empty")
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="effect_not_executed",
+            payload={"action_id": action.action_id, "effect_id": action.effect_id, "reason": reason},
         ))
         return self.replay(projection.task_id)
 
@@ -567,6 +590,13 @@ class LongTaskStore:
                 _required_string(payload, "action_id"),
                 LongTaskActionStatus.SUCCEEDED,
                 result=payload.get("result") if isinstance(payload.get("result"), str) else "",
+            )
+        elif event.event_type == "effect_not_executed":
+            self._replace_action(
+                projection,
+                _required_string(payload, "action_id"),
+                LongTaskActionStatus.FAILED,
+                result=payload.get("reason") if isinstance(payload.get("reason"), str) else "",
             )
         elif event.event_type == "task_paused":
             projection.status = LongTaskStatus.PAUSED
