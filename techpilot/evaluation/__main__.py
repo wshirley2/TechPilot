@@ -8,9 +8,15 @@ from pathlib import Path
 
 from .cases import (
     CORE_V0_SUITE,
+    LONG_TASK_OBSERVABILITY_V0_SUITE,
+    LONG_TASK_RUNTIME_SMOKE_SUITE,
+    LONG_TASK_RUNTIME_V0_SUITE,
     ROLE_RUNTIME_VALIDATION_SUITE,
     RUNNER_VALIDATION_SUITE,
     build_core_v0_cases,
+    build_long_task_observability_v0_cases,
+    build_long_task_runtime_smoke_cases,
+    build_long_task_runtime_v0_cases,
     build_role_runtime_validation_cases,
     build_runner_validation_cases,
 )
@@ -20,8 +26,14 @@ from .holdout import (
     default_holdout_report_path,
     holdout_case_set_metadata,
     inspect_holdout_case_schema,
+    inspect_long_task_holdout_design,
     run_holdout,
     write_holdout_summary,
+)
+from .long_task_holdout import (
+    default_long_task_holdout_report_path,
+    long_task_holdout_case_set_metadata,
+    run_long_task_holdout,
 )
 from .runner import ReplayRunner
 
@@ -31,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--suite",
         default=CORE_V0_SUITE,
-        choices=[CORE_V0_SUITE, RUNNER_VALIDATION_SUITE, ROLE_RUNTIME_VALIDATION_SUITE],
+        choices=[CORE_V0_SUITE, RUNNER_VALIDATION_SUITE, ROLE_RUNTIME_VALIDATION_SUITE, LONG_TASK_RUNTIME_SMOKE_SUITE, LONG_TASK_RUNTIME_V0_SUITE, LONG_TASK_OBSERVABILITY_V0_SUITE],
     )
     parser.add_argument("--output", type=Path, help="Write the structured result manifest to this JSON path.")
     parser.add_argument(
@@ -60,7 +72,64 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Print only JSONL case count and field names, never private case values.",
     )
+    parser.add_argument(
+        "--long-task-holdout-design-metadata",
+        type=Path,
+        help="Validate a private long-task design deck and print only its count, field names, and digest.",
+    )
+    parser.add_argument(
+        "--long-task-holdout-root",
+        type=Path,
+        help="Run a private long-task-holdout-v0 directory and print/write only a redacted summary.",
+    )
+    parser.add_argument(
+        "--long-task-holdout-case-set-metadata",
+        type=Path,
+        help="Print only count and digest for a private long-task-holdout-v0 manifest.",
+    )
     args = parser.parse_args(argv)
+    if args.long_task_holdout_design_metadata is not None:
+        if any((args.holdout_root, args.holdout_case_set_metadata, args.holdout_case_schema, args.long_task_holdout_root, args.long_task_holdout_case_set_metadata, args.baseline_v0, args.compare_baseline)):
+            parser.error("--long-task-holdout-design-metadata cannot be combined with another holdout or baseline option")
+        try:
+            metadata = inspect_long_task_holdout_design(args.long_task_holdout_design_metadata)
+        except HoldoutFormatError as error:
+            parser.error(str(error))
+        print(f"case_count: {metadata.case_count}")
+        print("case_fields: " + ", ".join(metadata.fields))
+        print(f"case_set_digest: {metadata.case_set_digest}")
+        print("status: design_only; convert to long-task-holdout-v0 before execution")
+        return 0
+    if args.long_task_holdout_case_set_metadata is not None:
+        if any((args.holdout_root, args.holdout_case_set_metadata, args.holdout_case_schema, args.long_task_holdout_root, args.baseline_v0, args.compare_baseline)):
+            parser.error("--long-task-holdout-case-set-metadata cannot be combined with another holdout or baseline option")
+        try:
+            count, digest = long_task_holdout_case_set_metadata(args.long_task_holdout_case_set_metadata)
+        except HoldoutFormatError as error:
+            parser.error(str(error))
+        print(f"case_count: {count}")
+        print(f"case_set_digest: {digest}")
+        return 0
+    if args.long_task_holdout_root is not None:
+        if args.baseline_v0 or args.compare_baseline is not None or args.holdout_root is not None:
+            parser.error("--long-task-holdout-root cannot be combined with another holdout or baseline option")
+        try:
+            summary = run_long_task_holdout(args.long_task_holdout_root)
+        except HoldoutFormatError as error:
+            parser.error(str(error))
+        output = args.output or default_long_task_holdout_report_path(args.long_task_holdout_root)
+        write_holdout_summary(summary, output)
+        print(f"{summary.suite}: {summary.passed}/{summary.total} passed; source_case_set_digest={summary.case_set_digest}")
+        print(f"replay_case_set_digest: {summary.replay_case_set_digest}")
+        print(f"categories: {json.dumps(summary.categories, ensure_ascii=False, sort_keys=True)}")
+        print("failed_case_ids: " + (", ".join(summary.failed_case_ids) if summary.failed_case_ids else "none"))
+        if summary.failure_kinds:
+            print(f"failure_kinds: {json.dumps(summary.failure_kinds, ensure_ascii=False, sort_keys=True)}")
+            print(f"failure_kind_by_case: {json.dumps(summary.failure_kind_by_case, ensure_ascii=False, sort_keys=True)}")
+        if summary.observed_by_case:
+            print(f"observed_by_case: {json.dumps(summary.observed_by_case, ensure_ascii=False, sort_keys=True)}")
+        print(f"summary: {output}")
+        return 0 if summary.passed == summary.total else 1
     if args.holdout_case_schema is not None:
         if args.holdout_root is not None or args.holdout_case_set_metadata is not None:
             parser.error("--holdout-case-schema cannot be combined with another holdout option")
@@ -103,6 +172,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.suite == CORE_V0_SUITE
         else build_role_runtime_validation_cases()
         if args.suite == ROLE_RUNTIME_VALIDATION_SUITE
+        else build_long_task_runtime_smoke_cases()
+        if args.suite == LONG_TASK_RUNTIME_SMOKE_SUITE
+        else build_long_task_runtime_v0_cases()
+        if args.suite == LONG_TASK_RUNTIME_V0_SUITE
+        else build_long_task_observability_v0_cases()
+        if args.suite == LONG_TASK_OBSERVABILITY_V0_SUITE
         else build_runner_validation_cases()
     )
     report = ReplayRunner().run(cases)

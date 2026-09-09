@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,20 @@ from .runner import ReplayRunner
 
 HOLDOUT_SCHEMA_VERSION = 1
 HOLDOUT_SUITE = "holdout-v0"
+LONG_TASK_HOLDOUT_DESIGN_FORMAT = "long-task-holdout-design-v0"
+LONG_TASK_HOLDOUT_DESIGN_FIELDS = (
+    "assertions",
+    "category",
+    "expected_support",
+    "id",
+    "initial_state",
+    "interruption_point",
+    "provider_script",
+    "recovery_action",
+    "runtime_requirement",
+    "title",
+    "why_independent",
+)
 
 
 class HoldoutFormatError(ValueError):
@@ -76,6 +90,10 @@ class HoldoutSummary:
     total: int
     categories: dict[str, dict[str, int]]
     failed_case_ids: tuple[str, ...]
+    replay_case_set_digest: str | None = None
+    failure_kinds: dict[str, int] = field(default_factory=dict)
+    failure_kind_by_case: dict[str, str] = field(default_factory=dict)
+    observed_by_case: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_report(cls, report: ReplayReport) -> HoldoutSummary:
@@ -91,7 +109,7 @@ class HoldoutSummary:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema_version": HOLDOUT_SCHEMA_VERSION,
             "kind": "holdout-summary-v0",
             "suite": self.suite,
@@ -103,6 +121,15 @@ class HoldoutSummary:
             "categories": self.categories,
             "failed_case_ids": list(self.failed_case_ids),
         }
+        if self.replay_case_set_digest is not None:
+            payload["replay_case_set_digest"] = self.replay_case_set_digest
+        if self.failure_kinds:
+            payload["failure_kinds"] = self.failure_kinds
+        if self.failure_kind_by_case:
+            payload["failure_kind_by_case"] = self.failure_kind_by_case
+        if self.observed_by_case:
+            payload["observed_by_case"] = self.observed_by_case
+        return payload
 
 
 @dataclass(frozen=True)
@@ -110,6 +137,20 @@ class HoldoutCaseSchema:
     """Field names and count only; no private case values leave the local process."""
 
     case_count: int
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LongTaskHoldoutDesignMetadata:
+    """Non-sensitive identity facts for an independently-authored design deck.
+
+    This is deliberately not a Replay report.  A design deck describes intended
+    scenarios, but becomes executable only after it adopts the separate,
+    versioned long-task execution contract.
+    """
+
+    case_count: int
+    case_set_digest: str
     fields: tuple[str, ...]
 
 
@@ -183,6 +224,33 @@ def inspect_holdout_case_schema(root: Path) -> HoldoutCaseSchema:
     return HoldoutCaseSchema(case_count=count, fields=tuple(sorted(fields)))
 
 
+def inspect_long_task_holdout_design(root: Path) -> LongTaskHoldoutDesignMetadata:
+    """Validate a private long-task design deck without exposing case values.
+
+    Unlike ``holdout-v0``, this format is not routed to the public Replay
+    runner.  Keeping that distinction explicit prevents a narrative design
+    card from being silently treated as a passing Runtime test.
+    """
+
+    payloads = _load_jsonl_payloads(root / "cases.jsonl")
+    ids: set[str] = set()
+    for index, payload in enumerate(payloads, start=1):
+        fields = tuple(sorted(payload))
+        if fields != LONG_TASK_HOLDOUT_DESIGN_FIELDS:
+            raise HoldoutFormatError(f"invalid long-task holdout design case at line {index}")
+        case_id = payload["id"]
+        if not isinstance(case_id, str) or not case_id or case_id != case_id.lower() or case_id in ids:
+            raise HoldoutFormatError(f"invalid long-task holdout design case at line {index}")
+        ids.add(case_id)
+        if any(not _has_value(payload[field]) for field in LONG_TASK_HOLDOUT_DESIGN_FIELDS if field != "id"):
+            raise HoldoutFormatError(f"invalid long-task holdout design case at line {index}")
+    return LongTaskHoldoutDesignMetadata(
+        case_count=len(payloads),
+        case_set_digest=_payload_set_digest(payloads),
+        fields=LONG_TASK_HOLDOUT_DESIGN_FIELDS,
+    )
+
+
 def default_holdout_report_path(root: Path) -> Path:
     """Create a non-overwriting summary filename under the private report directory."""
 
@@ -220,6 +288,27 @@ def _load_cases(path: Path) -> tuple[ReplayCase, ...]:
     return tuple(cases)
 
 
+def _load_jsonl_payloads(path: Path) -> tuple[dict[str, Any], ...]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise HoldoutFormatError("could not load holdout cases.jsonl") from error
+    payloads: list[dict[str, Any]] = []
+    for index, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise HoldoutFormatError(f"invalid JSON in holdout case at line {index}") from error
+        if not isinstance(payload, dict):
+            raise HoldoutFormatError(f"holdout case at line {index} is not a JSON object")
+        payloads.append(payload)
+    if not payloads:
+        raise HoldoutFormatError("holdout cases.jsonl must contain at least one case")
+    return tuple(payloads)
+
+
 def _case_from_dict(payload: object) -> ReplayCase:
     if not isinstance(payload, dict):
         raise HoldoutFormatError("holdout case must be a JSON object")
@@ -248,3 +337,18 @@ def _mapping(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HoldoutFormatError("holdout case input and expected values must be JSON objects")
     return value
+
+
+def _has_value(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return value is not None
+
+
+def _payload_set_digest(payloads: tuple[dict[str, Any], ...]) -> str:
+    import hashlib
+
+    encoded = json.dumps(payloads, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

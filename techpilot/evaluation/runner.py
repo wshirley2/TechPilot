@@ -5,8 +5,13 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +19,19 @@ from techpilot.engine.agent import Agent
 from techpilot.engine.context import ContextManager
 from techpilot.engine.events import CallbackEventSink, RuntimeEvent, RuntimeEventType
 from techpilot.engine.llm import LLMResponse, ToolCall
+from techpilot.engine.permissions import PermissionDecision
 from techpilot.engine.tool_execution import ToolConcurrency, ToolEffect, ToolExecutionDescription, ToolExecutionPlan
+from techpilot.engine.tools import BashTool, ReadFileTool, WriteFileTool
 from techpilot.engine.tools.base import Tool
-from techpilot.runtime import RuntimeBootstrap, RuntimeBootstrapInput
+from techpilot.runtime import (
+    LongTaskBudget,
+    LongTaskRecoveryRequired,
+    LongTaskStateError,
+    LongTaskStatus,
+    LongTaskWorkflow,
+    RuntimeBootstrap,
+    RuntimeBootstrapInput,
+)
 from techpilot.runtime.extensions import (
     PayloadContract,
     RoleHostConfiguration,
@@ -33,6 +48,15 @@ from techpilot.runtime.sessions import SessionEventSink, SessionStore
 from .contracts import ReplayCase, ReplayOutcome, ReplayReport, ReplayTrack
 
 
+class _LongTaskHoldoutAssertionFailure(AssertionError):
+    """A private holdout mismatch with deliberately non-sensitive observations."""
+
+    def __init__(self, codes: tuple[str, ...], observed: Mapping[str, Any]) -> None:
+        super().__init__("private long-task assertions did not match")
+        self.codes = codes
+        self.observed = dict(observed)
+
+
 class ReplayRunner:
     """Run structured cases against the current Runtime implementation."""
 
@@ -47,6 +71,9 @@ class ReplayRunner:
             "session-projection": self._run_session_projection,
             "role-skill-activation": self._run_role_skill_activation,
             "role-runtime-lifecycle": self._run_role_runtime_lifecycle,
+            "long-task-runtime": self._run_long_task_runtime,
+            "long-task-observability": self._run_long_task_observability,
+            "long-task-holdout": self._run_long_task_holdout,
             "instruction-carry": self._run_instruction_carry,
         }
 
@@ -110,9 +137,31 @@ class ReplayRunner:
         try:
             root.mkdir(parents=True, exist_ok=True)
             observed = handler(case, root)
+        except _LongTaskHoldoutAssertionFailure as error:
+            return ReplayOutcome(
+                case.id,
+                case.category,
+                False,
+                "long-task-holdout:assertion_mismatch",
+                observed={"mismatch_codes": list(error.codes)} | error.observed,
+            )
         except (AssertionError, KeyError, TypeError, ValueError) as error:
+            if case.scenario == "long-task-holdout":
+                return ReplayOutcome(
+                    case.id,
+                    case.category,
+                    False,
+                    f"long-task-holdout:{_long_task_holdout_failure_code(error)}",
+                )
             return ReplayOutcome(case.id, case.category, False, str(error))
         except Exception as error:  # pragma: no cover - defensive report boundary
+            if case.scenario == "long-task-holdout":
+                return ReplayOutcome(
+                    case.id,
+                    case.category,
+                    False,
+                    f"long-task-holdout:runtime_{type(error).__name__.lower()}",
+                )
             return ReplayOutcome(case.id, case.category, False, f"{type(error).__name__}: {error}")
         return ReplayOutcome(case.id, case.category, True, observed=observed)
 
@@ -399,6 +448,624 @@ class ReplayRunner:
         return {"outcome": mode}
 
     @staticmethod
+    def _run_long_task_runtime(case: ReplayCase, root: Path) -> Mapping[str, Any]:
+        """Exercise fixed-provider interruption recovery through the real Runtime."""
+
+        mode = _string(case.input, "mode")
+        _expect(mode == _string(case.expected, "outcome"), "long-task case outcome mismatch")
+        if mode in {"normal-write", "checkpoint-cursor"}:
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([_write_response(), LLMResponse(content="done")]))
+            result = LongTaskWorkflow(runtime, task_id="long-task", goal="write deterministic result").run_turn("write result")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "normal long Task did not succeed")
+            _expect(counter.calls == 1, "normal write did not execute exactly once")
+            _expect((root / "result.txt").read_text(encoding="utf-8") == "durable result\n", "write result mismatch")
+            if mode == "checkpoint-cursor":
+                session = runtime.session_store.replay(runtime.agent.session_id)
+                _expect(result.checkpoint.session_event_cursor == session.events[-1].event_id, "checkpoint cursor is not the latest Session fact")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "normal-read":
+            (root / "evidence.txt").write_text("durable evidence\n", encoding="utf-8")
+            response = LLMResponse(tool_calls=[ToolCall("read-1", "read_file", {"file_path": "evidence.txt"})])
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([response, LLMResponse(content="read done")]))
+            result = LongTaskWorkflow(runtime, task_id="long-task", goal="read deterministic evidence").run_turn("read evidence")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "read-only long Task did not succeed")
+            _expect(counter.calls == 1 and result.task.completed_effect_ids == (), "read created an effect ledger entry")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "normal-command":
+            response = LLMResponse(tool_calls=[ToolCall("command-1", "bash", {"command": "python -c \"print('ok')\""})])
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([response, LLMResponse(content="command done")]))
+            result = LongTaskWorkflow(runtime, task_id="long-task", goal="run deterministic command").run_turn("run command")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "command long Task did not succeed")
+            _expect(counter.calls == 1 and len(result.task.completed_effect_ids) == 1, "command effect ledger mismatch")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "permission-denied":
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([_write_response()]), allow=False)
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="write deterministic result")
+            try:
+                workflow.run_turn("write result")
+            except LongTaskStateError:
+                pass
+            else:
+                raise AssertionError("rejected effect unexpectedly completed the Task")
+            task = workflow.store.replay("long-task")
+            _expect(task.actions["tool-write-1"].status.value == "failed", "rejected effect was not recorded as not executed")
+            _expect(not (root / "result.txt").exists(), "rejected write changed the repository")
+            _expect(counter.calls == 1, "permission path did not reach the normal executor boundary")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "policy-blocked":
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([_write_response(file_path="../outside.txt")]))
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="blocked deterministic write")
+            try:
+                workflow.run_turn("write outside")
+            except LongTaskStateError:
+                pass
+            else:
+                raise AssertionError("policy-blocked effect unexpectedly completed the Task")
+            task = workflow.store.replay("long-task")
+            _expect(task.actions["tool-write-1"].status.value == "failed", "policy-blocked effect was not recorded as not executed")
+            _expect(not (root.parent / "outside.txt").exists(), "policy-blocked write escaped repository")
+            _expect(counter.calls == 1, "policy path did not reach the executor boundary")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "interrupt-before-effect":
+            first, first_counter = _build_long_task_runtime(root, _ReplayProvider([_write_response()]))
+
+            def interrupt(phase: str, action_id: str) -> None:
+                _expect(action_id == "tool-write-1", "unexpected action id")
+                if phase == "before_effect":
+                    raise KeyboardInterrupt("replay interruption before effect")
+
+            with _expect_keyboard_interrupt():
+                LongTaskWorkflow(first, task_id="long-task", goal="write deterministic result", fault_hook=interrupt).run_turn("write result")
+            resumed, resumed_counter = _build_long_task_runtime(root, _ReplayProvider([_write_response(), LLMResponse(content="resumed")]), resume_session_id=first.agent.session_id)
+            result = LongTaskWorkflow(resumed, task_id="long-task", goal="write deterministic result").run_turn("continue")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "pre-effect interruption did not recover")
+            _expect(first_counter.calls == 0 and resumed_counter.calls == 1, "pre-effect interruption did not execute exactly once after recovery")
+            return {"outcome": mode, "initial_tool_calls": first_counter.calls, "resumed_tool_calls": resumed_counter.calls}
+
+        if mode == "read-then-interrupt":
+            (root / "evidence.txt").write_text("durable evidence\n", encoding="utf-8")
+            calls = [
+                ToolCall("read-1", "read_file", {"file_path": "evidence.txt"}),
+                ToolCall("write-1", "write_file", {"file_path": "result.txt", "content": "durable result\n"}),
+            ]
+            first, first_counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=calls)]))
+
+            def interrupt(phase: str, action_id: str) -> None:
+                if phase == "before_effect":
+                    _expect(action_id == "tool-write-1", "read must complete before the write boundary")
+                    raise KeyboardInterrupt("replay interruption after read")
+
+            with _expect_keyboard_interrupt():
+                LongTaskWorkflow(first, task_id="long-task", goal="read then write", fault_hook=interrupt).run_turn("read and write")
+            task = LongTaskWorkflow(first, task_id="long-task", goal="read then write").store.replay("long-task")
+            _expect(task.actions["tool-read-1"].status.value == "succeeded", "read was not durable before interruption")
+            _expect(first_counter.calls == 1 and not (root / "result.txt").exists(), "write started before its boundary")
+            return {"outcome": mode, "tool_calls": first_counter.calls}
+
+        if mode == "command-completed-skip":
+            command = ToolCall("command-1", "bash", {"command": "python -c \"print('ok')\""})
+            first, first_counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=[command])]))
+
+            def interrupt(phase: str, action_id: str) -> None:
+                if phase == "after_effect_completed":
+                    _expect(action_id == "tool-command-1", "unexpected command action")
+                    raise KeyboardInterrupt("replay interruption after command")
+
+            with _expect_keyboard_interrupt():
+                LongTaskWorkflow(first, task_id="long-task", goal="run command", fault_hook=interrupt).run_turn("run command")
+            resumed, resumed_counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=[command]), LLMResponse(content="recovered")]), resume_session_id=first.agent.session_id)
+            result = LongTaskWorkflow(resumed, task_id="long-task", goal="run command").run_turn("continue")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "command Task did not recover")
+            _expect(first_counter.calls == 1 and resumed_counter.calls == 0, "completed command was executed again")
+            return {"outcome": mode, "initial_tool_calls": first_counter.calls, "resumed_tool_calls": resumed_counter.calls}
+
+        if mode == "same-round-read-write":
+            (root / "evidence.txt").write_text("durable evidence\n", encoding="utf-8")
+            calls = [ToolCall("read-1", "read_file", {"file_path": "evidence.txt"}), _write_response().tool_calls[0]]
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=calls), LLMResponse(content="done")]))
+            result = LongTaskWorkflow(runtime, task_id="long-task", goal="read then write").run_turn("read and write")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED and counter.calls == 2, "same-round read/write did not complete")
+            _expect((root / "result.txt").exists(), "same-round write was missing")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "same-round-write-write":
+            first_calls = [
+                ToolCall("write-1", "write_file", {"file_path": "first.txt", "content": "first\n"}),
+                ToolCall("write-2", "write_file", {"file_path": "second.txt", "content": "second\n"}),
+            ]
+            first, first_counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=first_calls)]))
+
+            def interrupt(phase: str, action_id: str) -> None:
+                if phase == "after_effect_completed" and action_id == "tool-write-1":
+                    raise KeyboardInterrupt("replay interruption after first write")
+
+            with _expect_keyboard_interrupt():
+                LongTaskWorkflow(first, task_id="long-task", goal="write twice", fault_hook=interrupt).run_turn("write both")
+            _expect((root / "first.txt").exists() and not (root / "second.txt").exists(), "second write started before recovery")
+            resumed, resumed_counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=first_calls), LLMResponse(content="recovered")]), resume_session_id=first.agent.session_id)
+            result = LongTaskWorkflow(resumed, task_id="long-task", goal="write twice").run_turn("continue")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "double-write Task did not recover")
+            _expect(first_counter.calls == 1 and resumed_counter.calls == 1, "first write repeated or second write was skipped")
+            _expect((root / "second.txt").read_text(encoding="utf-8") == "second\n", "second write result missing")
+            return {"outcome": mode, "initial_tool_calls": first_counter.calls, "resumed_tool_calls": resumed_counter.calls}
+
+        if mode == "same-round-read-read":
+            (root / "one.txt").write_text("one\n", encoding="utf-8")
+            (root / "two.txt").write_text("two\n", encoding="utf-8")
+            calls = [ToolCall("read-1", "read_file", {"file_path": "one.txt"}), ToolCall("read-2", "read_file", {"file_path": "two.txt"})]
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=calls), LLMResponse(content="done")]))
+            result = LongTaskWorkflow(runtime, task_id="long-task", goal="read both").run_turn("read both")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED and counter.calls == 2, "same-round reads did not complete")
+            _expect(result.task.completed_effect_ids == (), "safe reads created effect entries")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "opaque-tool-exclusive":
+            response = LLMResponse(tool_calls=[ToolCall("opaque-1", "opaque_probe", {})])
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([response, LLMResponse(content="opaque done")]))
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="run opaque Tool")
+            try:
+                workflow.run_turn("run opaque")
+            except LongTaskStateError:
+                pass
+            else:
+                raise AssertionError("opaque Tool unexpectedly completed")
+            task = workflow.store.replay("long-task")
+            _expect(task.actions["tool-opaque-1"].status.value == "failed", "opaque Tool was not fail-closed")
+            _expect(task.completed_effect_ids == (), "opaque Tool was incorrectly recorded as completed")
+            _expect(counter.calls == 1, "opaque Tool did not reach executor")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode in {"session-mismatch", "repository-mismatch"}:
+            first, _ = _build_long_task_runtime(root, _ReplayProvider([]))
+            LongTaskWorkflow(first, task_id="long-task", goal="identity check").start_or_resume()
+            target = root if mode == "session-mismatch" else root / "other-repository"
+            target.mkdir(exist_ok=True)
+            second, counter = _build_long_task_runtime(target, _ReplayProvider([LLMResponse(content="must not run")]))
+            candidate = LongTaskWorkflow(second, task_id="long-task", goal="identity check")
+            if mode == "repository-mismatch":
+                candidate.store = LongTaskWorkflow(first, task_id="long-task", goal="identity check").store
+            with _expect_state_error():
+                candidate.run_turn("continue")
+            _expect(counter.calls == 0, "identity mismatch reached Tool executor")
+            return {"outcome": mode, "tool_calls": 0}
+
+        if mode == "lease-conflict":
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([_write_response()]))
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="lease check")
+            workflow.start_or_resume()
+            with workflow.store.acquire_lease("long-task"), _expect_state_error():
+                workflow.run_turn("write result")
+            _expect(counter.calls == 0, "second lease holder reached Tool executor")
+            return {"outcome": mode, "tool_calls": 0}
+
+        if mode == "effect-budget":
+            calls = [_write_response(file_path="first.txt").tool_calls[0], _write_response(file_path="second.txt").tool_calls[0]]
+            calls[1].id = "write-2"
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(tool_calls=calls)]))
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="budget check", budget=LongTaskBudget(max_effects=1))
+            with _expect_state_error():
+                workflow.run_turn("write twice")
+            _expect(counter.calls == 1 and not (root / "second.txt").exists(), "effect budget allowed second effect")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "cancelled-task":
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([_write_response()]))
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="cancel check")
+            workflow.start_or_resume()
+            workflow.store.cancel("long-task", reason="replay cancellation")
+            with _expect_state_error():
+                workflow.run_turn("write result")
+            _expect(counter.calls == 0, "cancelled Task reached Tool executor")
+            return {"outcome": mode, "tool_calls": 0}
+
+        if mode in {"two-turn-read-write", "two-turn-write-read"}:
+            (root / "evidence.txt").write_text("durable evidence\n", encoding="utf-8")
+            read = LLMResponse(tool_calls=[ToolCall("read-1", "read_file", {"file_path": "evidence.txt"})])
+            write = _write_response()
+            first_call, first_done, second_call, second_done = (
+                (read, "read done", write, "write done")
+                if mode == "two-turn-read-write"
+                else (write, "write done", read, "read done")
+            )
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([
+                first_call, LLMResponse(content=first_done), second_call, LLMResponse(content=second_done),
+            ]))
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="two deterministic steps")
+            first = workflow.run_step("first step")
+            second = workflow.run_step("second step")
+            task = workflow.finish(result=second.response)
+            _expect(task.status is LongTaskStatus.SUCCEEDED, "two-turn Task did not finish")
+            _expect(first.checkpoint.session_event_cursor != second.checkpoint.session_event_cursor, "two turns reused a Session cursor")
+            _expect(counter.calls == 2, "two-turn Task did not execute exactly two Tool calls")
+            if mode == "two-turn-read-write":
+                _expect((root / "result.txt").exists(), "second-turn write was missing")
+            else:
+                _expect(task.completed_effect_ids == ("effect-write-1",), "first-turn write was not retained")
+            return {"outcome": mode, "tool_calls": counter.calls}
+
+        if mode == "corrupt-event-log":
+            runtime, counter = _build_long_task_runtime(root, _ReplayProvider([LLMResponse(content="must not run")]))
+            workflow = LongTaskWorkflow(runtime, task_id="long-task", goal="corruption check")
+            workflow.start_or_resume()
+            with workflow.store.path_for("long-task").open("ab") as stream:
+                stream.write(b"not-json\n")
+            with _expect_recovery_required():
+                workflow.run_step("continue")
+            _expect(counter.calls == 0, "corrupt Task log reached Tool executor")
+            return {"outcome": mode, "tool_calls": 0}
+
+        if mode == "unknown-effect":
+            first, first_counter = _build_long_task_runtime(root, _ReplayProvider([_write_response()]))
+
+            def interrupt(phase: str, action_id: str) -> None:
+                _expect(action_id == "tool-write-1", "unexpected action id")
+                if phase == "after_effect_started":
+                    raise KeyboardInterrupt("replay interruption before executor")
+
+            with _expect_keyboard_interrupt():
+                LongTaskWorkflow(first, task_id="long-task", goal="write deterministic result", fault_hook=interrupt).run_turn("write result")
+            resumed, resumed_counter = _build_long_task_runtime(
+                root,
+                _ReplayProvider([LLMResponse(content="must not run")]),
+                resume_session_id=first.agent.session_id,
+            )
+            with _expect_recovery_required():
+                LongTaskWorkflow(resumed, task_id="long-task", goal="write deterministic result").run_turn("continue")
+            _expect(first_counter.calls == 0 and resumed_counter.calls == 0, "unknown effect reached executor during recovery")
+            _expect(not (root / "result.txt").exists(), "unknown effect changed the repository")
+            return {"outcome": mode, "tool_calls": 0}
+
+        if mode == "completed-effect-skip":
+            first, first_counter = _build_long_task_runtime(root, _ReplayProvider([_write_response()]))
+
+            def interrupt(phase: str, action_id: str) -> None:
+                _expect(action_id == "tool-write-1", "unexpected action id")
+                if phase == "after_effect_completed":
+                    raise KeyboardInterrupt("replay interruption after completion")
+
+            with _expect_keyboard_interrupt():
+                LongTaskWorkflow(first, task_id="long-task", goal="write deterministic result", fault_hook=interrupt).run_turn("write result")
+            resumed, resumed_counter = _build_long_task_runtime(
+                root,
+                _ReplayProvider([_write_response(), LLMResponse(content="recovered")]),
+                resume_session_id=first.agent.session_id,
+            )
+            result = LongTaskWorkflow(resumed, task_id="long-task", goal="write deterministic result").run_turn("continue")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "recovered Task did not succeed")
+            _expect(first_counter.calls == 1 and resumed_counter.calls == 0, "completed effect was executed again")
+            return {"outcome": mode, "initial_tool_calls": first_counter.calls, "resumed_tool_calls": resumed_counter.calls}
+
+        if mode == "plain-session-control":
+            first, first_counter = _build_long_task_runtime(root, _ReplayProvider([_write_response()]))
+            first.agent.tool_executor = _InterruptAfterExecuteExecutor(first.agent.tool_executor)
+            with _expect_keyboard_interrupt():
+                first.run_turn("write result")
+            resumed, resumed_counter = _build_long_task_runtime(
+                root,
+                _ReplayProvider([_write_response(), LLMResponse(content="ordinary recovery")]),
+                resume_session_id=first.agent.session_id,
+            )
+            _expect(resumed.run_turn("continue") == "ordinary recovery", "ordinary Session did not resume")
+            _expect(first_counter.calls == 1 and resumed_counter.calls == 1, "ordinary Session control did not reissue the Tool call")
+            return {"outcome": mode, "initial_tool_calls": first_counter.calls, "resumed_tool_calls": resumed_counter.calls}
+        raise ValueError(f"unknown long-task runtime mode: {mode}")
+
+    @staticmethod
+    def _run_long_task_observability(case: ReplayCase, root: Path) -> Mapping[str, Any]:
+        """Observe Tool bodies and effects for public RS-6.2 extension cards.
+
+        These checks intentionally use the ordinary Runtime executor and C5
+        scheduler. The probes only record entry/exit around real Tool bodies;
+        they do not replace permission checks or Tool execution.
+        """
+
+        mode = _string(case.input, "mode")
+        _expect(mode == _string(case.expected, "outcome"), "long-task observability outcome mismatch")
+        trace = _ToolBodyTrace()
+
+        if mode == "command-effect-recovery":
+            command_tool = _ObservedBashTool(trace)
+            command = (
+                f'"{sys.executable}" -c "open(\'command-marker.txt\', \'w\', '
+                "encoding='utf-8').write('actual command')\""
+            )
+            call = ToolCall("command-1", "bash", {"command": command})
+            first, _ = _build_long_task_runtime(
+                root,
+                _ReplayProvider([LLMResponse(tool_calls=[call])]),
+                tools=[command_tool],
+            )
+
+            def interrupt(phase: str, action_id: str) -> None:
+                if phase == "after_effect_completed":
+                    _expect(action_id == "tool-command-1", "unexpected command action")
+                    raise KeyboardInterrupt("deterministic interruption after actual command")
+
+            try:
+                with _expect_keyboard_interrupt():
+                    LongTaskWorkflow(
+                        first,
+                        task_id="observability-task",
+                        goal="write a command marker",
+                        fault_hook=interrupt,
+                    ).run_turn("run the command")
+            except LongTaskStateError as error:
+                current = LongTaskWorkflow(first, task_id="observability-task", goal="write a command marker").store.replay("observability-task")
+                raise AssertionError(
+                    f"initial command interruption did not reach its effect boundary: {error}; "
+                    f"actions={[(action_id, action.status.value) for action_id, action in current.actions.items()]}"
+                ) from error
+            marker = root / "command-marker.txt"
+            _expect(command_tool.body_calls == 1, "command Tool body was not executed exactly once before interruption")
+            _expect(marker.read_text(encoding="utf-8") == "actual command", "command did not create its marker")
+            first_task = LongTaskWorkflow(first, task_id="observability-task", goal="write a command marker").store.replay("observability-task")
+            _expect(first_task.actions["tool-command-1"].status.value == "succeeded", "actual command was not durably marked completed")
+
+            resumed_tool = _ObservedBashTool(trace)
+            resumed, _ = _build_long_task_runtime(
+                root,
+                _ReplayProvider([LLMResponse(tool_calls=[call]), LLMResponse(content="recovered")]),
+                tools=[resumed_tool],
+                resume_session_id=first.agent.session_id,
+            )
+            resumed_workflow = LongTaskWorkflow(
+                resumed,
+                task_id="observability-task",
+                goal="write a command marker",
+            )
+            try:
+                step = resumed_workflow.run_step("continue")
+            except LongTaskStateError as error:
+                current = resumed_workflow.store.replay("observability-task")
+                raise AssertionError(
+                    f"resumed command step did not retain the completed effect: {error}; "
+                    f"actions={[(action_id, action.status.value) for action_id, action in current.actions.items()]}"
+                ) from error
+            recovered = resumed_workflow.store.replay("observability-task")
+            _expect(recovered.actions["tool-command-1"].status.value == "succeeded", "skipped command was not retained as completed")
+            try:
+                task = resumed_workflow.finish(result=step.response)
+            except LongTaskStateError as error:
+                current = resumed_workflow.store.replay("observability-task")
+                raise AssertionError(
+                    f"completed command could not finish: {error}; "
+                    f"action={current.actions['tool-command-1'].status.value}; "
+                    f"actions={sorted(current.actions)}"
+                ) from error
+            _expect(task.status is LongTaskStatus.SUCCEEDED, "recovered command Task did not succeed")
+            _expect(resumed_tool.body_calls == 0, "completed command Tool body executed again during recovery")
+            _expect(marker.read_text(encoding="utf-8") == "actual command", "command marker changed during recovery")
+            return {"outcome": mode, "initial_tool_body_calls": command_tool.body_calls, "resumed_tool_body_calls": resumed_tool.body_calls}
+
+        if mode == "read-read-overlap":
+            (root / "one.txt").write_text("one\n", encoding="utf-8")
+            (root / "two.txt").write_text("two\n", encoding="utf-8")
+            read_tool = _ObservedReadTool(trace, barrier=threading.Barrier(2))
+            calls = [
+                ToolCall("read-1", "read_file", {"file_path": "one.txt"}),
+                ToolCall("read-2", "read_file", {"file_path": "two.txt"}),
+            ]
+            runtime, _ = _build_long_task_runtime(
+                root,
+                _ReplayProvider([LLMResponse(tool_calls=calls), LLMResponse(content="reads complete")]),
+                tools=[read_tool],
+            )
+            result = LongTaskWorkflow(runtime, task_id="observability-task", goal="read two files").run_turn("read both")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "read/read Task did not succeed")
+            _expect(read_tool.body_calls == 2, "both read Tool bodies did not execute")
+            _expect(trace.max_active == 2, "safe reads did not overlap in actual Tool bodies")
+            return {"outcome": mode, "tool_body_calls": read_tool.body_calls, "peak_active_tool_bodies": trace.max_active}
+
+        if mode == "read-write-order":
+            (root / "evidence.txt").write_text("evidence\n", encoding="utf-8")
+            read_tool = _ObservedReadTool(trace)
+            calls = [
+                ToolCall("read-1", "read_file", {"file_path": "evidence.txt"}),
+                ToolCall("write-1", "write_file", {"file_path": "result.txt", "content": "written after read\n"}),
+            ]
+            runtime, _ = _build_long_task_runtime(
+                root,
+                _ReplayProvider([LLMResponse(tool_calls=calls), LLMResponse(content="ordered")]),
+                tools=[read_tool, WriteFileTool()],
+                effect_trace=trace,
+            )
+            result = LongTaskWorkflow(runtime, task_id="observability-task", goal="read then write").run_turn("read then write")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "read/write Task did not succeed")
+            _expect(
+                trace.events == ["read:evidence.txt:start", "read:evidence.txt:end", "write:result.txt:start", "write:result.txt:end"],
+                f"read/write Tool body order changed: {trace.events}",
+            )
+            _expect((root / "result.txt").read_text(encoding="utf-8") == "written after read\n", "write Tool body did not create expected file")
+            return {"outcome": mode, "tool_body_events": list(trace.events)}
+
+        if mode == "write-write-exclusive":
+            calls = [
+                ToolCall("write-1", "write_file", {"file_path": "first.txt", "content": "first\n"}),
+                ToolCall("write-2", "write_file", {"file_path": "second.txt", "content": "second\n"}),
+            ]
+            runtime, _ = _build_long_task_runtime(
+                root,
+                _ReplayProvider([LLMResponse(tool_calls=calls), LLMResponse(content="writes complete")]),
+                tools=[WriteFileTool()],
+                effect_trace=trace,
+            )
+            result = LongTaskWorkflow(runtime, task_id="observability-task", goal="write twice").run_turn("write both")
+            _expect(result.task.status is LongTaskStatus.SUCCEEDED, "write/write Task did not succeed")
+            _expect(
+                trace.completed_write_effects == 2 and trace.max_active == 1,
+                f"writes overlapped in actual effects: writes={trace.completed_write_effects}, peak={trace.max_active}, events={trace.events}",
+            )
+            _expect(
+                trace.events == ["write:first.txt:start", "write:first.txt:end", "write:second.txt:start", "write:second.txt:end"],
+                f"write/write Tool body order changed: {trace.events}",
+            )
+            _expect((root / "first.txt").read_text(encoding="utf-8") == "first\n", "first write result missing")
+            _expect((root / "second.txt").read_text(encoding="utf-8") == "second\n", "second write result missing")
+            return {"outcome": mode, "completed_write_effects": trace.completed_write_effects, "peak_active_effects": trace.max_active}
+
+        raise ValueError(f"unknown long-task observability mode: {mode}")
+
+    @staticmethod
+    def _run_long_task_holdout(case: ReplayCase, root: Path) -> Mapping[str, Any]:
+        """Run an independently-authored fixed-provider long-task card.
+
+        The card contract intentionally describes only stable Runtime concepts;
+        it never selects an internal public-suite mode or bypasses the normal
+        Tool executor, Permission gate, C5 scheduling, or Session store.
+        """
+
+        initial_state = _mapping_value(case.input, "initial_state")
+        provider_script = _mapping_value(case.input, "provider_script")
+        interruption = _mapping_value(case.input, "interruption_point")
+        recovery = _mapping_value(case.input, "recovery_action")
+        assertions = _mapping_value(case.expected, "assertions")
+
+        files = _mapping_value(initial_state, "files")
+        for relative_path, content in files.items():
+            if not isinstance(relative_path, str) or not isinstance(content, str):
+                raise TypeError("long-task holdout initial files must map string paths to string content")
+            target = _private_case_path(root, relative_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        user_input = _string(initial_state, "user_input")
+        task_spec = _mapping_value(initial_state, "task")
+        task_id = _string(task_spec, "id")
+        goal = _string(task_spec, "goal")
+        max_effects = _integer(task_spec, "max_effects")
+        permission = _string(initial_state, "permission")
+        if permission not in {"allow", "deny"}:
+            raise ValueError("long-task holdout permission must be allow or deny")
+
+        phase = _string(interruption, "phase")
+        if phase not in {"none", "before_effect", "after_effect_started", "after_effect_completed"}:
+            raise ValueError("long-task holdout interruption phase is unsupported")
+        target_call_id = interruption.get("tool_call_id")
+        if target_call_id is not None and not isinstance(target_call_id, str):
+            raise TypeError("long-task holdout interruption tool_call_id must be a string when present")
+
+        initial_responses = _long_task_provider_responses(provider_script, "initial")
+        resume_responses = _long_task_provider_responses(provider_script, "resume")
+        first, first_counter = _build_long_task_runtime(
+            root,
+            _ReplayProvider(initial_responses),
+            allow=permission == "allow",
+        )
+
+        def interrupt(actual_phase: str, action_id: str) -> None:
+            if phase == "none" or actual_phase != phase:
+                return
+            if target_call_id is not None and action_id != f"tool-{target_call_id}":
+                return
+            raise KeyboardInterrupt("private long-task holdout interruption")
+
+        try:
+            LongTaskWorkflow(
+                first,
+                task_id=task_id,
+                goal=goal,
+                budget=LongTaskBudget(max_effects=max_effects),
+                fault_hook=interrupt if phase != "none" else None,
+            ).run_turn(user_input)
+        except (KeyboardInterrupt, LongTaskStateError):
+            pass
+
+        recovery_kind = _string(recovery, "kind")
+        resumed_counter_calls = 0
+        if recovery_kind == "resume":
+            recovery_input = _string(recovery, "user_input")
+            resumed, resumed_counter = _build_long_task_runtime(
+                root,
+                _ReplayProvider(resume_responses),
+                allow=permission == "allow",
+                resume_session_id=first.agent.session_id,
+            )
+            resumed_counter_calls = resumed_counter.calls
+            try:
+                LongTaskWorkflow(
+                    resumed,
+                    task_id=task_id,
+                    goal=goal,
+                    budget=LongTaskBudget(max_effects=max_effects),
+                ).run_turn(recovery_input)
+            except LongTaskStateError:
+                pass
+            resumed_counter_calls = resumed_counter.calls
+        elif recovery_kind == "verify_stop":
+            resumed, resumed_counter = _build_long_task_runtime(
+                root,
+                _ReplayProvider(resume_responses),
+                allow=permission == "allow",
+                resume_session_id=first.agent.session_id,
+            )
+            try:
+                LongTaskWorkflow(
+                    resumed,
+                    task_id=task_id,
+                    goal=goal,
+                    budget=LongTaskBudget(max_effects=max_effects),
+                ).run_step(_string(recovery, "user_input"))
+            except LongTaskRecoveryRequired:
+                pass
+            else:
+                raise AssertionError("private long-task recovery did not stop for an ambiguous effect")
+            resumed_counter_calls = resumed_counter.calls
+        elif recovery_kind != "none":
+            raise ValueError("long-task holdout recovery kind is unsupported")
+
+        task = LongTaskWorkflow(first, task_id=task_id, goal=goal).store.replay(task_id)
+        mismatch_codes: list[str] = []
+        if task.status.value != _string(assertions, "task_status"):
+            mismatch_codes.append("assertion_task_status_mismatch")
+        if first_counter.calls != _integer(assertions, "initial_executor_calls"):
+            mismatch_codes.append("assertion_initial_executor_count_mismatch")
+        if resumed_counter_calls != _integer(assertions, "resume_executor_calls"):
+            mismatch_codes.append("assertion_resume_executor_count_mismatch")
+        expected_effects = _string_list(assertions, "completed_effect_ids")
+        if task.completed_effect_ids != expected_effects:
+            mismatch_codes.append("assertion_completed_effect_ledger_mismatch")
+        session = first.session_store.replay(first.agent.session_id)
+        session_cursor_advanced = bool(
+            task.checkpoints
+            and session.events
+            and task.checkpoints[-1].session_event_cursor == session.events[-1].event_id
+        )
+        if session_cursor_advanced is not _boolean(assertions, "session_cursor_advanced"):
+            mismatch_codes.append("assertion_session_cursor_mismatch")
+        expected_files = _mapping_value(assertions, "files")
+        matched_file_assertions = 0
+        for relative_path, expectation in expected_files.items():
+            if not isinstance(relative_path, str):
+                raise TypeError("private long-task file assertion path must be a string")
+            expectation_map = _mapping(expectation)
+            exists = expectation_map.get("exists")
+            if not isinstance(exists, bool):
+                raise TypeError("private long-task file assertion requires boolean exists")
+            if _private_case_path(root, relative_path).exists() is exists:
+                matched_file_assertions += 1
+        if matched_file_assertions != len(expected_files):
+            mismatch_codes.append("assertion_file_existence_mismatch")
+        observed = {
+            "task_status": task.status.value,
+            "initial_executor_calls": first_counter.calls,
+            "resume_executor_calls": resumed_counter_calls,
+            "completed_effect_count": len(task.completed_effect_ids),
+            "session_cursor_advanced": session_cursor_advanced,
+            "file_assertions": {"matched": matched_file_assertions, "total": len(expected_files)},
+        }
+        if mismatch_codes:
+            raise _LongTaskHoldoutAssertionFailure(tuple(mismatch_codes), observed)
+        return {
+            "task_status": task.status.value,
+            "initial_executor_calls": first_counter.calls,
+            "resume_executor_calls": resumed_counter_calls,
+        }
+
+    @staticmethod
     def _run_instruction_carry(case: ReplayCase, root: Path) -> Mapping[str, Any]:
         del root
         constraint = _string(case.input, "constraint")
@@ -454,6 +1121,240 @@ class _ReplayProvider:
         if on_token is not None and response.content:
             on_token(response.content)
         return response
+
+
+class _ReplayAllowPrompt:
+    def __init__(self, *, allow: bool) -> None:
+        self.allow = allow
+
+    def decide(self, request):
+        del request
+        return PermissionDecision.allow("replay approval") if self.allow else PermissionDecision.deny("replay rejection")
+
+
+@dataclass
+class _CountingExecutor:
+    delegate: object
+    calls: int = 0
+
+    def begin_turn(self):
+        return self.delegate.begin_turn()
+
+    def consume_turn_stop_message(self):
+        return self.delegate.consume_turn_stop_message()
+
+    def describe_call(self, tool, arguments):
+        return self.delegate.describe_call(tool, arguments)
+
+    def execute_call(self, tool, arguments, *, tool_call_id, execution_context=None):
+        self.calls += 1
+        return self.delegate.execute_call(
+            tool,
+            arguments,
+            tool_call_id=tool_call_id,
+            execution_context=execution_context,
+        )
+
+
+@dataclass
+class _ToolBodyTrace:
+    """Thread-safe observations made inside public deterministic Tool bodies."""
+
+    events: list[str] = field(default_factory=list)
+    active: int = 0
+    max_active: int = 0
+    completed_write_effects: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def enter(self, label: str) -> None:
+        with self._lock:
+            self.events.append(f"{label}:start")
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+
+    def leave(self, label: str) -> None:
+        with self._lock:
+            self.active -= 1
+            self.events.append(f"{label}:end")
+
+    def complete_write(self) -> None:
+        with self._lock:
+            self.completed_write_effects += 1
+
+
+class _ObservedReadTool(ReadFileTool):
+    """ReadFileTool whose real body records overlap without changing output."""
+
+    def __init__(self, trace: _ToolBodyTrace, *, barrier: threading.Barrier | None = None) -> None:
+        self.trace = trace
+        self.barrier = barrier
+        self.body_calls = 0
+
+    def execute(self, file_path: str, offset: int = 1, limit: int = 2000) -> str:
+        label = f"read:{Path(file_path).name}"
+        self.body_calls += 1
+        self.trace.enter(label)
+        try:
+            if self.barrier is not None:
+                self.barrier.wait(timeout=2)
+            time.sleep(0.02)
+            return super().execute(file_path, offset=offset, limit=limit)
+        finally:
+            self.trace.leave(label)
+
+
+class _ObservedBashTool(BashTool):
+    """BashTool that records actual ``execute_in`` entry without stubbing it."""
+
+    def __init__(self, trace: _ToolBodyTrace) -> None:
+        self.trace = trace
+        self.body_calls = 0
+
+    def execute_in(self, command: str, *, cwd: str, timeout: int = 120) -> str:
+        label = "bash:command"
+        self.body_calls += 1
+        self.trace.enter(label)
+        try:
+            return super().execute_in(command, cwd=cwd, timeout=timeout)
+        finally:
+            self.trace.leave(label)
+
+
+@dataclass
+class _ObservedEffectExecutor:
+    """Observe durable RepositoryToolExecutor writes without replacing them.
+
+    ``write_file`` is intentionally applied by the trusted-diff executor,
+    rather than by ``WriteFileTool.execute``. The probe therefore surrounds
+    that real executor path and records completion only when its durable file
+    result confirms a write.
+    """
+
+    delegate: object
+    trace: _ToolBodyTrace
+
+    def begin_turn(self):
+        return self.delegate.begin_turn()
+
+    def consume_turn_stop_message(self):
+        return self.delegate.consume_turn_stop_message()
+
+    def describe_call(self, tool, arguments):
+        return self.delegate.describe_call(tool, arguments)
+
+    def execute_call(self, tool, arguments, *, tool_call_id, execution_context=None):
+        is_write = tool.name == "write_file"
+        label = f"write:{Path(str(arguments.get('file_path', 'unknown'))).name}"
+        if is_write:
+            self.trace.enter(label)
+        try:
+            result = self.delegate.execute_call(
+                tool,
+                arguments,
+                tool_call_id=tool_call_id,
+                execution_context=execution_context,
+            )
+            if is_write and result.startswith("Wrote "):
+                self.trace.complete_write()
+            return result
+        finally:
+            if is_write:
+                self.trace.leave(label)
+
+
+@dataclass
+class _InterruptAfterExecuteExecutor:
+    delegate: object
+
+    def begin_turn(self):
+        return self.delegate.begin_turn()
+
+    def consume_turn_stop_message(self):
+        return self.delegate.consume_turn_stop_message()
+
+    def describe_call(self, tool, arguments):
+        return self.delegate.describe_call(tool, arguments)
+
+    def execute_call(self, tool, arguments, *, tool_call_id, execution_context=None):
+        self.delegate.execute_call(
+            tool,
+            arguments,
+            tool_call_id=tool_call_id,
+            execution_context=execution_context,
+        )
+        raise KeyboardInterrupt("replay interruption after ordinary tool execution")
+
+
+def _build_long_task_runtime(
+    root: Path,
+    provider: _ReplayProvider,
+    *,
+    allow: bool = True,
+    resume_session_id: str | None = None,
+    tools: list[Tool] | None = None,
+    effect_trace: _ToolBodyTrace | None = None,
+):
+    runtime = RuntimeBootstrap(provider_factory=lambda _config: provider).build(RuntimeBootstrapInput(
+        repository=root,
+        event_sink=CallbackEventSink(lambda _event: None),
+        tools=tools or [WriteFileTool(), ReadFileTool(), BashTool(), _OpaqueProbeTool()],
+        model="fake-replay",
+        permission_prompt=_ReplayAllowPrompt(allow=allow),
+        session_directory=root / "sessions",
+        resume_session_id=resume_session_id,
+    ))
+    executor = runtime.agent.tool_executor
+    if effect_trace is not None:
+        executor = _ObservedEffectExecutor(executor, effect_trace)
+    counter = _CountingExecutor(executor)
+    runtime.agent.tool_executor = counter
+    return runtime, counter
+
+
+def _write_response(*, file_path: str = "result.txt") -> LLMResponse:
+    return LLMResponse(tool_calls=[ToolCall(
+        id="write-1",
+        name="write_file",
+        arguments={"file_path": file_path, "content": "durable result\n"},
+    )])
+
+
+class _OpaqueProbeTool(Tool):
+    """A known Tool without effect metadata; Runtime must fail closed to exclusive."""
+
+    name = "opaque_probe"
+    description = "Deterministic opaque replay probe."
+    parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    def execute(self) -> str:
+        return "opaque-probe"
+
+
+@contextmanager
+def _expect_keyboard_interrupt():
+    try:
+        yield
+    except KeyboardInterrupt:
+        return
+    raise AssertionError("expected deterministic interruption")
+
+
+@contextmanager
+def _expect_recovery_required():
+    try:
+        yield
+    except LongTaskRecoveryRequired:
+        return
+    raise AssertionError("expected long Task recovery requirement")
+
+
+@contextmanager
+def _expect_state_error():
+    try:
+        yield
+    except LongTaskStateError:
+        return
+    raise AssertionError("expected long Task state rejection")
 
 
 class _EchoTool(Tool):
@@ -554,6 +1455,100 @@ def _event(
         tool_call_id=tool_call_id,
         payload=payload,
     )
+
+
+def _long_task_provider_responses(script: Mapping[str, Any], phase: str) -> list[LLMResponse]:
+    raw_responses = script.get(phase)
+    if not isinstance(raw_responses, list):
+        raise TypeError(f"private long-task provider_script requires {phase} responses")
+    if phase == "initial" and not raw_responses:
+        raise TypeError("private long-task provider_script requires non-empty initial responses")
+    responses: list[LLMResponse] = []
+    for raw_response in raw_responses:
+        response = _mapping(raw_response)
+        content = response.get("content", "")
+        raw_calls = response.get("tool_calls", [])
+        if not isinstance(content, str) or not isinstance(raw_calls, list):
+            raise TypeError("private long-task provider response is invalid")
+        calls: list[ToolCall] = []
+        for raw_call in raw_calls:
+            call = _mapping(raw_call)
+            call_id = call.get("id")
+            name = call.get("name")
+            arguments = call.get("arguments")
+            if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, dict):
+                raise TypeError("private long-task Tool call is invalid")
+            calls.append(ToolCall(call_id, name, dict(arguments)))
+        if not content and not calls:
+            raise ValueError("private long-task provider response must include content or Tool calls")
+        responses.append(LLMResponse(content=content, tool_calls=calls))
+    return responses
+
+
+def _private_case_path(root: Path, relative_path: str) -> Path:
+    candidate = Path(relative_path)
+    if not relative_path or candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("private long-task paths must stay inside the case repository")
+    resolved_root = root.resolve()
+    resolved = (resolved_root / candidate).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError("private long-task paths must stay inside the case repository") from error
+    if resolved == resolved_root:
+        raise ValueError("private long-task paths must name a file")
+    return resolved
+
+
+def _mapping(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("replay case requires a JSON object")
+    return value
+
+
+def _mapping_value(value: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    return _mapping(value.get(key))
+
+
+def _string_list(value: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    item = value.get(key)
+    if not isinstance(item, list) or any(not isinstance(entry, str) for entry in item):
+        raise TypeError(f"replay case requires a list of strings {key}")
+    return tuple(item)
+
+
+def _boolean(value: Mapping[str, Any], key: str) -> bool:
+    item = value.get(key)
+    if not isinstance(item, bool):
+        raise TypeError(f"replay case requires boolean {key}")
+    return item
+
+
+def _long_task_holdout_failure_code(error: Exception) -> str:
+    """Return only a stable diagnosis class, never a private case value."""
+
+    if isinstance(error, KeyError):
+        return "execution_contract_missing_field"
+    if isinstance(error, TypeError):
+        return "execution_contract_type_mismatch"
+    if isinstance(error, ValueError):
+        return "execution_contract_value_mismatch"
+    message = str(error)
+    if message == "private long-task recovery did not stop for an ambiguous effect":
+        return "recovery_safety_mismatch"
+    if "status mismatch" in message:
+        return "assertion_task_status_mismatch"
+    if "initial executor count mismatch" in message:
+        return "assertion_initial_executor_count_mismatch"
+    if "resumed executor count mismatch" in message:
+        return "assertion_resume_executor_count_mismatch"
+    if "completed effect ledger mismatch" in message:
+        return "assertion_completed_effect_ledger_mismatch"
+    if "checkpoint cursor" in message or "missing a completed checkpoint" in message:
+        return "assertion_session_cursor_mismatch"
+    if "file assertion mismatch" in message:
+        return "assertion_file_existence_mismatch"
+    return "assertion_mismatch"
 
 
 def _string(value: Mapping[str, Any], key: str) -> str:
