@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from techpilot.evaluation.behavior_oracle import BehaviorCheck, evaluate_behavior_check
+from techpilot.evaluation.behavior_oracle import (
+    BEHAVIOR_ORACLE_VERSION,
+    BehaviorCheck,
+    behavior_oracle_identity,
+    evaluate_behavior_check,
+)
 from techpilot.evaluation.model_tasks import ModelTaskAcceptanceLevel, ModelTaskCard, ModelTaskKind, _score
 
 
@@ -12,6 +17,14 @@ def test_behavior_oracle_interprets_only_a_pure_allowlisted_expression() -> None
 
     assert evaluate_behavior_check(source, check)
     assert not evaluate_behavior_check(source, BehaviorCheck("empty", "defaults.py", "resolve", ("",), "auto"))
+
+
+def test_behavior_oracle_identity_is_versioned_and_content_addressed() -> None:
+    identity = behavior_oracle_identity()
+
+    assert identity["version"] == BEHAVIOR_ORACLE_VERSION
+    assert len(identity["source_sha256"]) == 64
+    assert set(identity["source_sha256"]) <= set("0123456789abcdef")
 
 
 def test_behavior_oracle_returns_the_actual_short_circuit_value() -> None:
@@ -25,7 +38,7 @@ def test_behavior_oracle_rejects_code_outside_its_ast_subset_without_execution()
     check = BehaviorCheck("unsafe", "unsafe.py", "resolve", ("x",), "x")
 
     assert not evaluate_behavior_check("import os\ndef resolve(value):\n    return os.getcwd()\n", check)
-    assert not evaluate_behavior_check("def resolve(value):\n    value = value.strip()\n    return value\n", check)
+    assert not evaluate_behavior_check("def resolve(value):\n    value = os.getcwd()\n    return value\n", check)
     assert not evaluate_behavior_check("def resolve(value):\n    return value.encode()\n", check)
 
 
@@ -95,10 +108,29 @@ def test_behavior_oracle_interprets_safe_if_branches_and_no_argument_split() -> 
         "def canonical(value):\n    return '-'.join(value.strip().lower().split())\n",
         BehaviorCheck("spaces", "tags.py", "canonical", ("  Ready Set ",), "ready-set"),
     )
-    assert not evaluate_behavior_check(
+    assert evaluate_behavior_check(
         "def resolve(value):\n    if value is None:\n        value = 'auto'\n    return value\n",
         BehaviorCheck("assignment", "defaults.py", "resolve", (None,), "auto"),
     )
+
+
+def test_behavior_oracle_interprets_safe_scalar_constants_slices_and_type_guards() -> None:
+    source = """_PREFIX = 'tp_'\n\ndef clean(value):\n    \"\"\"Remove at most one transport prefix.\"\"\"\n    prefix = _PREFIX\n    if isinstance(value, str) and value.startswith(prefix):\n        return str(value)[len(prefix):]\n    return value\n"""
+
+    assert evaluate_behavior_check(source, BehaviorCheck("one", "keys.py", "clean", ("tp_alpha",), "alpha"))
+    assert evaluate_behavior_check(source, BehaviorCheck("two", "keys.py", "clean", ("tp_tp_alpha",), "tp_alpha"))
+    assert evaluate_behavior_check(source, BehaviorCheck("plain", "keys.py", "clean", ("alpha",), "alpha"))
+    assert not evaluate_behavior_check(
+        "value = open('secret')\n\ndef clean(value):\n    return value\n",
+        BehaviorCheck("unsafe-constant", "keys.py", "clean", ("alpha",), "alpha"),
+    )
+
+
+def test_behavior_oracle_interprets_a_scalar_bool_conversion() -> None:
+    source = "def response(value):\n    return {'retryable': bool(value.get('retryable', False))}\n"
+
+    assert evaluate_behavior_check(source, BehaviorCheck("true", "response.py", "response", ({"retryable": True},), {"retryable": True}))
+    assert evaluate_behavior_check(source, BehaviorCheck("false", "response.py", "response", ({"retryable": False},), {"retryable": False}))
 
 
 def test_behavioral_card_scores_behavior_and_scope_without_exact_reference_source_text() -> None:

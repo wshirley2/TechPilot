@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 from techpilot.config.user import resolve_runtime_config
 from techpilot.engine.runtime_control import RuntimeLimits
 from techpilot.runtime import RuntimeBootstrap
 
+from .behavior_oracle import behavior_oracle_identity
 from .cases import (
     CORE_V0_SUITE,
     LONG_TASK_OBSERVABILITY_V0_SUITE,
@@ -106,6 +109,22 @@ def _select_model_task_ids(cards: Sequence[ModelTaskCard], task_ids: Sequence[st
     if unknown:
         raise ValueError(f"--model-task-id is not available in the selected task deck: {', '.join(sorted(unknown))}")
     return tuple(card for card in cards if card.id in requested)
+
+
+def _model_evaluation_protocol_metadata(cards: Sequence[ModelTaskCard]) -> dict[str, object]:
+    """Record the evaluator and Runtime budgets that define a model-run contract."""
+
+    profiles: Counter[str] = Counter(
+        json.dumps(asdict(card.limits), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        for card in cards
+    )
+    return {
+        "behavior_oracle": behavior_oracle_identity(),
+        "runtime_limit_profiles": [
+            {"card_count": count, "limits": json.loads(profile)}
+            for profile, count in sorted(profiles.items())
+        ],
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -249,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
                 "per_attempt_token_limit": per_attempt_token_limit,
                 "attempts_per_task": args.attempts_per_task,
                 "task_split": args.model_task_split,
+                "evaluation_protocol": _model_evaluation_protocol_metadata(cards),
             },
             suite=args.suite,
             case_set_digest=model_task_set_digest(cards),

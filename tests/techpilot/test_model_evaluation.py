@@ -55,7 +55,7 @@ from techpilot.evaluation import (
     select_model_task_cards,
     validate_model_task_deck,
 )
-from techpilot.evaluation.__main__ import _per_attempt_token_limit, _select_model_task_ids
+from techpilot.evaluation.__main__ import _model_evaluation_protocol_metadata, _per_attempt_token_limit, _select_model_task_ids
 from techpilot.evaluation.__main__ import main as evaluation_main
 from techpilot.evaluation.model_tasks import MODEL_CODING_V1_FORMAL_CANDIDATE_IDS
 from techpilot.runtime import RuntimeBootstrap
@@ -723,6 +723,25 @@ def test_model_budget_is_distributed_per_runtime_attempt_not_per_prompt() -> Non
     assert _per_attempt_token_limit(900_000, card_count=31, attempts_per_task=3) == 9_677
     assert _per_attempt_token_limit(700_000, card_count=31, attempts_per_task=3) == 7_526
     assert _per_attempt_token_limit(None, card_count=31, attempts_per_task=3) is None
+
+
+def test_model_evaluation_protocol_records_oracle_and_runtime_limit_profiles() -> None:
+    cards = build_model_coding_v2_formal_100_cards()
+
+    protocol = _model_evaluation_protocol_metadata(cards)
+
+    assert protocol["behavior_oracle"]["version"] == "2026-09-17.v3"
+    assert protocol["runtime_limit_profiles"] == [{
+        "card_count": 100,
+        "limits": {
+            "max_cost_usd": None,
+            "max_input_tokens": None,
+            "max_provider_calls": 8,
+            "max_tool_rounds": 8,
+            "max_total_tokens": None,
+            "max_turn_seconds": None,
+        },
+    }]
 
 
 def test_model_task_id_selection_rejects_cards_outside_the_selected_deck() -> None:

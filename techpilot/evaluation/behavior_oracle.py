@@ -1,16 +1,20 @@
 """A deliberately tiny, non-executing oracle for pure Python task fixtures.
 
-It parses source to an AST and interprets only a closed expression subset.
-There is no ``exec``, import, file access, attribute lookup beyond approved
-string methods, or user-defined call dispatch.
+It parses source to an AST and interprets only a closed, side-effect-free
+subset. There is no ``exec``, import, file access, attribute lookup beyond
+approved string methods, or user-defined call dispatch.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+BEHAVIOR_ORACLE_VERSION = "2026-09-17.v3"
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,16 @@ class BehaviorCheck:
         }
 
 
+def behavior_oracle_identity() -> dict[str, str]:
+    """Return the versioned source identity recorded in model-run manifests."""
+
+    source = Path(__file__).read_bytes()
+    return {
+        "version": BEHAVIOR_ORACLE_VERSION,
+        "source_sha256": hashlib.sha256(source).hexdigest(),
+    }
+
+
 def evaluate_behavior_check(
     source: str,
     check: BehaviorCheck,
@@ -55,7 +69,7 @@ def evaluate_behavior_check(
 
     try:
         module = ast.parse(source, mode="exec")
-        if any(not isinstance(node, (ast.FunctionDef, ast.ImportFrom)) for node in module.body):
+        if any(not isinstance(node, (ast.FunctionDef, ast.ImportFrom, ast.Assign)) for node in module.body):
             return False
         imported_constants = _resolve_constant_imports(module, check, workspace_sources)
         function = next(
@@ -73,7 +87,8 @@ def evaluate_behavior_check(
             or not required <= len(check.arguments) <= len(arguments)
         ):
             return False
-        environment = dict(imported_constants)
+        environment = _module_scalar_constants(module)
+        environment.update(imported_constants)
         environment.update({argument.arg: value for argument, value in zip(arguments, check.arguments, strict=False)})
         for argument, default in zip(arguments[len(check.arguments):], defaults[len(check.arguments) - required:], strict=False):
             environment[argument.arg] = _evaluate(default, environment)
@@ -136,12 +151,44 @@ def _parse_constant_module(source: str | None) -> dict[str, str | int | float | 
     return constants
 
 
+def _module_scalar_constants(module: ast.Module) -> dict[str, str | int | float | bool | None]:
+    """Read only literal module constants; never evaluate module code."""
+
+    constants: dict[str, str | int | float | bool | None] = {}
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if (
+            len(node.targets) != 1
+            or not isinstance(node.targets[0], ast.Name)
+            or node.type_comment is not None
+            or not _is_scalar_constant(node.value)
+        ):
+            raise ValueError("only scalar module constants are supported")
+        constants[node.targets[0].id] = node.value.value
+    return constants
+
+
 def _evaluate_statements(statements: list[ast.stmt], environment: dict[str, Any]) -> tuple[bool, Any]:
-    """Interpret only return statements and side-effect-free conditional branches."""
+    """Interpret only safe assignments, returns, and side-effect-free branches."""
 
     for statement in statements:
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
+            continue
         if isinstance(statement, ast.Return):
             return True, _evaluate(statement.value, environment)
+        if isinstance(statement, ast.Assign):
+            if (
+                len(statement.targets) != 1
+                or not isinstance(statement.targets[0], ast.Name)
+                or statement.type_comment is not None
+            ):
+                raise ValueError("only single-name assignments are supported")
+            value = _evaluate(statement.value, environment)
+            if not _is_scalar(value):
+                raise ValueError("assignment must evaluate to a scalar")
+            environment[statement.targets[0].id] = value
+            continue
         if isinstance(statement, ast.If):
             branch = statement.body if _evaluate(statement.test, environment) else statement.orelse
             returned, value = _evaluate_statements(branch, environment)
@@ -170,6 +217,16 @@ def _evaluate(node: ast.expr, environment: dict[str, Any]) -> Any:
         return result
     if isinstance(node, ast.Subscript):
         value = _evaluate(node.value, environment)
+        if isinstance(node.slice, ast.Slice):
+            if type(value) is not str or node.slice.step is not None:
+                raise ValueError("only simple string slices are supported")
+            lower = _evaluate(node.slice.lower, environment) if node.slice.lower is not None else None
+            upper = _evaluate(node.slice.upper, environment) if node.slice.upper is not None else None
+            if lower is not None and type(lower) is not int:
+                raise ValueError("string slice bounds must be integers")
+            if upper is not None and type(upper) is not int:
+                raise ValueError("string slice bounds must be integers")
+            return value[lower:upper]
         index = _evaluate(node.slice, environment)
         if type(value) is not dict or type(index) not in {str, int, float, bool}:
             raise ValueError("subscript accepts only an exact dictionary and scalar key")
@@ -197,16 +254,41 @@ def _evaluate(node: ast.expr, environment: dict[str, Any]) -> Any:
         values = [_evaluate(node.left, environment)] + [_evaluate(value, environment) for value in node.comparators]
         return all(_compare(left, right, operation) for left, right, operation in zip(values, values[1:], node.ops))
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
-        if node.func.id not in {"min", "max"} or len(node.args) != 2:
-            raise ValueError("function is outside behavior oracle subset")
-        values = [_evaluate(argument, environment) for argument in node.args]
-        if any(type(value) not in {int, float} for value in values):
-            raise ValueError("min/max accepts only two numeric scalars")
-        return min(values) if node.func.id == "min" else max(values)
+        if node.func.id in {"min", "max"}:
+            if len(node.args) != 2:
+                raise ValueError("min/max requires exactly two arguments")
+            values = [_evaluate(argument, environment) for argument in node.args]
+            if any(type(value) not in {int, float} for value in values):
+                raise ValueError("min/max accepts only two numeric scalars")
+            return min(values) if node.func.id == "min" else max(values)
+        if node.func.id == "str" and len(node.args) == 1:
+            value = _evaluate(node.args[0], environment)
+            if not _is_scalar(value):
+                raise ValueError("str accepts only a scalar")
+            return str(value)
+        if node.func.id == "bool" and len(node.args) == 1:
+            value = _evaluate(node.args[0], environment)
+            if not _is_scalar(value):
+                raise ValueError("bool accepts only a scalar")
+            return bool(value)
+        if node.func.id == "len" and len(node.args) == 1:
+            value = _evaluate(node.args[0], environment)
+            if type(value) not in {str, dict, list}:
+                raise ValueError("len accepts only exact strings, dictionaries, or lists")
+            return len(value)
+        if (
+            node.func.id == "isinstance"
+            and len(node.args) == 2
+            and isinstance(node.args[1], ast.Name)
+            and node.args[1].id in {"str", "int", "float", "bool"}
+        ):
+            value = _evaluate(node.args[0], environment)
+            return type(value).__name__ == node.args[1].id
+        raise ValueError("function is outside behavior oracle subset")
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and not node.keywords:
         value = _evaluate(node.func.value, environment)
         arguments = [_evaluate(argument, environment) for argument in node.args]
-        allowed = {str: {"strip", "lower", "upper", "casefold", "removeprefix", "replace", "split", "join"}, dict: {"get"}}
+        allowed = {str: {"strip", "lower", "upper", "casefold", "removeprefix", "replace", "split", "join", "startswith"}, dict: {"get"}}
         if node.func.attr not in allowed.get(type(value), set()):
             raise ValueError("method is not in behavior oracle allowlist")
         if node.func.attr == "split" and arguments:
