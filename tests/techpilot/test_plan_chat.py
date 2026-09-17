@@ -14,6 +14,7 @@ from techpilot.advanced.planning import PlanningService, PlanStore
 from techpilot.advanced.workspace import CopyWorkspaceBackend, WorkspaceCreationError, WorkspaceService
 from techpilot.chat.session import ChatSession, TerminalEventSink
 from techpilot.engine.llm import LLMResponse, ToolCall
+from techpilot.execution.validation import ValidationCommandResult, ValidationService
 from techpilot.runtime import RuntimeBootstrap, RuntimeBootstrapInput
 
 
@@ -47,7 +48,36 @@ def _repository(tmp_path: Path) -> Path:
     return repository
 
 
-def _session(tmp_path: Path, repository: Path, provider: FakeProvider, inputs: list[str]):
+class PassingValidationRunner:
+    """Keep Plan Chat tests independent of a nested pytest child process."""
+
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+
+    def execute(self, command, workspace_path: Path, *, cancellation_token=None) -> ValidationCommandResult:
+        del cancellation_token
+        argv = list(command)
+        self.commands.append(argv)
+        return ValidationCommandResult(
+            argv=argv,
+            resolved_argv=argv,
+            cwd=str(workspace_path.resolve()),
+            status="passed",
+            exit_code=0,
+            duration_seconds=0.0,
+            stdout="1 passed",
+            stderr="",
+        )
+
+
+def _session(
+    tmp_path: Path,
+    repository: Path,
+    provider: FakeProvider,
+    inputs: list[str],
+    *,
+    validation_service: ValidationService | None = None,
+):
     store = PlanStore(tmp_path / "plans")
     output = StringIO()
     console = Console(file=output, force_terminal=False, color_system=None, width=120)
@@ -61,6 +91,7 @@ def _session(tmp_path: Path, repository: Path, provider: FakeProvider, inputs: l
             workspace_service=WorkspaceService(CopyWorkspaceBackend(tmp_path / "runs")),
             runtime_bootstrap=RuntimeBootstrap(provider_factory=lambda config: provider),
             event_sink=sink,
+            validation_service=validation_service,
         ),
         console=console,
         input_fn=lambda prompt: inputs.pop(0),
@@ -79,11 +110,13 @@ def test_plan_chat_requires_explicit_approval_then_runs_in_workspace(tmp_path, m
         )]),
         LLMResponse(content="Conversational plan completed."),
     ])
+    validation_runner = PassingValidationRunner()
     session, store, output = _session(
         tmp_path,
         repository,
         provider,
         ["Append Plan Chat verification to README.md", "执行", "批准并执行。"],
+        validation_service=ValidationService(validation_runner),
     )
 
     assert session.run() == 0
@@ -103,6 +136,7 @@ def test_plan_chat_requires_explicit_approval_then_runs_in_workspace(tmp_path, m
     assert "Managed Run 执行与验证完成" in rendered
     assert "系统验证：passed" in rendered
     assert "Events:" in rendered
+    assert validation_runner.commands
     assert (metadata_paths[0].parent / "events.jsonl").is_file()
 
 
