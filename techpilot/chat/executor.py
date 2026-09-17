@@ -176,7 +176,12 @@ class RepositoryToolExecutor:
         )
         if assessment.required_control is RequiredControl.BLOCK:
             message = _control_message("该操作已被阻断，未执行。", assessment)
-            self._request_turn_stop(message)
+            # A rejected read/search has performed no side effect.  Keep the
+            # boundary intact but let the Agent use the denial as feedback and
+            # retry inside the repository.  Writes, shell commands and other
+            # effectful operations still end the turn after a block.
+            if tool.name not in {"read_file", "glob", "grep"}:
+                self._request_turn_stop(message)
             return f"Policy denied {tool.name}: {message}"
         if tool.name == "glob":
             pattern_error = _validate_relative_pattern(normalized.get("pattern"), "glob pattern")

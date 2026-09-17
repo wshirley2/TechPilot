@@ -19,6 +19,8 @@ from techpilot.cli import _normalize_command
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import PermissionDecision
+from techpilot.engine.tools.glob_tool import GlobTool
+from techpilot.engine.tools.grep import GrepTool
 from techpilot.learning import LearningRoleRuntime
 from techpilot.runtime import ActiveRole, ChatRuntime, RuntimeBootstrap, RuntimeBootstrapInput, TaskRuntime
 from techpilot.runtime.contracts import RuntimeMode
@@ -628,6 +630,37 @@ def test_repository_executor_denies_paths_outside_repository(tmp_path):
     NeverRun.name = "glob"
     result = executor.execute(NeverRun(), {"path": ".", "pattern": "../*.txt"})
     assert result.startswith("Policy denied glob")
+
+
+def test_repository_executor_presents_search_hits_relative_to_the_repository(tmp_path):
+    repository = tmp_path / "repository"
+    source = repository / "pkg" / "messages.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("MESSAGE = 'Connection failed'\n", encoding="utf-8")
+    executor = RepositoryToolExecutor(repository)
+
+    glob_result = executor.execute(GlobTool(), {"pattern": "**/*.py"})
+    grep_result = executor.execute(GrepTool(), {"pattern": "Connection failed", "include": "*.py"})
+
+    assert "pkg/messages.py" in glob_result
+    assert "pkg/messages.py:1: MESSAGE = 'Connection failed'" in grep_result
+    assert str(repository) not in glob_result
+    assert str(repository) not in grep_result
+
+
+def test_repository_executor_allows_recovery_after_a_blocked_read_search(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "messages.py").write_text("MESSAGE = 'Connection failed'\n", encoding="utf-8")
+    executor = RepositoryToolExecutor(repository)
+    executor.begin_turn()
+
+    denied = executor.execute(GlobTool(), {"pattern": "**/*", "path": ".."})
+    recovered = executor.execute(GlobTool(), {"pattern": "**/*.py"})
+
+    assert denied.startswith("Policy denied glob")
+    assert executor.consume_turn_stop_message() is None
+    assert recovered == "messages.py"
 
 
 def test_default_cli_spelling_enters_chat_for_current_or_explicit_repository():

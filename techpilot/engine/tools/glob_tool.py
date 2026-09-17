@@ -38,7 +38,11 @@ class GlobTool(Tool):
 
             total = len(hits)
             shown = hits[:100]
-            lines = [str(h) for h in shown]
+            # Tool callers operate relative to the requested search root.  Do
+            # not expose host-specific absolute workspace paths in the model
+            # context: an Agent may otherwise reuse an artifact-parent path
+            # in a later call and correctly hit the repository boundary.
+            lines = [_display_path(hit, base) for hit in shown]
             result = "\n".join(lines)
 
             if total > 100:
@@ -46,3 +50,14 @@ class GlobTool(Tool):
             return result or "No files matched."
         except Exception as e:
             return f"Error: {e}"
+
+
+def _display_path(path: Path, root: Path) -> str:
+    """Render a search hit relative to its search root for Tool callers."""
+
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        # A path outside the requested root is unexpected, but preserve a
+        # useful diagnostic instead of misrepresenting its location.
+        return str(path)

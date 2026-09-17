@@ -49,6 +49,7 @@ class GrepTool(Tool):
         else:
             files = self._walk(base, include)
 
+        display_root = base if base.is_dir() else base.parent
         matches = []
         for fp in files:
             try:
@@ -57,7 +58,7 @@ class GrepTool(Tool):
                 continue
             for lineno, line in enumerate(text.splitlines(), 1):
                 if regex.search(line):
-                    matches.append(f"{fp}:{lineno}: {line.rstrip()}")
+                    matches.append(f"{_display_path(fp, display_root)}:{lineno}: {line.rstrip()}")
                     if len(matches) >= 200:
                         matches.append("... (200 match limit reached)")
                         return "\n".join(matches)
@@ -78,3 +79,12 @@ class GrepTool(Tool):
             if len(results) >= 5000:
                 break
         return results
+
+
+def _display_path(path: Path, root: Path) -> str:
+    """Render a match relative to the requested search root for Tool callers."""
+
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
