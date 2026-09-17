@@ -12,7 +12,10 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
+import socket
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
@@ -212,6 +215,10 @@ class ModelAttemptStatus(str, Enum):
     TASK_FAILED = "task_failed"
     RUNTIME_FAILED = "runtime_failed"
     LIMIT_REACHED = "limit_reached"
+
+
+class ModelEvaluationOutputLockedError(RuntimeError):
+    """Raised before a Provider call when another Runner owns an output directory."""
 
 
 @dataclass(frozen=True)
@@ -458,24 +465,25 @@ class ModelEvaluationRunner:
 
         output_root = output_directory.resolve()
         output_root.mkdir(parents=True, exist_ok=True)
-        outcomes = _restore_or_initialize_progress(
-            output_root,
-            manifest=manifest,
-            cards=selected,
-            attempts_per_task=attempts_per_task,
-        )
-        completed = {(outcome.task_id, outcome.attempt) for outcome in outcomes}
-        for card in selected:
-            for attempt in range(1, attempts_per_task + 1):
-                if (card.id, attempt) in completed:
-                    continue
-                limits = _merged_limits(card.limits, limits_override)
-                outcomes.append(self._run_attempt(card, attempt, output_root, model=manifest.model, limits=limits))
-                completed.add((card.id, attempt))
-                _write_progress(output_root, cards=selected, outcomes=outcomes, attempts_per_task=attempts_per_task)
-        report = ModelEvaluationReport(manifest=manifest, cards=selected, outcomes=tuple(outcomes))
-        _write_json(output_root / "report.json", report.to_dict())
-        return report
+        with _EvaluationOutputLease(output_root):
+            outcomes = _restore_or_initialize_progress(
+                output_root,
+                manifest=manifest,
+                cards=selected,
+                attempts_per_task=attempts_per_task,
+            )
+            completed = {(outcome.task_id, outcome.attempt) for outcome in outcomes}
+            for card in selected:
+                for attempt in range(1, attempts_per_task + 1):
+                    if (card.id, attempt) in completed:
+                        continue
+                    limits = _merged_limits(card.limits, limits_override)
+                    outcomes.append(self._run_attempt(card, attempt, output_root, model=manifest.model, limits=limits))
+                    completed.add((card.id, attempt))
+                    _write_progress(output_root, cards=selected, outcomes=outcomes, attempts_per_task=attempts_per_task)
+            report = ModelEvaluationReport(manifest=manifest, cards=selected, outcomes=tuple(outcomes))
+            _write_json(output_root / "report.json", report.to_dict())
+            return report
 
     def _run_attempt(
         self,
@@ -1483,6 +1491,92 @@ def _write_patch(path: Path, before: Mapping[str, bytes], after: Mapping[str, by
 
 def _write_events(path: Path, events: Sequence[RuntimeEvent]) -> None:
     path.write_text("".join(json.dumps(event.to_dict(), ensure_ascii=False) + "\n" for event in events), encoding="utf-8")
+
+
+class _EvaluationOutputLease:
+    """An output-directory lease that prevents concurrent billable evaluation runs.
+
+    Progress files make a run resumable after interruption, but are not a
+    coordination primitive: two processes could otherwise restore the same
+    checkpoint and both start a Provider call.  The lock is acquired before
+    progress is read and held until the report is durable or the caller exits.
+    """
+
+    _FILENAME = ".model-evaluation.lock"
+
+    def __init__(self, root: Path) -> None:
+        self.path = root / self._FILENAME
+        self.owner = {
+            "schema_version": 1,
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "lease_id": uuid.uuid4().hex,
+        }
+        self._acquired = False
+
+    def __enter__(self):
+        while True:
+            try:
+                descriptor = json.dumps(self.owner, ensure_ascii=False).encode("utf-8")
+                handle = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                try:
+                    os.write(handle, descriptor)
+                finally:
+                    os.close(handle)
+                self._acquired = True
+                return self
+            except FileExistsError:
+                owner = _read_evaluation_output_lease(self.path)
+                if owner is None or _evaluation_output_lease_is_active(owner):
+                    raise ModelEvaluationOutputLockedError(
+                        f"model evaluation output is already active: {self.path}; "
+                        "wait for its owner to exit before resuming"
+                    )
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    continue
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+        if not self._acquired:
+            return
+        owner = _read_evaluation_output_lease(self.path)
+        if owner is not None and owner.get("lease_id") == self.owner["lease_id"]:
+            self.path.unlink(missing_ok=True)
+        self._acquired = False
+
+
+def _read_evaluation_output_lease(path: Path) -> Mapping[str, Any] | None:
+    """Return a valid lease descriptor, or ``None`` for malformed lock data."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or not isinstance(payload.get("host"), str)
+        or not isinstance(payload.get("pid"), int)
+        or not isinstance(payload.get("lease_id"), str)
+    ):
+        return None
+    return payload
+
+
+def _evaluation_output_lease_is_active(owner: Mapping[str, Any]) -> bool:
+    """Fail closed unless a same-host owner is definitely no longer running."""
+
+    if owner["host"] != socket.gethostname():
+        return True
+    try:
+        os.kill(owner["pid"], 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

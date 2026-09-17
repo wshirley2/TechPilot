@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from techpilot.evaluation import (
     ModelAttemptOutcome,
     ModelAttemptStatus,
     ModelEvaluationManifest,
+    ModelEvaluationOutputLockedError,
     ModelEvaluationReport,
     ModelEvaluationRunner,
     ModelTaskAcceptanceLevel,
@@ -413,6 +416,60 @@ def test_model_runner_keeps_evaluator_artifacts_outside_workspace_and_scores_a_s
     assert json.loads((tmp_path / "artifacts" / "manifest.json").read_text(encoding="utf-8"))["model"] == "fixed-model-evaluation"
     progress = json.loads((tmp_path / "artifacts" / "progress.json").read_text(encoding="utf-8"))
     assert progress["completed_attempt_count"] == progress["planned_attempt_count"] == 1
+    assert not (tmp_path / "artifacts" / ".model-evaluation.lock").exists()
+
+
+def test_model_runner_refuses_an_active_output_lease_before_starting_a_provider_call(tmp_path: Path) -> None:
+    card = ModelTaskCard(
+        id="locked-card",
+        suite=MODEL_CODING_DEV_V0_SUITE,
+        kind=ModelTaskKind.READ_ONLY,
+        prompts=("State the flag.",),
+        initial_files={"flag.txt": "flag: green\n"},
+        required_response_facts=("green",),
+    )
+    output = tmp_path / "artifacts"
+    output.mkdir()
+    lock_path = output / ".model-evaluation.lock"
+    lock_path.write_text(json.dumps({
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "lease_id": "other-active-run",
+    }), encoding="utf-8")
+    provider = FixedProvider([LLMResponse(content="green")])
+    runner = ModelEvaluationRunner(RuntimeBootstrap(provider_factory=lambda _config: provider))
+
+    with pytest.raises(ModelEvaluationOutputLockedError, match="already active"):
+        runner.run((card,), manifest=_manifest((card,)), output_directory=output)
+
+    assert provider.total_prompt_tokens == provider.total_completion_tokens == 0
+    assert lock_path.exists()
+
+
+def test_model_runner_reclaims_only_a_confirmed_stale_output_lease(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    card = ModelTaskCard(
+        id="stale-lock-card",
+        suite=MODEL_CODING_DEV_V0_SUITE,
+        kind=ModelTaskKind.READ_ONLY,
+        prompts=("State the flag.",),
+        initial_files={"flag.txt": "flag: green\n"},
+        required_response_facts=("green",),
+    )
+    output = tmp_path / "artifacts"
+    output.mkdir()
+    (output / ".model-evaluation.lock").write_text(json.dumps({
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": 999_999,
+        "lease_id": "dead-run",
+    }), encoding="utf-8")
+    monkeypatch.setattr("techpilot.evaluation.model_tasks._evaluation_output_lease_is_active", lambda _owner: False)
+
+    report = _runner([LLMResponse(content="green")]).run((card,), manifest=_manifest((card,)), output_directory=output)
+
+    assert report.started == report.passed == 1
+    assert not (output / ".model-evaluation.lock").exists()
 
 
 def test_model_runner_denies_out_of_scope_writes_and_reports_a_task_failure(tmp_path: Path) -> None:
@@ -526,6 +583,7 @@ def test_model_runner_resumes_an_interrupted_matching_run_without_repeating_comp
             output_directory=output,
             attempts_per_task=2,
         )
+    assert not (output / ".model-evaluation.lock").exists()
 
     report = _runner([LLMResponse(content="green")]).run(
         (card,),
@@ -559,6 +617,7 @@ def test_model_runner_recovers_a_persisted_attempt_missing_its_progress_checkpoi
         InterruptAfterPersistingAttempt(
             RuntimeBootstrap(provider_factory=lambda _config: FixedProvider([LLMResponse(content="green")]))
         ).run((card,), manifest=_manifest((card,)), output_directory=output)
+    assert not (output / ".model-evaluation.lock").exists()
 
     report = _runner([]).run((card,), manifest=_manifest((card,)), output_directory=output)
     assert report.started == report.passed == 1
