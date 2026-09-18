@@ -112,15 +112,22 @@ def test_tui_shows_block_reason_and_waits_for_the_existing_permission_prompt(tmp
         started.set()
         decision.append(tui.permission_prompt.decide(request))
 
-    worker = threading.Thread(target=decide)
+    # A test runner may be interrupted while the UI is displaying this prompt.
+    # Keep the helper daemonized and release it in ``finally`` so an interrupted
+    # assertion cannot leave a non-daemon permission waiter blocking pytest exit.
+    worker = threading.Thread(target=decide, daemon=True)
     worker.start()
-    assert started.wait(timeout=1)
-    tui._drain_updates()
-    assert "permission requested" in tui.transcript_text
-    assert "Trusted Diff" in tui.transcript_text
-    assert tui._input_prompt() == "Permission [1/2/3] > "
-    tui._answer_permission_text("allow")
-    worker.join(timeout=1)
+    try:
+        assert started.wait(timeout=1)
+        tui._drain_updates()
+        assert "permission requested" in tui.transcript_text
+        assert "Trusted Diff" in tui.transcript_text
+        assert tui._input_prompt() == "Permission [1/2/3] > "
+        tui._answer_permission_text("allow")
+    finally:
+        if worker.is_alive():
+            tui.answer_permission(PermissionDecision.deny("test cleanup after interruption"))
+            worker.join(timeout=1)
 
     assert decision[0].action.value == "allow"
     assert "permission approved" in tui.transcript_text
