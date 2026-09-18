@@ -28,8 +28,64 @@ jobs:
           python -m pip install -U pip
           python -m pip install -e ".[dev]"
 
-      - name: Run tests
-        run: python -m pytest tests/ -v
+      # Keep each Python test process below the Windows runner's observed
+      # external-interrupt window. The groups are intentionally disjoint and
+      # together cover every file under tests/.
+      - name: Run evaluation and execution tests
+        run: >-
+          python -m pytest -v
+          tests/techpilot/test_artifacts.py
+          tests/techpilot/test_behavior_oracle.py
+          tests/techpilot/test_domain.py
+          tests/techpilot/test_evaluation.py
+          tests/techpilot/test_evaluation_mutations.py
+          tests/techpilot/test_execution.py
+          tests/techpilot/test_execution_control.py
+
+      - name: Run runtime lifecycle tests
+        run: >-
+          python -m pytest -v
+          tests/techpilot/test_long_task_workflow.py
+          tests/techpilot/test_long_tasks.py
+          tests/techpilot/test_m0_demo.py
+          tests/techpilot/test_managed_run.py
+          tests/techpilot/test_model_evaluation.py
+          tests/techpilot/test_run_events.py
+          tests/techpilot/test_runtime_contracts.py
+          tests/techpilot/test_sessions.py
+          tests/techpilot/test_workspace.py
+
+      - name: Run chat and planning tests
+        run: >-
+          python -m pytest -v
+          tests/techpilot/test_chat.py
+          tests/techpilot/test_cli.py
+          tests/techpilot/test_permissions.py
+          tests/techpilot/test_plan_chat.py
+          tests/techpilot/test_planning.py
+          tests/techpilot/test_trust.py
+          tests/techpilot/test_tui.py
+
+      - name: Run learning and configuration tests
+        run: >-
+          python -m pytest -v
+          tests/techpilot/test_learning_conversation.py
+          tests/techpilot/test_learning_entry.py
+          tests/techpilot/test_learning_foundation.py
+          tests/techpilot/test_learning_research.py
+          tests/techpilot/test_repository.py
+          tests/techpilot/test_role_skill_contracts.py
+          tests/techpilot/test_user_config.py
+
+      - name: Run compatibility tests
+        run: >-
+          python -m pytest -v
+          tests/test_core.py
+          tests/test_litellm.py
+          tests/test_runtime_events.py
+          tests/test_session.py
+          tests/test_tool_execution.py
+          tests/test_tools.py
 
       - name: Compile
         run: python -m compileall -q techpilot tests
