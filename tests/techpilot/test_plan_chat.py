@@ -70,6 +70,28 @@ class PassingValidationRunner:
         )
 
 
+class FailingValidationRunner:
+    """Model a failed system validation without spawning nested pytest."""
+
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+
+    def execute(self, command, workspace_path: Path, *, cancellation_token=None) -> ValidationCommandResult:
+        del cancellation_token
+        argv = list(command)
+        self.commands.append(argv)
+        return ValidationCommandResult(
+            argv=argv,
+            resolved_argv=argv,
+            cwd=str(workspace_path.resolve()),
+            status="failed",
+            exit_code=1,
+            duration_seconds=0.0,
+            stdout="1 failed",
+            stderr="intentional validation failure",
+        )
+
+
 def _session(
     tmp_path: Path,
     repository: Path,
@@ -249,12 +271,13 @@ def test_workspace_creation_failure_stays_in_plan_mode_with_a_brief_retry_messag
 def test_plan_chat_reports_system_validation_failure_and_retains_workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
     repository = _repository(tmp_path)
-    (repository / "test_smoke.py").write_text("def test_smoke():\n    assert False\n", encoding="utf-8")
+    validation_runner = FailingValidationRunner()
     session, _, output = _session(
         tmp_path,
         repository,
         FakeProvider([LLMResponse(content="Agent implementation finished.")]),
         ["Append a validation failure note to README.md", "批准并执行"],
+        validation_service=ValidationService(validation_runner),
     )
 
     assert session.run() == 1
@@ -267,3 +290,4 @@ def test_plan_chat_reports_system_validation_failure_and_retains_workspace(tmp_p
     rendered = output.getvalue()
     assert "系统验证：failed" in rendered
     assert "Managed Run 验证未通过" in rendered
+    assert validation_runner.commands
