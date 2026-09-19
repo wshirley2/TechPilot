@@ -20,7 +20,6 @@ from techpilot.engine.tool_execution import (
     resources_conflict,
 )
 from techpilot.engine.tools.base import Tool
-from techpilot.engine.tools.research import ResearchDocumentTool, ResearchUrlTool
 
 
 class FakeLLM:
@@ -300,26 +299,6 @@ def test_repository_executor_describes_effect_resources_and_cwd(tmp_path):
     assert write is not None and write.effect is ToolEffect.WRITE and write.concurrency is ToolConcurrency.EXCLUSIVE
     assert command is not None and command.effect is ToolEffect.EXECUTE and command.resources_known is False
     assert unknown is None
-
-
-def test_learning_research_tools_keep_network_exclusive_and_documents_workspace_read_only(tmp_path):
-    executor = RepositoryToolExecutor(tmp_path)
-
-    source = executor.describe_call(ResearchUrlTool(), {"url": "https://example.test/docs"})
-    document = executor.describe_call(ResearchDocumentTool(), {"file_path": "notes/topic.md"})
-
-    assert source is not None
-    assert source.effect is ToolEffect.NETWORK
-    assert source.concurrency is ToolConcurrency.EXCLUSIVE
-    assert source.resources_known is False
-    assert document == ToolExecutionDescription(
-        ToolEffect.READ,
-        ToolConcurrency.SAFE,
-        (str((tmp_path / "notes" / "topic.md").resolve()),),
-        str(tmp_path.resolve()),
-    )
-    denied = executor.execute(ResearchUrlTool(), {"url": "https://example.test/docs"})
-    assert denied.startswith("Permission denied research_url")
 
 
 class StoppingExecutor:

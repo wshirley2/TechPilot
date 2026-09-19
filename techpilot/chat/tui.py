@@ -35,7 +35,6 @@ from prompt_toolkit.widgets import TextArea
 
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
 from techpilot.engine.permissions import PermissionDecision, PermissionGrantScope, PermissionRequest
-from techpilot.learning import LearningChoice, LearningCommandController, LearningConversationController, LearningTurn
 
 from ..runtime import TaskRuntime
 from .session import ToolCallDetail, _find_tool_call_detail, _format_tool_call_detail, _tool_call_details, _tool_status
@@ -66,14 +65,6 @@ class _ToolActivity:
 class _PendingPermission:
     request: PermissionRequest
     response: queue.Queue[PermissionDecision]
-
-
-@dataclass
-class _PendingLearningChoice:
-    choice: LearningChoice
-    user_input: str
-    entry: _TranscriptEntry
-    selected_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -177,8 +168,6 @@ class TechPilotTui:
 
     def __init__(self) -> None:
         self.runtime: TaskRuntime | None = None
-        self.learning: LearningCommandController | None = None
-        self.learning_conversation: LearningConversationController | None = None
         self.event_sink = TuiEventSink(self)
         self.permission_prompt = TuiPermissionPrompt(self)
         self._updates: queue.SimpleQueue[tuple[str, object]] = queue.SimpleQueue()
@@ -186,9 +175,6 @@ class TechPilotTui:
         self._tool_activities: dict[str, _ToolActivity] = {}
         self._expanded_tool_groups: set[str] = set()
         self._pending_permission: _PendingPermission | None = None
-        self._pending_learning_choice: _PendingLearningChoice | None = None
-        self._learning_routing = False
-        self._suppressed_user_echo: str | None = None
         self._restored_session_id: str | None = None
         self._running = False
         self._streamed_turn = False
@@ -244,9 +230,6 @@ class TechPilotTui:
 
         @bindings.add("enter", eager=True)
         def _submit_input(event) -> None:
-            if self._pending_learning_choice is not None:
-                self._choose_learning_option(self._pending_learning_choice.selected_index)
-                return
             if _physical_shift_is_pressed():
                 self._insert_input_newline(event.current_buffer)
                 return
@@ -269,27 +252,6 @@ class TechPilotTui:
         @bindings.add("pagedown")
         def _page_down(_event) -> None:
             self._scroll_transcript(1, page=True)
-
-        @bindings.add("up", eager=True)
-        def _choice_up(_event) -> None:
-            if self._pending_learning_choice is not None:
-                self._move_learning_choice(-1)
-
-        @bindings.add("down", eager=True)
-        def _choice_down(_event) -> None:
-            if self._pending_learning_choice is not None:
-                self._move_learning_choice(1)
-
-        for index, key in enumerate(("1", "2", "3")):
-            @bindings.add(key, eager=True)
-            def _choose_learning(_event, selected_index: int = index) -> None:
-                if self._pending_learning_choice is not None:
-                    self._choose_learning_option(selected_index)
-
-        @bindings.add("escape")
-        def _cancel_learning_choice(_event) -> None:
-            if self._pending_learning_choice is not None:
-                self._cancel_learning_choice()
 
         @bindings.add("c-home")
         def _scroll_top(_event) -> None:
@@ -361,12 +323,6 @@ class TechPilotTui:
 
     def bind_runtime(self, runtime: TaskRuntime) -> None:
         self.runtime = runtime
-        self.learning = LearningCommandController(
-            session_sink=getattr(runtime, "session_sink", None),
-            session_id=runtime.agent.session_id,
-        )
-        if hasattr(runtime.agent, "llm"):
-            self.learning_conversation = LearningConversationController(self.learning.service)
         self._restore_session_transcript()
         self._status = "Ready"
         self._refresh_status()
@@ -516,43 +472,15 @@ class TechPilotTui:
             buffer.text = ""
             self._answer_permission_text(text)
             return True
-        if self._pending_learning_choice is not None:
-            return False
         if self._handle_details_command(text):
             buffer.text = ""
-            return True
-        if self.learning is not None and text.startswith("/learn"):
-            buffer.text = ""
-            self._follow_tail = True
-            self._append_transcript("you", text, kind="user")
-            self._append_transcript("学习", self.learning.handle(text[len("/learn"):]), kind="system")
             return True
         if self._running:
             self._status = "A turn is already running. Press Ctrl+C to cancel it."
             self._refresh_status()
             return False
-        if self._learning_routing:
-            self._status = "正在理解你的学习请求…"
-            self._refresh_status()
-            return False
         if self.runtime is None:
             return False
-        if self.learning is not None:
-            if self.learning_conversation is not None and self.learning_conversation.should_route(text):
-                buffer.text = ""
-                self._follow_tail = True
-                self._learning_routing = True
-                self._status = "正在理解你的学习请求…"
-                self._refresh_status()
-                threading.Thread(target=self._prepare_learning_turn, args=(text,), daemon=True).start()
-                return True
-            learning_reply = self.learning.start_from_message(text)
-            if learning_reply is not None:
-                buffer.text = ""
-                self._follow_tail = True
-                self._append_transcript("you", text, kind="user")
-                self._append_transcript("学习", learning_reply, kind="system")
-                return True
         buffer.text = ""
         self._start_runtime_turn(text)
         return True
@@ -562,8 +490,6 @@ class TechPilotTui:
         text: str,
         *,
         status: str = "正在思考…",
-        allow_tools: bool = True,
-        clear_role_after_turn: bool = False,
     ) -> None:
         self._follow_tail = True
         self._running = True
@@ -572,100 +498,7 @@ class TechPilotTui:
         self._stream_buffer = ""
         self._status = status
         self._refresh_status()
-        arguments = (text,) if allow_tools and not clear_role_after_turn else (text, allow_tools, clear_role_after_turn)
-        threading.Thread(target=self._run_turn, args=arguments, daemon=True).start()
-
-    def _prepare_learning_turn(self, text: str) -> None:
-        assert self.runtime is not None
-        assert self.learning_conversation is not None
-        try:
-            turn = self.learning_conversation.prepare(self.runtime, text)
-        except Exception as error:
-            turn = LearningTurn(notice=f"学习请求暂时无法处理：{error}")
-        # Only show Skill preparation after routing confirms that a learning
-        # Role will actually be used. Lightweight introductions and pending
-        # choices must not claim that a Skill is loading.
-        if turn.stage is not None:
-            self._updates.put(("learning_stage", "✻ 正在准备 Skill…"))
-            self._invalidate()
-        self._updates.put(("learning_prepared", (text, turn)))
-        self._invalidate()
-
-    def _apply_learning_turn(self, text: str, turn: LearningTurn, *, user_already_visible: bool = False) -> None:
-        if turn.choice is not None:
-            if not user_already_visible:
-                self._append_transcript("you", text, kind="user")
-            entry = self._append_transcript("学习选择", "", kind="choice")
-            self._pending_learning_choice = _PendingLearningChoice(turn.choice, text, entry)
-            self._render_learning_choice()
-            self._status = "请选择学习方式"
-            self._refresh_status()
-            return
-        user_echo_visible = user_already_visible
-        if turn.notice is not None:
-            if not user_already_visible:
-                self._append_transcript("you", text, kind="user")
-            user_echo_visible = True
-            self._append_transcript("学习进度", turn.notice, kind="system")
-        if turn.stage is not None:
-            self._status = turn.stage
-        if turn.user_input is not None:
-            if user_echo_visible and turn.user_input == text:
-                self._suppressed_user_echo = text
-            options: dict[str, object] = {"status": turn.stage or "正在思考…"}
-            if not turn.allow_tools:
-                options["allow_tools"] = False
-            if turn.clear_role_after_turn:
-                options["clear_role_after_turn"] = True
-            self._start_runtime_turn(turn.user_input, **options)
-            return
-        self._status = "Ready"
-        self._refresh_status()
-
-    def _move_learning_choice(self, direction: int) -> None:
-        pending = self._pending_learning_choice
-        if pending is None:
-            return
-        pending.selected_index = (pending.selected_index + direction) % len(pending.choice.options)
-        self._render_learning_choice()
-
-    def _choose_learning_option(self, index: int) -> None:
-        pending = self._pending_learning_choice
-        if pending is None or self.runtime is None or self.learning_conversation is None:
-            return
-        if not 0 <= index < len(pending.choice.options):
-            return
-        pending.selected_index = index
-        pending.entry.body = self._learning_choice_body(pending.choice, index, resolved=True)
-        self._pending_learning_choice = None
-        turn = self.learning_conversation.choose(self.runtime, index)
-        self._apply_learning_turn(pending.user_input, turn, user_already_visible=True)
-
-    def _cancel_learning_choice(self) -> None:
-        pending = self._pending_learning_choice
-        if pending is None:
-            return
-        pending.entry.body = self._learning_choice_body(pending.choice, pending.selected_index, cancelled=True)
-        self._pending_learning_choice = None
-        self._append_transcript("学习", "已取消本次学习选择。", kind="system")
-        self._status = "Ready"
-        self._refresh_status()
-
-    def _render_learning_choice(self) -> None:
-        pending = self._pending_learning_choice
-        if pending is None:
-            return
-        pending.entry.body = self._learning_choice_body(pending.choice, pending.selected_index)
-        self._invalidate()
-
-    @staticmethod
-    def _learning_choice_body(choice: LearningChoice, selected_index: int, *, resolved: bool = False, cancelled: bool = False) -> str:
-        options = "\n".join(
-            f"{'❯' if index == selected_index else ' '} {index + 1}. {option}"
-            for index, option in enumerate(choice.options)
-        )
-        suffix = "已取消。" if cancelled else (f"已选择：{choice.options[selected_index]}" if resolved else "↑↓ 选择 · Enter 确认 · Esc 取消")
-        return f"{choice.title}\n\n{options}\n\n{suffix}"
+        threading.Thread(target=self._run_turn, args=(text,), daemon=True).start()
 
     def _dismiss_welcome(self, buffer=None) -> None:
         """Keep the welcome block and clear only an optional input buffer."""
@@ -703,19 +536,14 @@ class TechPilotTui:
             return "Permission [1/2/3] > "
         return "❯ "
 
-    def _run_turn(self, text: str, allow_tools: bool = True, clear_role_after_turn: bool = False) -> None:
+    def _run_turn(self, text: str) -> None:
         assert self.runtime is not None
         try:
-            if allow_tools:
-                self.runtime.run_turn(text)
-            else:
-                self.runtime.run_turn(text, allow_tools=False)
+            self.runtime.run_turn(text)
         except Exception as error:
             self._updates.put(("worker_error", str(error)))
             self._invalidate()
         finally:
-            if clear_role_after_turn:
-                self.runtime.clear_role()
             self._updates.put(("turn_finished", None))
             self._invalidate()
 
@@ -739,13 +567,6 @@ class TechPilotTui:
             elif kind == "worker_error":
                 self._status = f"Turn failed: {value}"
                 self._append_transcript("error", f"Runtime error: {value}", kind="error")
-            elif kind == "learning_prepared":
-                text, turn = value  # type: ignore[misc]
-                self._learning_routing = False
-                self._apply_learning_turn(str(text), turn)  # type: ignore[arg-type]
-            elif kind == "learning_stage":
-                self._status = str(value)
-                self._refresh_status()
             elif kind == "turn_finished":
                 self._running = False
                 self._refresh_status()
@@ -763,10 +584,7 @@ class TechPilotTui:
             self._stream_entry = None
             self._follow_tail = True
             user_input = str(payload.get("user_input", ""))
-            if self._suppressed_user_echo == user_input:
-                self._suppressed_user_echo = None
-            else:
-                self._append_transcript("you", user_input, kind="user")
+            self._append_transcript("you", user_input, kind="user")
             self._stream_buffer = ""
             self._status = "Thinking…"
         elif event_type is RuntimeEventType.PROVIDER_STARTED:

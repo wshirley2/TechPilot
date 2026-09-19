@@ -29,7 +29,7 @@ def test_public_api_exports():
     assert Config is not None
     assert {tool.name for tool in ALL_TOOLS} == {
         "agent", "bash", "edit_file", "fetch_url", "glob", "grep", "now",
-        "read_file", "research_document", "research_url", "write_file",
+        "read_file", "write_file",
     }
 
 

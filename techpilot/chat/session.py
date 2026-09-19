@@ -22,7 +22,6 @@ from rich.text import Text
 from techpilot.engine.context import estimate_tokens
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
 from techpilot.engine.tools.edit import _changed_files
-from techpilot.learning import LearningChoice, LearningCommandController, LearningConversationController, LearningTurn
 
 from ..runtime import TaskRuntime
 
@@ -249,18 +248,6 @@ class ChatSession:
         self.console = console or Console()
         self.input_fn = input_fn
         self._prompt_session: PromptSession[str] | None = None
-        self.learning = LearningCommandController(
-            session_sink=getattr(runtime, "session_sink", None),
-            session_id=getattr(getattr(runtime, "agent", None), "session_id", None),
-        )
-        self.learning_conversation = (
-            LearningConversationController(self.learning.service)
-            if hasattr(getattr(runtime, "agent", None), "llm")
-            else None
-        )
-        self._learning_choice: LearningChoice | None = None
-        self._turn_allows_tools = True
-        self._clear_role_after_turn = False
 
     def run(self) -> int:
         self.show_startup()
@@ -283,33 +270,8 @@ class ChatSession:
                 self._handle_command(user_input)
                 continue
 
-            if self._learning_choice is not None:
-                if user_input in {"1", "2", "3"} and self.learning_conversation is not None:
-                    turn = self.learning_conversation.choose(self.runtime, int(user_input) - 1)
-                    self._learning_choice = None
-                    user_input = self._handle_learning_turn(turn)
-                    if user_input is None:
-                        continue
-                else:
-                    self.console.print("[yellow]请先输入 1、2 或 3 完成当前学习选择。[/yellow]")
-                    continue
-
-            if self.learning_conversation is not None and self.learning_conversation.should_route(user_input):
-                turn = self.learning_conversation.prepare(self.runtime, user_input)
-                user_input = self._handle_learning_turn(turn)
-                if user_input is None:
-                    continue
-            else:
-                learning_reply = self.learning.start_from_message(user_input)
-                if learning_reply is not None:
-                    self.console.print(Panel(learning_reply, title="学习", border_style="green"))
-                    continue
-
             try:
-                if self._turn_allows_tools:
-                    response = self.runtime.run_turn(user_input)
-                else:
-                    response = self.runtime.run_turn(user_input, allow_tools=False)
+                response = self.runtime.run_turn(user_input)
                 # Providers used by embedders may not stream token callbacks.
                 sink = self.runtime.agent.event_sink
                 if not getattr(sink, "last_turn_streamed", False) and response:
@@ -319,25 +281,7 @@ class ChatSession:
             except Exception as error:
                 self.console.print(f"[red]Error: {error}[/red]")
             finally:
-                if self._clear_role_after_turn:
-                    self.runtime.clear_role()
-                self._turn_allows_tools = True
-                self._clear_role_after_turn = False
                 self._ensure_session_persisted()
-
-    def _handle_learning_turn(self, turn: LearningTurn) -> str | None:
-        if turn.choice is not None:
-            self._learning_choice = turn.choice
-            options = "\n".join(f"{index}. {option}" for index, option in enumerate(turn.choice.options, start=1))
-            self.console.print(Panel(f"{turn.choice.title}\n\n{options}\n\n请输入 1、2 或 3 选择。", title="学习选择", border_style="yellow"))
-            return None
-        if turn.notice is not None:
-            self.console.print(Panel(turn.notice, title="学习进度", border_style="green"))
-        if turn.stage is not None:
-            self.console.print(f"[dim]{turn.stage}[/dim]")
-        self._turn_allows_tools = turn.allow_tools
-        self._clear_role_after_turn = turn.clear_role_after_turn
-        return turn.user_input
 
     def _read_input(self, prompt: str) -> str:
         if self.input_fn is not None:
@@ -392,7 +336,6 @@ class ChatSession:
             "/details": lambda: self._details(argument.strip()),
             "/model": lambda: self._model(argument.strip()),
             "/clear": self._clear,
-            "/learn": lambda: self._learn(argument),
         }
         handler = handlers.get(command.lower())
         if handler is None:
@@ -410,7 +353,6 @@ class ChatSession:
             "/compact Compress model context",
             "/model [name]  Show or switch model",
             "/clear   Clear conversation messages",
-            "/learn <topic>  Start a developer learning path",
         ]
         lines.extend([
             "/save    Show the active auto-saved event Session",
@@ -423,9 +365,6 @@ class ChatSession:
             "/exit    Exit Chat",
         ])
         self.console.print(Panel("\n".join(lines), title="TechPilot Commands"))
-
-    def _learn(self, argument: str) -> None:
-        self.console.print(Panel(self.learning.handle(argument), title="Learning", border_style="green"))
 
     def _show_status(self) -> None:
         """Show the small set of live facts most useful during a Chat turn."""

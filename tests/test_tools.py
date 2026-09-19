@@ -7,10 +7,10 @@ from types import SimpleNamespace
 from techpilot.engine.tools import ALL_TOOLS, get_tool
 
 
-def test_tool_registry_contains_core_and_role_gated_research_tools():
+def test_tool_registry_contains_core_tools():
     assert {tool.name for tool in ALL_TOOLS} == {
         "agent", "bash", "edit_file", "fetch_url", "glob", "grep", "now",
-        "read_file", "research_document", "research_url", "write_file",
+        "read_file", "write_file",
     }
 
 

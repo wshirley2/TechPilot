@@ -66,13 +66,9 @@ jobs:
           tests/techpilot/test_trust.py
           tests/techpilot/test_tui.py
 
-      - name: Run learning and configuration tests
+      - name: Run configuration and Role contract tests
         run: >-
           python -m pytest -v
-          tests/techpilot/test_learning_conversation.py
-          tests/techpilot/test_learning_entry.py
-          tests/techpilot/test_learning_foundation.py
-          tests/techpilot/test_learning_research.py
           tests/techpilot/test_repository.py
           tests/techpilot/test_role_skill_contracts.py
           tests/techpilot/test_user_config.py

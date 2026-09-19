@@ -489,7 +489,7 @@ class RuntimeBootstrap:
             base_tools=tuple(tools),
             role_tool_catalog={
                 name: tool
-                for name in ("research_url", "research_document")
+                for name in ("fetch_url", "agent")
                 if (tool := get_tool(name)) is not None
             },
         )

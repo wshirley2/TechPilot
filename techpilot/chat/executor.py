@@ -44,7 +44,6 @@ _PATH_ARGUMENTS = {
     "write_file": "file_path",
     "glob": "path",
     "grep": "path",
-    "research_document": "file_path",
 }
 _TOOL_EFFECTS = {
     "read_file": PermissionEffect.READ,
@@ -55,8 +54,6 @@ _TOOL_EFFECTS = {
     "write_file": PermissionEffect.WRITE,
     "bash": PermissionEffect.EXECUTE,
     "fetch_url": PermissionEffect.NETWORK,
-    "research_url": PermissionEffect.NETWORK,
-    "research_document": PermissionEffect.READ,
     "agent": PermissionEffect.DELEGATE,
 }
 class RepositoryToolExecutor:
@@ -119,8 +116,6 @@ class RepositoryToolExecutor:
             "write_file": ToolEffect.WRITE,
             "bash": ToolEffect.EXECUTE,
             "fetch_url": ToolEffect.NETWORK,
-            "research_url": ToolEffect.NETWORK,
-            "research_document": ToolEffect.READ,
             "agent": ToolEffect.DELEGATE,
         }.get(tool.name)
         if effect is None:
@@ -478,8 +473,6 @@ def _operation_kind(tool_name: str, command: NormalizedCommand | None) -> Operat
         "edit_file": OperationKind.WRITE,
         "write_file": OperationKind.WRITE,
         "fetch_url": OperationKind.NETWORK,
-        "research_url": OperationKind.NETWORK,
-        "research_document": OperationKind.READ,
         "now": OperationKind.READ,
     }.get(tool_name)
     if fixed is not None:
@@ -536,7 +529,7 @@ def _impact_scope(
 
 
 def _external_effect(tool_name: str, command: NormalizedCommand | None) -> ExternalEffect:
-    if tool_name in {"fetch_url", "research_url"}:
+    if tool_name == "fetch_url":
         return ExternalEffect.NETWORK
     if command is None:
         return ExternalEffect.NONE

@@ -36,7 +36,6 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["techpilot"]
-include = ["techpilot/learning/skills/**/*.md"]
 
 [project.optional-dependencies]
 litellm = ["litellm>=1.60.0,<2.0.0"]

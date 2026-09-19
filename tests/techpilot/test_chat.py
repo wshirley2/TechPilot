@@ -21,7 +21,6 @@ from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import PermissionDecision
 from techpilot.engine.tools.glob_tool import GlobTool
 from techpilot.engine.tools.grep import GrepTool
-from techpilot.learning import LearningRoleRuntime
 from techpilot.runtime import ActiveRole, ChatRuntime, RuntimeBootstrap, RuntimeBootstrapInput, TaskRuntime
 from techpilot.runtime.contracts import RuntimeMode
 from techpilot.runtime.sessions import SessionEvent, SessionStore
@@ -448,24 +447,6 @@ def test_runtime_bootstrap_builds_profile_context_and_repository_scoped_agent(tm
     }
 
 
-def test_learning_role_exposes_research_tools_only_while_active(tmp_path, monkeypatch):
-    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
-    runtime = make_runtime(
-        BENCHMARK_ROOT,
-        FakeProvider([]),
-        Console(file=StringIO(), force_terminal=False, color_system=None),
-        session_directory=tmp_path / "sessions",
-    )
-
-    LearningRoleRuntime().activate(runtime)
-
-    assert {tool.name for tool in runtime.tools} >= {"research_url", "research_document"}
-    assert {tool.name for tool in runtime.agent.tools} == {tool.name for tool in runtime.tools}
-    runtime.clear_role()
-    assert "research_url" not in {tool.name for tool in runtime.tools}
-    assert "research_document" not in {tool.name for tool in runtime.tools}
-
-
 def test_role_switch_replaces_prior_role_tools_and_records_structured_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
     runtime = make_runtime(
@@ -475,22 +456,22 @@ def test_role_switch_replaces_prior_role_tools_and_records_structured_lifecycle(
         session_directory=tmp_path / "sessions",
     )
 
-    runtime.activate_role("research-role", "research context", tool_names=("research_url",))
-    runtime.activate_role("document-role", "document context", tool_names=("research_document",))
+    runtime.activate_role("network-role", "network context", tool_names=("fetch_url",))
+    runtime.activate_role("delegate-role", "delegate context", tool_names=("agent",))
 
     assert runtime.active_role == ActiveRole(
-        role_id="document-role",
-        context="document context",
-        tool_names=("research_document",),
+        role_id="delegate-role",
+        context="delegate context",
+        tool_names=("agent",),
     )
-    assert "research_url" not in {tool.name for tool in runtime.tools}
-    assert "research_document" in {tool.name for tool in runtime.tools}
-    assert "document context" in runtime.agent._system
-    assert "research context" not in runtime.agent._system
+    assert "fetch_url" not in {tool.name for tool in runtime.tools}
+    assert "agent" in {tool.name for tool in runtime.tools}
+    assert "delegate context" in runtime.agent._system
+    assert "network context" not in runtime.agent._system
     events = runtime.session_store.replay(runtime.agent.session_id).events
     assert [(event.event_type, event.payload) for event in events if event.event_type == "role_activated"] == [
-        ("role_activated", {"role_id": "research-role", "tool_names": ["research_url"]}),
-        ("role_activated", {"role_id": "document-role", "tool_names": ["research_document"]}),
+        ("role_activated", {"role_id": "network-role", "tool_names": ["fetch_url"]}),
+        ("role_activated", {"role_id": "delegate-role", "tool_names": ["agent"]}),
     ]
 
 
@@ -502,7 +483,7 @@ def test_failed_role_switch_restores_prior_runtime_and_agent_projection(tmp_path
         Console(file=StringIO(), force_terminal=False, color_system=None),
         session_directory=tmp_path / "sessions",
     )
-    runtime.activate_role("research-role", "research context", tool_names=("research_url",))
+    runtime.activate_role("network-role", "network context", tool_names=("fetch_url",))
     original_update = runtime.agent.update_system_context
     calls = 0
 
@@ -516,19 +497,19 @@ def test_failed_role_switch_restores_prior_runtime_and_agent_projection(tmp_path
     monkeypatch.setattr(runtime.agent, "update_system_context", fail_once)
 
     with pytest.raises(RuntimeError, match="simulated context failure"):
-        runtime.activate_role("document-role", "document context", tool_names=("research_document",))
+        runtime.activate_role("delegate-role", "delegate context", tool_names=("agent",))
 
     assert runtime.active_role == ActiveRole(
-        role_id="research-role",
-        context="research context",
-        tool_names=("research_url",),
+        role_id="network-role",
+        context="network context",
+        tool_names=("fetch_url",),
     )
-    assert "research_url" in {tool.name for tool in runtime.tools}
-    assert "research_document" not in {tool.name for tool in runtime.tools}
-    assert "research context" in runtime.agent._system
-    assert "document context" not in runtime.agent._system
+    assert "fetch_url" in {tool.name for tool in runtime.tools}
+    assert "agent" not in {tool.name for tool in runtime.tools}
+    assert "network context" in runtime.agent._system
+    assert "delegate context" not in runtime.agent._system
     events = runtime.session_store.replay(runtime.agent.session_id).events
-    assert [event.payload["role_id"] for event in events if event.event_type == "role_activated"] == ["research-role"]
+    assert [event.payload["role_id"] for event in events if event.event_type == "role_activated"] == ["network-role"]
 
 
 def test_temporary_role_scope_clears_on_exception_and_restores_default_chat(tmp_path, monkeypatch):
@@ -541,19 +522,19 @@ def test_temporary_role_scope_clears_on_exception_and_restores_default_chat(tmp_
     )
 
     with pytest.raises(RuntimeError, match="cancelled temporary role"), runtime.role_scope(
-        "temporary-role", "temporary context", tool_names=("research_url",)
+        "temporary-role", "temporary context", tool_names=("fetch_url",)
     ):
         assert runtime.active_role is not None
-        assert "research_url" in {tool.name for tool in runtime.tools}
+        assert "fetch_url" in {tool.name for tool in runtime.tools}
         raise RuntimeError("cancelled temporary role")
 
     assert runtime.active_role is None
     assert runtime.role_context is None
-    assert "research_url" not in {tool.name for tool in runtime.tools}
+    assert "fetch_url" not in {tool.name for tool in runtime.tools}
     assert "temporary context" not in runtime.agent._system
     events = runtime.session_store.replay(runtime.agent.session_id).events
     assert [(event.event_type, event.payload) for event in events if event.event_type.startswith("role_")] == [
-        ("role_activated", {"role_id": "temporary-role", "tool_names": ["research_url"]}),
+        ("role_activated", {"role_id": "temporary-role", "tool_names": ["fetch_url"]}),
         ("role_cleared", {"role_id": "temporary-role"}),
     ]
 
@@ -567,7 +548,7 @@ def test_resuming_session_does_not_reactivate_historical_role(tmp_path, monkeypa
         Console(file=StringIO(), force_terminal=False, color_system=None),
         session_directory=session_directory,
     )
-    first.activate_role("research-role", "research context", tool_names=("research_url",))
+    first.activate_role("network-role", "network context", tool_names=("fetch_url",))
 
     resumed = RuntimeBootstrap(provider_factory=lambda _config: FakeProvider([])).build(RuntimeBootstrapInput(
         repository=tmp_path,
@@ -578,7 +559,7 @@ def test_resuming_session_does_not_reactivate_historical_role(tmp_path, monkeypa
 
     assert resumed.active_role is None
     assert resumed.role_context is None
-    assert "research_url" not in {tool.name for tool in resumed.tools}
+    assert "fetch_url" not in {tool.name for tool in resumed.tools}
     assert any("不会自动恢复 Role、工具或历史授权" in notice for notice in resumed.consume_recovery_notices())
 
 
