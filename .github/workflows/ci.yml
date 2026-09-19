@@ -10,6 +10,12 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # Git Bash is available on GitHub-hosted Windows runners.  Keep the test
+    # invocation shell identical across the matrix: PowerShell has reported a
+    # non-zero native-process status here after pytest has completed cleanly.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
