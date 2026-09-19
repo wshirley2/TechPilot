@@ -2,6 +2,10 @@
 
 from pathlib import Path
 
+from techpilot.safety.paths import is_sensitive_path
+
+from ..tool_results import ToolResult, ToolStatus
+from ..tool_validation import validated_tool
 from .base import Tool
 
 
@@ -20,18 +24,23 @@ class ReadFileTool(Tool):
             },
             "offset": {
                 "type": "integer",
+                "minimum": 1,
                 "description": "Start line (1-based). Default 1.",
             },
             "limit": {
                 "type": "integer",
+                "minimum": 1,
                 "description": "Max lines to read. Default 2000.",
             },
         },
         "required": ["file_path"],
     }
 
+    @validated_tool
     def execute(self, file_path: str, offset: int = 1, limit: int = 2000) -> str:
         try:
+            if is_sensitive_path(Path(file_path).expanduser()):
+                return ToolResult("Permission denied read_file: sensitive file", ToolStatus.DENIED)
             p = Path(file_path).expanduser().resolve()
             if not p.exists():
                 return f"Error: {file_path} not found"
@@ -49,6 +58,6 @@ class ReadFileTool(Tool):
 
             if total > start + limit:
                 result += f"\n... ({total} lines total, showing {start+1}-{start+len(chunk)})"
-            return result or "(empty file)"
+            return ToolResult(result or "(empty file)")
         except Exception as e:
             return f"Error: {e}"

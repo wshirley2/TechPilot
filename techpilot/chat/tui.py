@@ -630,7 +630,7 @@ class TechPilotTui:
                 )
             result = str(payload.get("result", ""))
             activity.result = result
-            activity.status = "cancelled" if payload.get("interrupted") else _tool_status(result)
+            activity.status = "cancelled" if payload.get("interrupted") else _tool_status(result, payload.get("tool_status"))
             activity.finished_at = time.monotonic()
             self._status = f"{activity.tool_name}: {activity.status}"
             self._refresh_tool_entry(activity)

@@ -9,6 +9,8 @@ and makes edits safe and reviewable.
 import difflib
 from pathlib import Path
 
+from ..tool_results import ToolResult, ToolStatus
+from ..tool_validation import validated_tool
 from .base import Tool
 
 # track files changed this session for /diff
@@ -31,6 +33,7 @@ class EditFileTool(Tool):
             },
             "old_string": {
                 "type": "string",
+                "minLength": 1,
                 "description": "Exact text to find (must be unique in file)",
             },
             "new_string": {
@@ -41,7 +44,9 @@ class EditFileTool(Tool):
         "required": ["file_path", "old_string", "new_string"],
     }
 
+    @validated_tool
     def execute(self, file_path: str, old_string: str, new_string: str) -> str:
+        writing = False
         try:
             p = Path(file_path).expanduser().resolve()
             if not p.exists():
@@ -66,6 +71,7 @@ class EditFileTool(Tool):
                 )
 
             new_content = content.replace(old_string, new_string, 1)
+            writing = True
             p.write_text(new_content, encoding="utf-8")
             _changed_files.add(str(p))
 
@@ -73,6 +79,8 @@ class EditFileTool(Tool):
             diff = _unified_diff(content, new_content, str(p))
             return f"Edited {file_path}\n{diff}"
         except Exception as e:
+            if writing:
+                return ToolResult(f"[effect unknown] Error: {e}; inspect the file before retrying", ToolStatus.EFFECT_UNKNOWN)
             return f"Error: {e}"
 
 

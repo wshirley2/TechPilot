@@ -21,6 +21,7 @@ from rich.text import Text
 
 from techpilot.engine.context import estimate_tokens
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
+from techpilot.engine.tool_results import display_tool_status
 from techpilot.engine.tools.edit import _changed_files
 
 from ..runtime import TaskRuntime
@@ -41,12 +42,13 @@ class ToolCallDetail:
     completed_at: str | datetime | None = None
     interrupted: bool = False
     execution_control: dict[str, object] | None = None
+    tool_status: str | None = None
 
     @property
     def status(self) -> str:
         if self.result is None:
             return "running"
-        return "interrupted" if self.interrupted else _tool_status(self.result)
+        return "interrupted" if self.interrupted else _tool_status(self.result, self.tool_status)
 
     @property
     def duration_seconds(self) -> float | None:
@@ -170,10 +172,10 @@ class TerminalEventSink:
             elapsed = f" in {time.monotonic() - started[0]:.2f}s" if started is not None else ""
             tool_name = str(event.payload.get("tool_name") or (started[1] if started else "tool"))
             result = str(event.payload.get("result", ""))
-            status = "interrupted" if event.payload.get("interrupted") else _tool_status(result)
+            status = "interrupted" if event.payload.get("interrupted") else _tool_status(result, event.payload.get("tool_status"))
             block_was_rendered = call_id in self._blocked_tool_calls
             self._blocked_tool_calls.discard(call_id)
-            style = "yellow" if status in {"interrupted", "not executed"} else ("red" if status in {"error", "denied"} else "green")
+            style = "yellow" if status in {"interrupted", "not executed", "effect unknown"} else ("red" if status in {"error", "denied"} else "green")
             if not self.show_full_results and status == "completed":
                 call = self._collapsed_tool_calls.get(call_id)
                 if call is not None:
@@ -188,7 +190,7 @@ class TerminalEventSink:
             if result:
                 if status == "not executed":
                     self.console.print("[dim]未执行：达到运行限制；详情保留在 Session 中。[/dim]")
-                elif (status in {"error", "denied", "interrupted"} and not block_was_rendered) or self.show_full_results:
+                elif (status in {"error", "denied", "interrupted", "effect unknown"} and not block_was_rendered) or self.show_full_results:
                     self.console.print(f"[dim]{_summarize(result, self.result_limit)}[/dim]")
         elif event.event_type is RuntimeEventType.CONTEXT_COMPRESSED:
             self.console.print("[dim]Context compressed.[/dim]")
@@ -748,6 +750,7 @@ def _tool_call_details(events: list[object]) -> list[ToolCallDetail]:
             detail = detail or ToolCallDetail(call_id=call_id)
             detail.tool_name = str(payload.get("tool_name", detail.tool_name))
             detail.result = str(payload.get("result", ""))
+            detail.tool_status = payload.get("tool_status")
             detail.interrupted = bool(payload.get("interrupted"))
             detail.completed_at = getattr(event, "created_at", None)
             details[call_id] = detail
@@ -794,7 +797,10 @@ def _format_tool_call_detail(
             stderr or "(none)",
         ])
         if _is_validation_command(command, validation_commands):
-            validation_status = "passed" if detail.status == "completed" else "failed"
+            validation_status = (
+                "passed" if detail.status == "completed"
+                else "unknown" if detail.status == "effect unknown" else "failed"
+            )
             lines.extend(["", f"Validation: {validation_status}"])
     elif detail.tool_name in {"edit_file", "write_file"}:
         summary, trusted_diff = _split_result_summary(result)
@@ -819,7 +825,7 @@ def _format_tool_call_detail(
 
     if detail.execution_control is not None:
         lines.extend(["", "Execution Control:", _format_execution_control(detail.execution_control)])
-    elif detail.status in {"denied", "interrupted", "error", "not executed"}:
+    elif detail.status in {"denied", "interrupted", "error", "not executed", "effect unknown"}:
         lines.extend(["", "Result detail:", result])
     return "\n".join(lines)
 
@@ -846,7 +852,7 @@ def _permission_detail(detail: ToolCallDetail) -> str:
     result = detail.result or ""
     if detail.status == "denied":
         return f"Denied: {result}"
-    if detail.status in {"error", "interrupted", "not executed"}:
+    if detail.status in {"error", "interrupted", "not executed", "effect unknown"}:
         return f"Not completed: {detail.status}. {result}"
     return "Completed. The saved Tool Result below contains the Trusted Diff reviewed for this write."
 
@@ -889,7 +895,7 @@ def _as_datetime(value: str | datetime | None) -> datetime | None:
 def _detail_border_style(status: str) -> str:
     if status in {"error", "denied"}:
         return "red"
-    if status in {"interrupted", "not executed", "running"}:
+    if status in {"interrupted", "not executed", "running", "effect unknown"}:
         return "yellow"
     return "green"
 
@@ -903,17 +909,8 @@ def _summarize(value: str, limit: int) -> str:
     return f"{normalized[:head]}\n... output folded ...\n{normalized[-tail:]}"
 
 
-def _tool_status(result: str) -> str:
-    lowered = result.lstrip().lower()
-    if lowered.startswith("[limit reached]"):
-        return "not executed"
-    if lowered.startswith(("policy denied", "permission denied", "⚠ blocked")):
-        return "denied"
-    if lowered.startswith("error") or "[exit code:" in lowered:
-        return "error"
-    if re.search(r"(?:^|\n)\[exit code: -?[1-9]\d*\]\s*$", lowered):
-        return "error"
-    return "completed"
+def _tool_status(result: str, status: object = None) -> str:
+    return display_tool_status(result, status)
 
 
 def _session_result_line(session) -> str:

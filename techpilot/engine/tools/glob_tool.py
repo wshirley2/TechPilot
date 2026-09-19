@@ -2,6 +2,10 @@
 
 from pathlib import Path
 
+from techpilot.safety.paths import is_safe_search_path, is_sensitive_path
+
+from ..tool_results import ToolResult, ToolStatus
+from ..tool_validation import validated_tool
 from .base import Tool
 
 
@@ -16,6 +20,7 @@ class GlobTool(Tool):
         "properties": {
             "pattern": {
                 "type": "string",
+                "minLength": 1,
                 "description": "Glob pattern, e.g. '**/*.py' or 'src/**/*.ts'",
             },
             "path": {
@@ -26,13 +31,16 @@ class GlobTool(Tool):
         "required": ["pattern"],
     }
 
+    @validated_tool
     def execute(self, pattern: str, path: str = ".") -> str:
         try:
+            if is_sensitive_path(Path(path).expanduser()):
+                return ToolResult("Permission denied glob: sensitive path", ToolStatus.DENIED)
             base = Path(path).expanduser().resolve()
             if not base.is_dir():
                 return f"Error: {path} is not a directory"
 
-            hits = list(base.glob(pattern))
+            hits = [hit for hit in base.glob(pattern) if is_safe_search_path(hit, base)]
             # sort by mtime, newest first
             hits.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
 
@@ -47,7 +55,7 @@ class GlobTool(Tool):
 
             if total > 100:
                 result += f"\n... ({total} matches, showing first 100)"
-            return result or "No files matched."
+            return ToolResult(result or "No files matched.")
         except Exception as e:
             return f"Error: {e}"
 

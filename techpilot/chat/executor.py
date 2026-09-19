@@ -18,10 +18,13 @@ from techpilot.engine.permissions import (
     PermissionRequest,
 )
 from techpilot.engine.tool_execution import ToolConcurrency, ToolEffect, ToolExecutionDescription
+from techpilot.engine.tool_results import ToolResult, ToolStatus, tool_result
+from techpilot.engine.tool_validation import validate_tool_arguments
 from techpilot.engine.tools.base import Tool
 from techpilot.engine.tools.bash import BashTool
 from techpilot.engine.tools.edit import _changed_files
 from techpilot.engine.trusted_diff import FileWriteProposal, SourceSnapshotChanged, TrustedDiffError
+from techpilot.safety.paths import is_sensitive_path
 
 from ..execution import (
     CommandKind,
@@ -144,6 +147,22 @@ class RepositoryToolExecutor:
         tool_call_id: str,
         execution_context: ToolExecutionContext | None = None,
     ) -> str:
+        try:
+            validate_tool_arguments(tool, arguments)
+        except (TypeError, ValueError) as error:
+            return ToolResult(f"Error: bad arguments for {tool.name}: {error}", ToolStatus.ERROR)
+        return tool_result(self._execute_call(
+            tool, arguments, tool_call_id=tool_call_id, execution_context=execution_context,
+        ))
+
+    def _execute_call(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        tool_call_id: str,
+        execution_context: ToolExecutionContext | None = None,
+    ) -> str:
         """Execute the exact Runtime-held call after path and permission checks."""
 
         normalized = dict(arguments)
@@ -191,6 +210,12 @@ class RepositoryToolExecutor:
             PathBoundary.APPROVED_ARTIFACT,
         }:
             return f"Policy denied {tool.name}: path could not be normalized within the repository"
+
+        if tool.name in {"read_file", "grep", "glob"}:
+            raw = Path(arguments.get(path_argument, ".")).expanduser()
+            requested = raw if raw.is_absolute() else self.repository_root / raw
+            if is_sensitive_path(requested):
+                return ToolResult(f"Permission denied {tool.name}: sensitive file", ToolStatus.DENIED)
 
         if tool.name in {"edit_file", "write_file"}:
             with self._side_effect_lock:
@@ -294,7 +319,10 @@ class RepositoryToolExecutor:
                 force_prompt = True
                 continue
             except OSError as error:
-                return f"Error: {error}"
+                return ToolResult(
+                    f"[effect unknown] Error: {error}; inspect the file before retrying",
+                    ToolStatus.EFFECT_UNKNOWN,
+                )
 
             _changed_files.add(str(proposal.path))
             if tool.name == "edit_file":

@@ -60,3 +60,22 @@ def ignored_child_names(names: Iterable[str]) -> set[str]:
         or name.endswith(".egg-info")
         or is_sensitive_file_name(name)
     }
+
+
+def is_sensitive_path(path: Path) -> bool:
+    """Check both the requested name and link target, including parent names."""
+    return any(is_sensitive_file_name(part) for part in (*path.parts, *path.resolve().parts))
+
+
+def is_safe_search_path(path: Path, root: Path) -> bool:
+    """Filter native search hits before opening contents or displaying names."""
+    try:
+        relative = path.relative_to(root)
+        resolved_relative = path.resolve(strict=True).relative_to(root.resolve())
+        return not (
+            is_sensitive_path(path)
+            or should_ignore_repository_path(relative)
+            or should_ignore_repository_path(resolved_relative)
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False

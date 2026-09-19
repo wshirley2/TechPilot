@@ -37,6 +37,8 @@ class FileWriteProposal:
         old_string: str,
         new_string: str,
     ) -> FileWriteProposal:
+        if not isinstance(old_string, str) or not old_string or not isinstance(new_string, str):
+            raise TrustedDiffError("edit_file requires non-empty old_string and string new_string")
         exists, content, snapshot = _read_source(path)
         if not exists:
             raise TrustedDiffError(f"{display_path} not found")

@@ -29,6 +29,8 @@ from .tool_execution import (
     declared_tool_description,
     default_tool_description,
 )
+from .tool_results import ToolResult, ToolStatus, tool_result
+from .tool_validation import validate_tool_arguments
 from .tools import ALL_TOOLS
 from .tools.agent import AgentTool
 from .tools.base import Tool
@@ -429,6 +431,11 @@ class Agent:
         tool_call_id: str | None = None,
     ) -> None:
         """Emit an observation without allowing consumer failures to stop the Agent."""
+        if event_type is RuntimeEventType.TOOL_COMPLETED:
+            payload = dict(payload or {})
+            outcome = tool_result(payload.get("result", ""))
+            payload["result"] = str(outcome)
+            payload["tool_status"] = outcome.status.value
         event = RuntimeEvent(
             event_type=event_type,
             session_id=self.session_id,
@@ -501,7 +508,7 @@ class Agent:
             tool_call_id=tc.id,
             payload={
                 "tool_name": tc.name,
-                "arguments": dict(tc.arguments),
+                "arguments": dict(tc.arguments) if isinstance(tc.arguments, dict) else tc.arguments,
                 "assistant_content": assistant_content,
             },
         )
@@ -530,13 +537,13 @@ class Agent:
         """Execute a single tool call, returning the result string."""
         tool = self._tool_by_name.get(tc.name)
         if tool is None:
-            return f"Error: unknown tool '{tc.name}'"
+            return ToolResult(f"Error: unknown tool '{tc.name}'", ToolStatus.ERROR)
         # validate arguments first so a TypeError raised *inside* the tool isn't
         # mislabelled as a bad-arguments error from the caller
         try:
-            inspect.signature(tool.execute).bind(**tc.arguments)
-        except TypeError as e:
-            return f"Error: bad arguments for {tc.name}: {e}"
+            validate_tool_arguments(tool, tc.arguments)
+        except (TypeError, ValueError) as e:
+            return ToolResult(f"Error: bad arguments for {tc.name}: {e}", ToolStatus.ERROR)
         try:
             if self.tool_executor is not None:
                 execute_call = getattr(self.tool_executor, "execute_call", None)
@@ -549,17 +556,20 @@ class Agent:
                             round_index=round_index,
                             event_sink=execution_event_sink or self.event_sink,
                         )
-                    return execute_call(tool, dict(tc.arguments), **kwargs)
-                return self.tool_executor.execute(tool, dict(tc.arguments))
-            return tool.execute(**tc.arguments)
+                    return tool_result(execute_call(tool, dict(tc.arguments), **kwargs))
+                return tool_result(self.tool_executor.execute(tool, dict(tc.arguments)))
+            return tool_result(tool.execute(**tc.arguments))
         except Exception as e:
-            return f"Error executing {tc.name}: {e}"
+            return ToolResult(
+                f"Error executing {tc.name}: {e}\n[effect unknown] Inspect effects before retrying.",
+                ToolStatus.EFFECT_UNKNOWN,
+            )
 
     def _describe_tool_call(self, tc) -> ToolExecutionDescription:
         """Resolve a scheduler description without executing a Tool effect."""
 
         tool = self._tool_by_name.get(tc.name)
-        if tool is None:
+        if tool is None or not isinstance(tc.arguments, dict):
             return ToolExecutionDescription.unknown()
         declared = declared_tool_description(tool, dict(tc.arguments))
         if declared is not None:

@@ -13,6 +13,8 @@ import re
 import subprocess
 import threading
 
+from ..tool_results import ToolResult, ToolStatus
+from ..tool_validation import validate_tool_arguments, validated_tool
 from .base import Tool
 
 # Track cwd across commands (Claude Code does this too). Thread-local, so that
@@ -49,16 +51,19 @@ class BashTool(Tool):
         "properties": {
             "command": {
                 "type": "string",
+                "minLength": 1,
                 "description": "The shell command to run",
             },
             "timeout": {
                 "type": "integer",
+                "minimum": 1,
                 "description": "Timeout in seconds (default 120)",
             },
         },
         "required": ["command"],
     }
 
+    @validated_tool
     def execute(self, command: str, timeout: int = 120) -> str:
         # use this thread's own tracked working directory
         cwd = getattr(_local, "cwd", None) or os.getcwd()
@@ -67,9 +72,13 @@ class BashTool(Tool):
 
     def execute_in(self, command: str, *, cwd: str, timeout: int = 120) -> str:
         """Execute a command from an application-selected working directory."""
+        try:
+            validate_tool_arguments(self, {"command": command, "timeout": timeout})
+        except (TypeError, ValueError) as error:
+            return ToolResult(f"Error: bad arguments for bash: {error}", ToolStatus.ERROR)
         warning = _check_dangerous(command)
         if warning:
-            return f"⚠ Blocked: {warning}\nCommand: {command}\nIf intentional, modify the command to be more specific."
+            return ToolResult(f"⚠ Blocked: {warning}\nCommand: {command}", ToolStatus.DENIED)
 
         try:
             proc = subprocess.run(
@@ -99,11 +108,14 @@ class BashTool(Tool):
                     + f"\n\n... truncated ({len(out)} chars total) ...\n\n"
                     + out[-3000:]
                 )
-            return out.strip() or "(no output)"
+            return ToolResult(out.strip() or "(no output)", ToolStatus.ERROR if proc.returncode else ToolStatus.COMPLETED)
         except subprocess.TimeoutExpired:
-            return f"Error: timed out after {timeout}s"
+            return ToolResult(
+                f"[effect unknown] Error: timed out after {timeout}s; the command may have changed files "
+                "or started child processes. Inspect effects before retrying.", ToolStatus.EFFECT_UNKNOWN,
+            )
         except Exception as e:
-            return f"Error running command: {e}"
+            return ToolResult(f"[effect unknown] Error running command: {e}", ToolStatus.EFFECT_UNKNOWN)
 
 
 def _check_dangerous(cmd: str) -> str | None:
