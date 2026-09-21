@@ -106,6 +106,8 @@ M0 冻结评测与现有安全合同不变，不自动暂存、提交、推送�
   流，明确标记 `truncated=true` 且没有 `output_artifact`，直到受控产物服务落地。
 - 已实现完整来源受控分页：`read_file` 的 `result_facts` 保存源 SHA-256、页范围、总行数、
   下一页与 UTF-8 状态；分页导入会回传摘要校验版本，不能将截断或混合版本内容冒充完整快照。
+- 已实现可宿主注入的最小 research 工具集：导入批准资料、分页查询证据、按行补读上下文、
+  校验已发出证据后提交新报告。工具不创建 Provider、不嵌套 Runtime，普通 Chat 默认不启用。
 - 拟议最小工具为来源导入、证据查询、上下文读取、报告提交；导入可先由宿主预处理，其余供真实模型自主调用。
 - 生产工具复用受控 IO 边界，不在内部嵌套 FixedToolProvider/Runtime；演示适配器继续保留做回归。
 - 下一步先完成完整资料与最小 research 接入的实施卡；Bash 并发的首个窄切片已完成：无 Shell 元字符的受限 `git status`/`git diff`、`git rev-parse --show-toplevel`、`git branch --show-current` 可并行。测试、构建、`rg`、路径或修订参数和未知命令仍独占，不阻塞首个真实任务。

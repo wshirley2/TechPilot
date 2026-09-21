@@ -10,7 +10,15 @@ from scripts.run_m1_demo import ROOT, DemoWritePrompt, run_demo
 from techpilot.engine.events import RuntimeEventType
 from techpilot.engine.permissions import DenyPermissionPrompt, PermissionDecision
 from techpilot.research.contracts import ReportArtifact, ReportClaim, ResearchTask
+from techpilot.research.host_files import HostResearchFiles
 from techpilot.research.runtime_files import MAX_IMPORT_LINES, ResearchIOError, RuntimeResearchFiles
+from techpilot.research.tools import (
+    ResearchImportSourceTool,
+    ResearchQueryEvidenceTool,
+    ResearchReadEvidenceTool,
+    ResearchSubmitReportTool,
+    ResearchToolService,
+)
 from techpilot.research.workflow import ResearchWorkflow
 
 
@@ -223,6 +231,113 @@ def test_source_change_between_pages_never_creates_a_mixed_snapshot(workflow, mo
     with pytest.raises(ResearchIOError):
         workflow.import_source("changing", source)
     assert not (workflow.store_directory / "snapshots").exists()
+
+
+def test_host_research_files_imports_without_creating_nested_runtime(tmp_path):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "source.txt"
+    source.write_text("host-owned source\n", encoding="utf-8")
+    task = ResearchTask("host", "What is documented?", ("A",), (), tmp_path / "reports")
+    files = HostResearchFiles(
+        tmp_path,
+        source_root=source_root,
+        store_directory=tmp_path / "store",
+        artifact_directory=task.artifact_directory,
+    )
+    flow = ResearchWorkflow(task, tmp_path / "store", files)
+    flow.initialize()
+
+    snapshot = flow.import_source("source", source)
+
+    assert snapshot.content == "host-owned source\n"
+    with pytest.raises(ResearchIOError, match="host-approved"):
+        files.read(tmp_path / "outside.txt")
+
+
+def test_read_only_research_tools_query_and_read_immutable_snapshot(tmp_path):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "source.txt"
+    source.write_text("alpha\nbeta alpha\ngamma\n", encoding="utf-8")
+    task = ResearchTask("tools", "What is documented?", ("A",), (), tmp_path / "reports")
+    files = HostResearchFiles(
+        tmp_path,
+        source_root=source_root,
+        store_directory=tmp_path / "store",
+        artifact_directory=task.artifact_directory,
+    )
+    flow = ResearchWorkflow(task, tmp_path / "store", files)
+    flow.initialize()
+    snapshot = flow.import_source("source", source)
+    service = ResearchToolService(flow)
+    query = ResearchQueryEvidenceTool(service)
+    read = ResearchReadEvidenceTool(service)
+
+    found = json.loads(query.execute(snapshot.snapshot_id, "alpha", limit=1))
+
+    assert found["total_matches"] == 2
+    assert found["next_offset"] == 2
+    assert found["matches"][0]["start_line"] == 1
+    context = json.loads(read.execute(snapshot.snapshot_id, 2, 2))
+    assert context["quote"] == "beta alpha"
+    assert context["evidence_id"] in service._evidence
+
+
+def test_research_import_tool_only_accepts_relative_approved_sources(tmp_path):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "source.txt"
+    source.write_text("approved\n", encoding="utf-8")
+    task = ResearchTask("import", "What is documented?", ("A",), (), tmp_path / "reports")
+    files = HostResearchFiles(
+        tmp_path,
+        source_root=source_root,
+        store_directory=tmp_path / "store",
+        artifact_directory=task.artifact_directory,
+    )
+    flow = ResearchWorkflow(task, tmp_path / "store", files)
+    flow.initialize()
+    tool = ResearchImportSourceTool(ResearchToolService(flow))
+
+    imported = json.loads(tool.execute("approved", "source.txt"))
+
+    assert imported["source_id"] == "approved"
+    assert imported["total_lines"] == 1
+    denied = tool.execute("escape", "../source.txt")
+    assert denied.status.value == "effect unknown"
+
+
+def test_research_submit_tool_only_uses_issued_evidence_and_new_artifact(tmp_path):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "source.txt"
+    source.write_text("documented fact\n", encoding="utf-8")
+    task = ResearchTask("submit", "What is documented?", ("A",), (), tmp_path / "reports")
+    files = HostResearchFiles(
+        tmp_path,
+        source_root=source_root,
+        store_directory=tmp_path / "store",
+        artifact_directory=task.artifact_directory,
+    )
+    flow = ResearchWorkflow(task, tmp_path / "store", files)
+    flow.initialize()
+    snapshot = flow.import_source("source", source)
+    service = ResearchToolService(flow)
+    query = ResearchQueryEvidenceTool(service)
+    submit = ResearchSubmitReportTool(service)
+    evidence_id = json.loads(query.execute(snapshot.snapshot_id, "documented"))["matches"][0]["evidence_id"]
+
+    delivered = json.loads(submit.execute(
+        [{"topic": "事实", "conclusion": "已记录", "evidence_ids": [evidence_id]}],
+        [snapshot.snapshot_id],
+        "report.md",
+    ))
+
+    assert (task.artifact_directory / "report.md").exists()
+    assert delivered["snapshot_ids"] == [snapshot.snapshot_id]
+    rejected = submit.execute([], [snapshot.snapshot_id], "report.md")
+    assert rejected.status.value == "effect unknown"
 
 
 def test_source_instructions_are_only_searchable_data(workflow):
