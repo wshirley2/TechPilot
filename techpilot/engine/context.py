@@ -67,13 +67,17 @@ class ContextManager:
 
     @staticmethod
     def _snip_tool_outputs(messages: list[dict]) -> bool:
-        """Layer 1: Truncate tool results over 1500 chars to their first/last lines.
+        """Layer 1: snip old verbose results, not the pending tool-result batch.
 
-        This mirrors Claude Code's HISTORY_SNIP which replaces old tool outputs
-        with a one-line summary to reclaim context space.
+        The final ``assistant(tool_calls) -> tool result(s)`` batch has not yet
+        been sent back to the model.  Keep it intact for one provider request;
+        every earlier tool result remains eligible for low-cost text snipping.
         """
         changed = False
-        for m in messages:
+        protected = ContextManager._unconsumed_tool_output_indexes(messages)
+        for index, m in enumerate(messages):
+            if index in protected:
+                continue
             if m.get("role") != "tool":
                 continue
             content = m.get("content", "")
@@ -91,6 +95,26 @@ class ContextManager:
             m["content"] = snipped
             changed = True
         return changed
+
+    @staticmethod
+    def _unconsumed_tool_output_indexes(messages: list[dict]) -> set[int]:
+        """Return the trailing tool batch that the next provider call must see.
+
+        A trailing tool message without its immediately preceding assistant
+        ``tool_calls`` request is not treated as protected.  That preserves the
+        historical behavior for malformed or imported message fragments while
+        keeping a valid single or parallel tool batch intact.
+        """
+
+        first_tool = len(messages)
+        while first_tool and messages[first_tool - 1].get("role") == "tool":
+            first_tool -= 1
+        if first_tool == len(messages) or first_tool == 0:
+            return set()
+        request = messages[first_tool - 1]
+        if request.get("role") != "assistant" or not request.get("tool_calls"):
+            return set()
+        return set(range(first_tool, len(messages)))
 
     @staticmethod
     def _safe_split(messages: list[dict], keep_recent: int) -> int:

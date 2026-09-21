@@ -3,8 +3,10 @@
 from techpilot.engine import ALL_TOOLS, LLM, Agent, Config, __version__
 from techpilot.engine import session as session_module
 from techpilot.engine.context import ContextManager, estimate_tokens
+from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.session import list_sessions, load_session, save_session
 from techpilot.engine.tools import get_tool
+from techpilot.engine.tools.base import Tool
 
 
 def test_system_prompt_prefers_native_read_tools_and_simple_shell_calls():
@@ -79,6 +81,82 @@ def test_context_snip():
     ctx._snip_tool_outputs(msgs)
     after = estimate_tokens(msgs)
     assert after < before
+
+
+def test_context_snip_keeps_unconsumed_tail_tool_result():
+    ctx = ContextManager(max_tokens=3000)
+    old_output = "old\n" * 1000
+    pending_output = "pending\n" * 1000
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": "old"}]},
+        {"role": "tool", "tool_call_id": "old", "content": old_output},
+        {"role": "assistant", "tool_calls": [{"id": "pending"}]},
+        {"role": "tool", "tool_call_id": "pending", "content": pending_output},
+    ]
+
+    assert ctx._snip_tool_outputs(messages) is True
+    assert messages[1]["content"] != old_output
+    assert messages[3]["content"] == pending_output
+
+
+def test_context_snip_keeps_every_parallel_unconsumed_tool_result():
+    ctx = ContextManager(max_tokens=3000)
+    first_output = "first\n" * 1000
+    second_output = "second\n" * 1000
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": "first"}, {"id": "second"}]},
+        {"role": "tool", "tool_call_id": "first", "content": first_output},
+        {"role": "tool", "tool_call_id": "second", "content": second_output},
+    ]
+
+    assert ctx._snip_tool_outputs(messages) is False
+    assert messages[1]["content"] == first_output
+    assert messages[2]["content"] == second_output
+
+
+def test_context_snip_releases_tool_result_after_model_reply():
+    ctx = ContextManager(max_tokens=3000)
+    output = "evidence\n" * 1000
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": "evidence"}]},
+        {"role": "tool", "tool_call_id": "evidence", "content": output},
+        {"role": "assistant", "content": "I reviewed the evidence."},
+    ]
+
+    assert ctx._snip_tool_outputs(messages) is True
+    assert messages[1]["content"] != output
+
+
+def test_agent_sends_full_unconsumed_tool_result_to_next_provider_call():
+    output = "evidence\n" * 1000
+
+    class LongResultTool(Tool):
+        name = "long_result"
+        description = "Return controlled long evidence."
+        parameters = {"type": "object", "properties": {}}
+
+        def execute(self) -> str:
+            return output
+
+    class CapturingProvider:
+        def __init__(self) -> None:
+            self.requests: list[list[dict]] = []
+            self.responses = iter([
+                LLMResponse(tool_calls=[ToolCall("long", "long_result", {})]),
+                LLMResponse(content="I reviewed the complete evidence."),
+            ])
+
+        def chat(self, messages, **kwargs):
+            del kwargs
+            self.requests.append([dict(message) for message in messages])
+            return next(self.responses)
+
+    provider = CapturingProvider()
+    agent = Agent(llm=provider, tools=[LongResultTool()], max_context_tokens=1000)
+
+    assert agent.chat("Inspect the evidence.") == "I reviewed the complete evidence."
+    tool_messages = [message for message in provider.requests[1] if message.get("role") == "tool"]
+    assert tool_messages[0]["content"] == output
 
 
 def test_context_compress():
