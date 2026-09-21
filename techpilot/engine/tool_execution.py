@@ -7,8 +7,10 @@ remain enforced by the application executor.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -51,6 +53,42 @@ class ToolExecutionDescription:
             self.effect is ToolEffect.READ
             and self.concurrency is ToolConcurrency.SAFE
             and self.resources_known
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedToolCall:
+    """One host-prepared tool invocation shared by scheduling and execution.
+
+    ``requested_arguments`` preserve what the model asked for; the executor may
+    put repository-normalized values in ``normalized_arguments``.  The opaque
+    ``host_context`` is only meaningful to the executor that created it.
+    ``create`` makes shallow immutable copies so workers cannot alter the
+    scheduling facts of their siblings.
+    """
+
+    tool_name: str
+    requested_arguments: Mapping[str, Any]
+    normalized_arguments: Mapping[str, Any]
+    description: ToolExecutionDescription
+    host_context: object | None = None
+
+    @classmethod
+    def create(
+        cls,
+        tool_name: str,
+        requested_arguments: Mapping[str, Any],
+        description: ToolExecutionDescription,
+        *,
+        normalized_arguments: Mapping[str, Any] | None = None,
+        host_context: object | None = None,
+    ) -> PreparedToolCall:
+        return cls(
+            tool_name,
+            MappingProxyType(dict(requested_arguments)),
+            MappingProxyType(dict(normalized_arguments if normalized_arguments is not None else requested_arguments)),
+            description,
+            host_context,
         )
 
 

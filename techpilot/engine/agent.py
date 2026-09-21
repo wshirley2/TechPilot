@@ -24,6 +24,7 @@ from .llm import LLM
 from .prompt import system_prompt
 from .runtime_control import CancellationToken, RuntimeCancelled, RuntimeLimitExceeded, RuntimeLimits
 from .tool_execution import (
+    PreparedToolCall,
     ToolExecutionDescription,
     ToolExecutionPlan,
     declared_tool_description,
@@ -516,7 +517,13 @@ class Agent:
             on_tool(tc.name, tc.arguments)
 
     def _exec_tool_with_event(self, tc, turn_id: str, round_index: int) -> str:
-        result = self._exec_tool(tc, turn_id=turn_id, round_index=round_index)
+        prepared = self._prepare_tool_call(tc)
+        result = self._exec_tool(
+            tc,
+            turn_id=turn_id,
+            round_index=round_index,
+            prepared_call=prepared,
+        )
         self._emit_event(
             RuntimeEventType.TOOL_COMPLETED,
             turn_id,
@@ -533,6 +540,7 @@ class Agent:
         turn_id: str | None = None,
         round_index: int = 0,
         execution_event_sink: EventSink | None = None,
+        prepared_call: PreparedToolCall | None = None,
     ) -> str:
         """Execute a single tool call, returning the result string."""
         tool = self._tool_by_name.get(tc.name)
@@ -549,6 +557,8 @@ class Agent:
                 execute_call = getattr(self.tool_executor, "execute_call", None)
                 if execute_call is not None:
                     kwargs: dict[str, Any] = {"tool_call_id": tc.id}
+                    if "prepared_call" in inspect.signature(execute_call).parameters and prepared_call is not None:
+                        kwargs["prepared_call"] = prepared_call
                     if "execution_context" in inspect.signature(execute_call).parameters and turn_id is not None:
                         kwargs["execution_context"] = ToolExecutionContext(
                             session_id=self.session_id,
@@ -565,26 +575,48 @@ class Agent:
                 ToolStatus.EFFECT_UNKNOWN,
             )
 
-    def _describe_tool_call(self, tc) -> ToolExecutionDescription:
-        """Resolve a scheduler description without executing a Tool effect."""
+    def _prepare_tool_call(self, tc) -> PreparedToolCall:
+        """Prepare one validated call without triggering a Tool effect."""
 
         tool = self._tool_by_name.get(tc.name)
         if tool is None or not isinstance(tc.arguments, dict):
-            return ToolExecutionDescription.unknown()
+            return PreparedToolCall.create(tc.name, {}, ToolExecutionDescription.unknown())
+        # Scheduling must see the same basic argument contract as execution.
+        # Invalid calls remain an exclusive, no-effect error rather than being
+        # allowed to enter a custom tool's declared SAFE wave.
+        try:
+            validate_tool_arguments(tool, tc.arguments)
+        except (TypeError, ValueError):
+            return PreparedToolCall.create(tc.name, tc.arguments, ToolExecutionDescription.unknown())
+        prepare_call = getattr(self.tool_executor, "prepare_call", None)
+        if callable(prepare_call):
+            try:
+                prepared = prepare_call(tool, dict(tc.arguments))
+            except Exception:
+                return PreparedToolCall.create(tc.name, tc.arguments, ToolExecutionDescription.unknown())
+            if isinstance(prepared, PreparedToolCall):
+                return prepared
+            if prepared is not None:
+                return PreparedToolCall.create(tc.name, tc.arguments, ToolExecutionDescription.unknown())
         declared = declared_tool_description(tool, dict(tc.arguments))
         if declared is not None:
-            return declared
+            return PreparedToolCall.create(tc.name, tc.arguments, declared)
         describe_call = getattr(self.tool_executor, "describe_call", None)
         if callable(describe_call):
             try:
                 described = describe_call(tool, dict(tc.arguments))
             except Exception:
-                return ToolExecutionDescription.unknown()
+                return PreparedToolCall.create(tc.name, tc.arguments, ToolExecutionDescription.unknown())
             if isinstance(described, ToolExecutionDescription):
-                return described
+                return PreparedToolCall.create(tc.name, tc.arguments, described)
             if described is not None:
-                return ToolExecutionDescription.unknown()
-        return default_tool_description(tc.name, dict(tc.arguments))
+                return PreparedToolCall.create(tc.name, tc.arguments, ToolExecutionDescription.unknown())
+        return PreparedToolCall.create(tc.name, tc.arguments, default_tool_description(tc.name, dict(tc.arguments)))
+
+    def _describe_tool_call(self, tc) -> ToolExecutionDescription:
+        """Compatibility wrapper for callers that only need scheduling facts."""
+
+        return self._prepare_tool_call(tc).description
 
     def _exec_tools_in_plan(
         self,
@@ -602,7 +634,8 @@ class Agent:
         application-requested stop.
         """
 
-        descriptions = [self._describe_tool_call(tc) for tc in tool_calls]
+        prepared_calls = [self._prepare_tool_call(tc) for tc in tool_calls]
+        descriptions = [prepared.description for prepared in prepared_calls]
         plan = ToolExecutionPlan.build(descriptions)
         results = ["[not executed]" for _ in tool_calls]
         buffered_events = [_BufferedEventSink() for _ in tool_calls]
@@ -623,6 +656,7 @@ class Agent:
                             turn_id=turn_id,
                             round_index=round_index,
                             execution_event_sink=buffered_events[index],
+                            prepared_call=prepared_calls[index],
                         )
                         for index in wave.indexes
                     }
@@ -637,6 +671,7 @@ class Agent:
                     turn_id=turn_id,
                     round_index=round_index,
                     execution_event_sink=buffered_events[index],
+                    prepared_call=prepared_calls[index],
                 )
 
             # The application executor may emit execution-control facts from a

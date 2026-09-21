@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from uuid import uuid4
@@ -17,7 +18,7 @@ from techpilot.engine.permissions import (
     PermissionManager,
     PermissionRequest,
 )
-from techpilot.engine.tool_execution import ToolConcurrency, ToolEffect, ToolExecutionDescription
+from techpilot.engine.tool_execution import PreparedToolCall, ToolConcurrency, ToolEffect, ToolExecutionDescription
 from techpilot.engine.tool_results import ToolResult, ToolStatus, tool_result
 from techpilot.engine.tool_validation import validate_tool_arguments
 from techpilot.engine.tools.base import Tool
@@ -39,7 +40,13 @@ from ..execution import (
     PathBoundary,
     RequiredControl,
 )
-from .permissions import ChatPermissionPolicy, command_effect, command_prefix, command_tokens
+from .permissions import (
+    ChatPermissionPolicy,
+    command_effect,
+    command_prefix,
+    command_tokens,
+    is_concurrency_safe_read_command,
+)
 
 _PATH_ARGUMENTS = {
     "read_file": "file_path",
@@ -59,6 +66,17 @@ _TOOL_EFFECTS = {
     "fetch_url": PermissionEffect.NETWORK,
     "agent": PermissionEffect.DELEGATE,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _RepositoryPreparedContext:
+    """Repository facts produced once and consumed by the same executor."""
+
+    repository_root: Path
+    path_boundary: PathBoundary
+    affected_paths: tuple[str, ...]
+
+
 class RepositoryToolExecutor:
     """Bind tools to a repository and enforce C3 permissions before effects."""
 
@@ -76,6 +94,9 @@ class RepositoryToolExecutor:
             DenyPermissionPrompt(),
         )
         self._side_effect_lock = threading.Lock()
+        # A SAFE command can run concurrently after authorization, but two
+        # interactive permission prompts must never race on the terminal.
+        self._command_permission_lock = threading.Lock()
         self._turn_stop_lock = threading.Lock()
         self._turn_stop_message: str | None = None
         self._execution_control_policy = ExecutionControlPolicy()
@@ -102,13 +123,8 @@ class RepositoryToolExecutor:
     def execute(self, tool: Tool, arguments: dict[str, Any]) -> str:
         return self.execute_call(tool, arguments, tool_call_id=uuid4().hex)
 
-    def describe_call(self, tool: Tool, arguments: dict[str, Any]) -> ToolExecutionDescription | None:
-        """Expose conservative scheduling facts without changing C3 enforcement.
-
-        The Agent uses this before executing a fully returned Tool Call round.
-        Unknown tools deliberately return ``None`` so the generic scheduler
-        falls back to UNKNOWN + EXCLUSIVE.
-        """
+    def prepare_call(self, tool: Tool, arguments: dict[str, Any]) -> PreparedToolCall | None:
+        """Validate and normalize a known call before scheduling any effect."""
 
         effect = {
             "read_file": ToolEffect.READ,
@@ -123,20 +139,74 @@ class RepositoryToolExecutor:
         }.get(tool.name)
         if effect is None:
             return None
-        cwd = str(self.repository_root)
-        if tool.name == "now":
-            return ToolExecutionDescription(ToolEffect.READ, ToolConcurrency.SAFE, cwd=cwd)
+        validate_tool_arguments(tool, arguments)
+        normalized = dict(arguments)
+        path_boundary = PathBoundary.REPOSITORY
+        affected_paths: tuple[str, ...] = ()
         path_argument = _PATH_ARGUMENTS.get(tool.name)
+        if path_argument:
+            path_boundary, affected_paths, resolved_path = self._normalized_path_fact(normalized.get(path_argument, "."))
+            if resolved_path is not None:
+                normalized[path_argument] = str(resolved_path)
+        context = _RepositoryPreparedContext(self.repository_root, path_boundary, affected_paths)
+        return PreparedToolCall.create(
+            tool.name,
+            arguments,
+            self._prepared_description(tool.name, effect, normalized, context),
+            normalized_arguments=normalized,
+            host_context=context,
+        )
+
+    def describe_call(self, tool: Tool, arguments: dict[str, Any]) -> ToolExecutionDescription | None:
+        """Compatibility view of ``prepare_call`` for existing executors/tests."""
+
+        try:
+            prepared = self.prepare_call(tool, arguments)
+        except (TypeError, ValueError):
+            return ToolExecutionDescription.unknown()
+        return prepared.description if prepared is not None else None
+
+    def _prepared_description(
+        self,
+        tool_name: str,
+        effect: ToolEffect,
+        normalized: dict[str, Any],
+        context: _RepositoryPreparedContext,
+    ) -> ToolExecutionDescription:
+        cwd = str(self.repository_root)
+        if tool_name == "now":
+            return ToolExecutionDescription(ToolEffect.READ, ToolConcurrency.SAFE, cwd=cwd)
+        if tool_name == "bash":
+            command = normalized.get("command")
+            if is_concurrency_safe_read_command(command):
+                return ToolExecutionDescription(
+                    ToolEffect.READ,
+                    ToolConcurrency.SAFE,
+                    (str(self.repository_root),),
+                    cwd,
+                )
+            return ToolExecutionDescription(
+                ToolEffect.EXECUTE,
+                ToolConcurrency.EXCLUSIVE,
+                cwd=cwd,
+                resources_known=False,
+            )
+        path_argument = _PATH_ARGUMENTS.get(tool_name)
         if path_argument is not None:
-            boundary, resources, resolved = self._normalized_path_fact(arguments.get(path_argument, "."))
-            if boundary in {PathBoundary.REPOSITORY, PathBoundary.APPROVED_ARTIFACT} and resolved is not None:
+            if context.path_boundary in {PathBoundary.REPOSITORY, PathBoundary.APPROVED_ARTIFACT}:
                 return ToolExecutionDescription(
                     effect,
                     ToolConcurrency.SAFE if effect is ToolEffect.READ else ToolConcurrency.EXCLUSIVE,
-                    (str(resolved),),
+                    tuple(str(self.repository_root / path) for path in context.affected_paths),
                     cwd,
                 )
-            return ToolExecutionDescription(effect, ToolConcurrency.EXCLUSIVE, resources, cwd, resources_known=False)
+            return ToolExecutionDescription(
+                effect,
+                ToolConcurrency.EXCLUSIVE,
+                context.affected_paths,
+                cwd,
+                resources_known=False,
+            )
         return ToolExecutionDescription(effect, ToolConcurrency.EXCLUSIVE, cwd=cwd, resources_known=False)
 
     def execute_call(
@@ -146,13 +216,18 @@ class RepositoryToolExecutor:
         *,
         tool_call_id: str,
         execution_context: ToolExecutionContext | None = None,
+        prepared_call: PreparedToolCall | None = None,
     ) -> str:
         try:
             validate_tool_arguments(tool, arguments)
         except (TypeError, ValueError) as error:
             return ToolResult(f"Error: bad arguments for {tool.name}: {error}", ToolStatus.ERROR)
         return tool_result(self._execute_call(
-            tool, arguments, tool_call_id=tool_call_id, execution_context=execution_context,
+            tool,
+            arguments,
+            tool_call_id=tool_call_id,
+            execution_context=execution_context,
+            prepared_call=prepared_call,
         ))
 
     def _execute_call(
@@ -162,18 +237,31 @@ class RepositoryToolExecutor:
         *,
         tool_call_id: str,
         execution_context: ToolExecutionContext | None = None,
+        prepared_call: PreparedToolCall | None = None,
     ) -> str:
         """Execute the exact Runtime-held call after path and permission checks."""
 
-        normalized = dict(arguments)
-        path_boundary = PathBoundary.REPOSITORY
-        affected_paths: tuple[str, ...] = ()
-        path_argument = _PATH_ARGUMENTS.get(tool.name)
-        if path_argument:
-            value = normalized.get(path_argument, ".")
-            path_boundary, affected_paths, resolved_path = self._normalized_path_fact(value)
-            if resolved_path is not None:
-                normalized[path_argument] = str(resolved_path)
+        prepared = self._usable_prepared_call(tool, arguments, prepared_call)
+        if prepared is None:
+            try:
+                prepared = self.prepare_call(tool, arguments)
+            except (TypeError, ValueError) as error:
+                return ToolResult(f"Error: bad arguments for {tool.name}: {error}", ToolStatus.ERROR)
+        if prepared is not None and isinstance(prepared.host_context, _RepositoryPreparedContext):
+            normalized = dict(prepared.normalized_arguments)
+            path_boundary = prepared.host_context.path_boundary
+            affected_paths = prepared.host_context.affected_paths
+        else:
+            # Unknown extensions retain the previous conservative execution
+            # path.  They never inherit repository preparation facts.
+            normalized = dict(arguments)
+            path_boundary = PathBoundary.REPOSITORY
+            affected_paths: tuple[str, ...] = ()
+            path_argument = _PATH_ARGUMENTS.get(tool.name)
+            if path_argument:
+                path_boundary, affected_paths, resolved_path = self._normalized_path_fact(normalized.get(path_argument, "."))
+                if resolved_path is not None:
+                    normalized[path_argument] = str(resolved_path)
 
         control_request = self._normalized_control_request(
             tool.name,
@@ -205,6 +293,7 @@ class RepositoryToolExecutor:
             pattern_error = _validate_relative_pattern(normalized.get("include"), "grep include")
             if pattern_error:
                 return f"Policy denied grep: {pattern_error}"
+        path_argument = _PATH_ARGUMENTS.get(tool.name)
         if path_argument and path_boundary not in {
             PathBoundary.REPOSITORY,
             PathBoundary.APPROVED_ARTIFACT,
@@ -223,6 +312,11 @@ class RepositoryToolExecutor:
         if tool.name == "bash":
             if not isinstance(tool, BashTool):
                 return "Error: bash tool does not support a repository working directory"
+            # Keep the same classifier at scheduling and execution.  SAFE only
+            # bypasses the side-effect *execution* lock; it never bypasses
+            # execution control or the permission manager below.
+            if is_concurrency_safe_read_command(normalized.get("command")):
+                return self._execute_command(tool, normalized, tool_call_id, assessment)
             with self._side_effect_lock:
                 return self._execute_command(tool, normalized, tool_call_id, assessment)
 
@@ -238,6 +332,25 @@ class RepositoryToolExecutor:
         if decision.action is not PermissionAction.ALLOW:
             return _denied(tool.name, decision.reason)
         return tool.execute(**normalized)
+
+    def _usable_prepared_call(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        prepared_call: PreparedToolCall | None,
+    ) -> PreparedToolCall | None:
+        """Reject a stale/foreign prepared call rather than trusting its facts."""
+
+        if not isinstance(prepared_call, PreparedToolCall):
+            return None
+        context = prepared_call.host_context
+        if not isinstance(context, _RepositoryPreparedContext):
+            return None
+        if context.repository_root != self.repository_root or prepared_call.tool_name != tool.name:
+            return None
+        if dict(prepared_call.requested_arguments) != dict(arguments):
+            return None
+        return prepared_call
 
     def _execute_command(
         self,
@@ -263,7 +376,8 @@ class RepositoryToolExecutor:
             command_tokens=tokens,
             command_prefix=command_prefix(tokens),
         )
-        decision = self.permission_manager.authorize(request)
+        with self._command_permission_lock:
+            decision = self.permission_manager.authorize(request)
         if decision.action is not PermissionAction.ALLOW:
             self._stop_after_interactive_denial("bash", decision)
             return _denied("bash", decision.reason)

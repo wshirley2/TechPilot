@@ -14,6 +14,7 @@ from techpilot.chat.permissions import (
     command_effect,
     command_prefix,
     command_tokens,
+    is_concurrency_safe_read_command,
 )
 from techpilot.engine.permissions import (
     PermissionAction,
@@ -281,6 +282,37 @@ def test_chat_command_policy_is_code_driven(command, expected):
     )
 
     assert ChatPermissionPolicy().decide(request).action is expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "git status --short --branch",
+        "git diff --stat --cached",
+        "git rev-parse --show-toplevel",
+        "git branch --show-current",
+    ],
+)
+def test_concurrency_safe_command_classifier_accepts_only_literal_git_inspection(command):
+    assert is_concurrency_safe_read_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest",
+        "rg tool_execution",
+        "git status src",
+        "git branch -Dfeature",
+        "git diff --no-index left right",
+        "git status && whoami",
+        "git status > status.txt",
+        "git status %COMSPEC%",
+    ],
+)
+def test_concurrency_safe_command_classifier_fails_closed(command):
+    assert not is_concurrency_safe_read_command(command)
 
 
 def test_command_prefix_grant_executes_later_matching_command_without_prompt(tmp_path):

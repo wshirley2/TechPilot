@@ -13,6 +13,7 @@ from techpilot.engine.events import CallbackEventSink, RuntimeEventType
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.runtime_control import CancellationToken
 from techpilot.engine.tool_execution import (
+    PreparedToolCall,
     ToolConcurrency,
     ToolEffect,
     ToolExecutionDescription,
@@ -20,6 +21,7 @@ from techpilot.engine.tool_execution import (
     resources_conflict,
 )
 from techpilot.engine.tools.base import Tool
+from techpilot.engine.tools.bash import BashTool
 
 
 class FakeLLM:
@@ -92,6 +94,18 @@ class TimedBash(Tool):
         self.delay = delay
 
     def execute(self, command: str) -> str:
+        return self.timeline.run(command, self.delay)
+
+
+class TimedRepositoryBash(BashTool):
+    """Avoid a real shell while exercising Chat's Bash scheduling path."""
+
+    def __init__(self, timeline: Timeline, delay: float = 0.08) -> None:
+        self.timeline = timeline
+        self.delay = delay
+
+    def execute_in(self, command: str, *, cwd: str, timeout: int = 120) -> str:
+        del cwd, timeout
         return self.timeline.run(command, self.delay)
 
 
@@ -194,6 +208,28 @@ def test_writes_and_bash_remain_serial():
     ]
 
 
+def test_repository_executor_runs_only_approved_read_only_git_commands_in_parallel(tmp_path):
+    timeline = Timeline()
+    calls = [
+        ToolCall("status", "bash", {"command": "git status --short"}),
+        ToolCall("diff", "bash", {"command": "git diff --stat"}),
+        ToolCall("test", "bash", {"command": "pytest"}),
+        ToolCall("branch", "bash", {"command": "git branch --show-current"}),
+    ]
+
+    assert _agent(
+        calls,
+        [TimedRepositoryBash(timeline, delay=0.06)],
+        executor=RepositoryToolExecutor(tmp_path),
+    ).chat("inspect") == "done"
+
+    starts = {name: stamp for kind, name, stamp in timeline.records if kind == "start"}
+    ends = {name: stamp for kind, name, stamp in timeline.records if kind == "end"}
+    assert timeline.max_active == 2
+    assert starts["pytest"] >= max(ends["git status --short"], ends["git diff --stat"])
+    assert starts["git branch --show-current"] >= ends["pytest"]
+
+
 def test_unknown_tools_default_to_serial_execution():
     timeline = Timeline()
     calls = [
@@ -266,6 +302,44 @@ class ExecutorReadTool(Tool):
         return value
 
 
+class CountingDescriptionExecutor:
+    def __init__(self) -> None:
+        self.describe_calls = 0
+        self.execute_calls = 0
+
+    def describe_call(self, tool, arguments):
+        del tool, arguments
+        self.describe_calls += 1
+        return ToolExecutionDescription(ToolEffect.READ, ToolConcurrency.SAFE, ("safe",))
+
+    def execute_call(self, tool, arguments, *, tool_call_id):
+        del tool, arguments, tool_call_id
+        self.execute_calls += 1
+        return "unexpected"
+
+
+class PreparedRecordingExecutor:
+    def __init__(self) -> None:
+        self.prepared: PreparedToolCall | None = None
+        self.executed: PreparedToolCall | None = None
+
+    def prepare_call(self, tool, arguments):
+        del tool
+        self.prepared = PreparedToolCall.create(
+            "executor_read",
+            arguments,
+            ToolExecutionDescription(ToolEffect.READ, ToolConcurrency.SAFE, ("prepared",)),
+            normalized_arguments={"value": "normalized"},
+        )
+        return self.prepared
+
+    def execute_call(self, tool, arguments, *, tool_call_id, prepared_call):
+        del tool, tool_call_id
+        assert arguments == {"value": "requested"}
+        self.executed = prepared_call
+        return str(prepared_call.normalized_arguments["value"])
+
+
 def test_executor_events_are_buffered_and_published_in_model_order():
     events = []
     calls = [
@@ -282,12 +356,36 @@ def test_executor_events_are_buffered_and_published_in_model_order():
     assert completed == ["slow", "fast"]
 
 
+def test_invalid_arguments_are_not_described_as_a_safe_call():
+    executor = CountingDescriptionExecutor()
+    calls = [ToolCall("invalid", "executor_read", {"value": 42})]
+    agent = _agent(calls, [ExecutorReadTool()], executor=executor)
+
+    assert agent.chat("read") == "done"
+    assert executor.describe_calls == 0
+    assert executor.execute_calls == 0
+    assert "bad arguments" in agent.messages[-2]["content"]
+
+
+def test_agent_reuses_one_prepared_call_for_scheduling_and_execution():
+    executor = PreparedRecordingExecutor()
+    calls = [ToolCall("prepared", "executor_read", {"value": "requested"})]
+
+    assert _agent(calls, [ExecutorReadTool()], executor=executor).chat("read") == "done"
+    assert executor.prepared is executor.executed
+    assert executor.executed is not None
+    assert executor.executed.requested_arguments["value"] == "requested"
+    assert executor.executed.normalized_arguments["value"] == "normalized"
+
+
 def test_repository_executor_describes_effect_resources_and_cwd(tmp_path):
     executor = RepositoryToolExecutor(tmp_path)
 
     read = executor.describe_call(TimedRead(Timeline()), {"file_path": "src/main.py"})
     write = executor.describe_call(TimedWrite(Timeline()), {"file_path": "src/main.py", "content": "x"})
     command = executor.describe_call(TimedBash(Timeline()), {"command": "pytest"})
+    safe_command = executor.describe_call(TimedBash(Timeline()), {"command": "git status --short"})
+    prepared_read = executor.prepare_call(TimedRead(Timeline()), {"file_path": "src/main.py"})
     unknown = executor.describe_call(UnknownTool(Timeline()), {"value": "x"})
 
     assert read == ToolExecutionDescription(
@@ -298,6 +396,16 @@ def test_repository_executor_describes_effect_resources_and_cwd(tmp_path):
     )
     assert write is not None and write.effect is ToolEffect.WRITE and write.concurrency is ToolConcurrency.EXCLUSIVE
     assert command is not None and command.effect is ToolEffect.EXECUTE and command.resources_known is False
+    assert safe_command == ToolExecutionDescription(
+        ToolEffect.READ,
+        ToolConcurrency.SAFE,
+        (str(tmp_path.resolve()),),
+        str(tmp_path.resolve()),
+    )
+    assert prepared_read is not None
+    assert prepared_read.requested_arguments["file_path"] == "src/main.py"
+    assert prepared_read.normalized_arguments["file_path"] == str((tmp_path / "src" / "main.py").resolve())
+    assert prepared_read.description == read
     assert unknown is None
 
 

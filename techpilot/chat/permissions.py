@@ -61,6 +61,37 @@ _READ_ONLY_GIT = {
 _READ_ONLY_SHELL = {"dir", "ls"}
 _SHELL_OPERATORS = {"&", "&&", "|", "||", ";", ">", ">>", "<", "<<"}
 
+# This is deliberately much narrower than the permission allow-list.  A command
+# that is permitted to run (for example a test command) may still write caches,
+# execute project code, or change the environment, so it must not enter a SAFE
+# scheduler wave merely because permission policy allows it.
+_SAFE_GIT_STATUS_FLAGS = {
+    "--short",
+    "-s",
+    "--porcelain",
+    "--branch",
+    "-b",
+    "--untracked-files=no",
+    "--untracked-files=normal",
+    "--untracked-files=all",
+    "--ignored=no",
+    "--ignored=traditional",
+    "--ignored=matching",
+}
+_SAFE_GIT_DIFF_FLAGS = {
+    "--stat",
+    "--name-only",
+    "--name-status",
+    "--summary",
+    "--compact-summary",
+    "--cached",
+    "--staged",
+    "--check",
+    "--no-ext-diff",
+    "--quiet",
+    "--exit-code",
+}
+
 
 class ChatPermissionPolicy:
     """Deterministic default policy for one repository-scoped Chat runtime."""
@@ -198,6 +229,40 @@ def command_effect(command: str) -> PermissionEffect:
     if _is_network(tokens) or _is_install(tokens):
         return PermissionEffect.NETWORK
     return PermissionEffect.EXECUTE
+
+
+def is_concurrency_safe_read_command(command: object) -> bool:
+    """Return True only for a small, cross-platform-safe read-only command set.
+
+    This answers scheduling, not permission.  The shell used by ``BashTool`` is
+    platform dependent (``cmd.exe`` on this project's Windows target), so this
+    function intentionally accepts only literal Git invocations without shell
+    syntax, path operands, revisions, or user-controlled expansion.  Native
+    ``read_file``/``grep`` remain the preferred way to inspect repository text.
+    """
+
+    if not isinstance(command, str) or not command.strip():
+        return False
+    # Detect syntax in the original command, not only shlex tokens: cmd.exe and
+    # POSIX shells can interpret metacharacters differently.
+    if any(marker in command for marker in ("&", "|", ";", ">", "<", "`", "$", "%", "!", "\n", "\r", "(", ")")):
+        return False
+    tokens = command_tokens(command)
+    if not tokens or _has_shell_operator(tokens, command) or any(_contains_shell_syntax(token) for token in tokens):
+        return False
+    names = [_command_name(token) for token in tokens]
+    if len(names) < 2 or names[0] != "git":
+        return False
+    subcommand = names[1]
+    arguments = tuple(token.lower() for token in tokens[2:])
+    if subcommand == "status":
+        return all(argument in _SAFE_GIT_STATUS_FLAGS for argument in arguments)
+    if subcommand == "diff":
+        return all(argument in _SAFE_GIT_DIFF_FLAGS for argument in arguments)
+    return (subcommand, arguments) in {
+        ("rev-parse", ("--show-toplevel",)),
+        ("branch", ("--show-current",)),
+    }
 
 
 def dangerous_command_reason(command: str) -> str | None:
