@@ -43,6 +43,7 @@ class ToolCallDetail:
     interrupted: bool = False
     execution_control: dict[str, object] | None = None
     tool_status: str | None = None
+    result_facts: dict[str, object] | None = None
 
     @property
     def status(self) -> str:
@@ -751,6 +752,8 @@ def _tool_call_details(events: list[object]) -> list[ToolCallDetail]:
             detail.tool_name = str(payload.get("tool_name", detail.tool_name))
             detail.result = str(payload.get("result", ""))
             detail.tool_status = payload.get("tool_status")
+            raw_facts = payload.get("result_facts")
+            detail.result_facts = dict(raw_facts) if isinstance(raw_facts, dict) else None
             detail.interrupted = bool(payload.get("interrupted"))
             detail.completed_at = getattr(event, "created_at", None)
             details[call_id] = detail
@@ -785,17 +788,33 @@ def _format_tool_call_detail(
     if detail.tool_name == "bash":
         command = str(arguments.get("command", ""))
         stdout, stderr, exit_code = _shell_result_parts(result)
+        facts = detail.result_facts or {}
+        if isinstance(facts.get("stdout"), str):
+            stdout = facts["stdout"]
+        if isinstance(facts.get("stderr"), str):
+            stderr = facts["stderr"]
+        stored_exit_code = facts.get("exit_code")
+        if isinstance(stored_exit_code, int) and not isinstance(stored_exit_code, bool):
+            exit_code = stored_exit_code
+        stored_cwd = facts.get("cwd")
+        cwd = stored_cwd if isinstance(stored_cwd, str) else str(repository)
         lines.extend([
             "",
             "Shell:",
             f"Command: {command or '(missing from saved arguments)'}",
-            f"cwd: {repository}",
+            f"cwd: {cwd}",
             f"Exit code: {exit_code if exit_code is not None else ('cancelled' if detail.interrupted else '0 or unavailable')}",
             "stdout:",
-            stdout,
+            stdout if not facts.get("truncated") else "(not retained here; output was truncated)",
             "stderr:",
-            stderr or "(none)",
+            (stderr or "(none)") if not facts.get("truncated") else "(not retained here; output was truncated)",
         ])
+        if facts.get("truncated"):
+            lines.append(f"Output: truncated after {facts.get('output_chars', 'unknown')} stream chars")
+            artifact = facts.get("output_artifact")
+            lines.append(f"Full output artifact: {artifact if isinstance(artifact, str) else '(not persisted)'}")
+        if facts.get("timed_out"):
+            lines.append(f"Timeout: {facts.get('timeout_seconds', 'unknown')}s")
         if _is_validation_command(command, validation_commands):
             validation_status = (
                 "passed" if detail.status == "completed"

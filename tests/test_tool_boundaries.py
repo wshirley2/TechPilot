@@ -29,6 +29,7 @@ from techpilot.runtime.sessions import SessionEventSink, SessionStore
     ("read_file", {"file_path": "x", "limit": -1}),
     ("read_file", {"file_path": "x", "limit": True}),
     ("read_file", {"file_path": "x", "offset": 1.5}),
+    ("read_file", {"file_path": "x", "expected_content_hash": "not-a-sha"}),
     ("read_file", {"file_path": "x", "extra": 1}),
     ("read_file", {}),
     ("edit_file", {"file_path": "x", "old_string": "", "new_string": "x"}),
@@ -128,6 +129,52 @@ def test_bash_status_is_not_inferred_from_stdout(tmp_path, monkeypatch):
     assert _tool_status(str(result), "completed") == "completed"
 
 
+def test_bash_result_facts_capture_streams_exit_code_and_cwd(tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=7, stdout="useful output", stderr="specific failure",
+    ))
+
+    result = get_tool("bash").execute_in("example", cwd=str(tmp_path))
+
+    assert result.status is ToolStatus.ERROR
+    assert result.facts.to_payload() == {
+        "exit_code": 7,
+        "stdout": "useful output",
+        "stderr": "specific failure",
+        "cwd": str(tmp_path),
+        "truncated": False,
+        "output_chars": len("useful output") + len("specific failure"),
+        "output_artifact": None,
+        "timed_out": False,
+        "timeout_seconds": None,
+        "content_hash": None,
+        "content_bytes": None,
+        "encoding": None,
+        "decoding_replaced": False,
+        "line_start": None,
+        "line_end": None,
+        "total_lines": None,
+        "next_offset": None,
+    }
+    assert json.loads(json.dumps(result.facts.to_payload()))["exit_code"] == 7
+
+
+def test_bash_result_facts_do_not_mislabel_truncated_streams_as_complete(tmp_path, monkeypatch):
+    stdout = "x" * 15_001
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=stdout, stderr="warning",
+    ))
+
+    result = get_tool("bash").execute_in("example", cwd=str(tmp_path))
+
+    assert "truncated" in result
+    assert result.facts.truncated is True
+    assert result.facts.stdout is None
+    assert result.facts.stderr is None
+    assert result.facts.output_chars == len(stdout) + len("warning")
+    assert result.facts.output_artifact is None
+
+
 def test_timeout_after_effect_is_unknown(tmp_path, monkeypatch):
     target = tmp_path / "effect.txt"
 
@@ -140,6 +187,9 @@ def test_timeout_after_effect_is_unknown(tmp_path, monkeypatch):
     assert result.status is ToolStatus.EFFECT_UNKNOWN
     assert "Inspect effects before retrying" in result
     assert target.exists()
+    assert result.facts.timed_out is True
+    assert result.facts.timeout_seconds == 1
+    assert result.facts.cwd == str(tmp_path)
 
 
 def test_partial_write_failure_is_unknown(tmp_path, monkeypatch):
@@ -177,11 +227,14 @@ def test_status_survives_events_session_replay_and_ui(tmp_path, monkeypatch, par
     assert agent.chat("test") == "done"
     completions = [e for e in events if e.event_type is RuntimeEventType.TOOL_COMPLETED]
     assert completions[0].payload["tool_status"] == "completed"
+    assert completions[0].payload["result_facts"]["stdout"] == "Error: this is successful command output"
+    assert completions[0].payload["result_facts"]["exit_code"] == 0
     if parallel:
         assert completions[1].payload["tool_status"] == "error"
     projection = store.replay("s1")
     details = _tool_call_details(projection.events)
     assert details[0].status == "completed"
+    assert details[0].result_facts == completions[0].payload["result_facts"]
     tui = TechPilotTui()
     for event in events:
         if event.event_type in {RuntimeEventType.TOOL_REQUESTED, RuntimeEventType.TOOL_COMPLETED}:

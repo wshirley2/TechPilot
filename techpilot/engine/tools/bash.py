@@ -13,7 +13,7 @@ import re
 import subprocess
 import threading
 
-from ..tool_results import ToolResult, ToolStatus
+from ..tool_results import ToolResult, ToolResultFacts, ToolStatus
 from ..tool_validation import validate_tool_arguments, validated_tool
 from .base import Tool
 
@@ -75,10 +75,16 @@ class BashTool(Tool):
         try:
             validate_tool_arguments(self, {"command": command, "timeout": timeout})
         except (TypeError, ValueError) as error:
-            return ToolResult(f"Error: bad arguments for bash: {error}", ToolStatus.ERROR)
+            return ToolResult(
+                f"Error: bad arguments for bash: {error}", ToolStatus.ERROR,
+                facts=ToolResultFacts(cwd=cwd),
+            )
         warning = _check_dangerous(command)
         if warning:
-            return ToolResult(f"⚠ Blocked: {warning}\nCommand: {command}", ToolStatus.DENIED)
+            return ToolResult(
+                f"⚠ Blocked: {warning}\nCommand: {command}", ToolStatus.DENIED,
+                facts=ToolResultFacts(cwd=cwd),
+            )
 
         try:
             proc = subprocess.run(
@@ -96,26 +102,43 @@ class BashTool(Tool):
             # track cd commands so next command runs in the right place
             if proc.returncode == 0:
                 _update_cwd(command, cwd)
-            out = proc.stdout
-            if proc.stderr:
-                out += f"\n[stderr]\n{proc.stderr}"
+            stdout = proc.stdout
+            stderr = proc.stderr
+            out = stdout
+            if stderr:
+                out += f"\n[stderr]\n{stderr}"
             if proc.returncode != 0:
                 out += f"\n[exit code: {proc.returncode}]"
             # keep head + tail to preserve the most useful info
-            if len(out) > 15_000:
+            truncated = len(out) > 15_000
+            if truncated:
                 out = (
                     out[:6000]
                     + f"\n\n... truncated ({len(out)} chars total) ...\n\n"
                     + out[-3000:]
                 )
-            return ToolResult(out.strip() or "(no output)", ToolStatus.ERROR if proc.returncode else ToolStatus.COMPLETED)
+            return ToolResult(
+                out.strip() or "(no output)", ToolStatus.ERROR if proc.returncode else ToolStatus.COMPLETED,
+                facts=ToolResultFacts(
+                    exit_code=proc.returncode,
+                    stdout=None if truncated else stdout,
+                    stderr=None if truncated else stderr,
+                    cwd=cwd,
+                    truncated=truncated,
+                    output_chars=len(stdout) + len(stderr),
+                ),
+            )
         except subprocess.TimeoutExpired:
             return ToolResult(
                 f"[effect unknown] Error: timed out after {timeout}s; the command may have changed files "
                 "or started child processes. Inspect effects before retrying.", ToolStatus.EFFECT_UNKNOWN,
+                facts=ToolResultFacts(cwd=cwd, timed_out=True, timeout_seconds=timeout),
             )
         except Exception as e:
-            return ToolResult(f"[effect unknown] Error running command: {e}", ToolStatus.EFFECT_UNKNOWN)
+            return ToolResult(
+                f"[effect unknown] Error running command: {e}", ToolStatus.EFFECT_UNKNOWN,
+                facts=ToolResultFacts(cwd=cwd),
+            )
 
 
 def _check_dangerous(cmd: str) -> str | None:

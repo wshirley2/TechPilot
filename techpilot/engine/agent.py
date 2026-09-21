@@ -437,6 +437,7 @@ class Agent:
             outcome = tool_result(payload.get("result", ""))
             payload["result"] = str(outcome)
             payload["tool_status"] = outcome.status.value
+            payload["result_facts"] = outcome.facts.to_payload()
         event = RuntimeEvent(
             event_type=event_type,
             session_id=self.session_id,

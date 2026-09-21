@@ -10,7 +10,7 @@ from scripts.run_m1_demo import ROOT, DemoWritePrompt, run_demo
 from techpilot.engine.events import RuntimeEventType
 from techpilot.engine.permissions import DenyPermissionPrompt, PermissionDecision
 from techpilot.research.contracts import ReportArtifact, ReportClaim, ResearchTask
-from techpilot.research.runtime_files import ResearchIOError, RuntimeResearchFiles
+from techpilot.research.runtime_files import MAX_IMPORT_LINES, ResearchIOError, RuntimeResearchFiles
 from techpilot.research.workflow import ResearchWorkflow
 
 
@@ -166,12 +166,62 @@ def test_receipt_denial_leaves_diagnostic_report_but_never_returns_delivery(work
     assert not report.output_path.with_suffix(".json").exists()
 
 
-@pytest.mark.parametrize("body", [b"", b"invalid \xff", b"line\n" * 2001])
+@pytest.mark.parametrize("body", [b"", b"invalid \xff"])
 def test_incomplete_or_invalid_text_never_creates_snapshot(workflow, body):
     source = workflow.files.repository / "invalid.txt"
     source.write_bytes(body)
     with pytest.raises(ResearchIOError):
         workflow.import_source("invalid", source)
+    assert not (workflow.store_directory / "snapshots").exists()
+
+
+def test_source_over_line_budget_never_creates_snapshot(workflow):
+    source = workflow.files.repository / "over-budget.txt"
+    source.write_bytes(b"line\n" * (MAX_IMPORT_LINES + 1))
+    with pytest.raises(ResearchIOError, match="budget"):
+        workflow.import_source("over-budget", source)
+    assert not (workflow.store_directory / "snapshots").exists()
+
+
+def test_paginated_source_imports_all_lines_with_one_version(workflow):
+    source = workflow.files.repository / "long.txt"
+    source.write_text("".join(f"line {index}\n" for index in range(1, 2002)), encoding="utf-8")
+
+    snapshot = workflow.import_source("long", source)
+
+    assert snapshot.content.splitlines() == [f"line {index}" for index in range(1, 2002)]
+    source_calls = {
+        event.tool_call_id for event in workflow.files.events
+        if event.event_type is RuntimeEventType.TOOL_REQUESTED
+        and event.payload.get("tool_name") == "read_file"
+        and event.payload.get("arguments", {}).get("file_path") == str(source)
+    }
+    reads = [event for event in workflow.files.events
+             if event.event_type is RuntimeEventType.TOOL_COMPLETED and event.tool_call_id in source_calls]
+    assert len(reads) == 2
+    assert reads[0].payload["result_facts"]["next_offset"] == 2001
+    assert reads[1].payload["result_facts"]["content_hash"] == reads[0].payload["result_facts"]["content_hash"]
+
+
+def test_source_change_between_pages_never_creates_a_mixed_snapshot(workflow, monkeypatch):
+    source = workflow.files.repository / "changing.txt"
+    source.write_text("".join(f"line {index}\n" for index in range(1, 2002)), encoding="utf-8")
+    original_call = workflow.files._call
+    calls = 0
+
+    def change_after_first_page(name, arguments):
+        nonlocal calls
+        outcome = original_call(name, arguments)
+        if name == "read_file":
+            calls += 1
+            if calls == 1:
+                source.write_text("changed\n", encoding="utf-8")
+        return outcome
+
+    monkeypatch.setattr(workflow.files, "_call", change_after_first_page)
+
+    with pytest.raises(ResearchIOError):
+        workflow.import_source("changing", source)
     assert not (workflow.store_directory / "snapshots").exists()
 
 

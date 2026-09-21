@@ -6,6 +6,7 @@ constraints. This is deliberately not a general JSON Schema implementation.
 
 import inspect
 import math
+import re
 from functools import wraps
 
 from .tool_results import ToolResult, ToolStatus, tool_result
@@ -57,6 +58,11 @@ def validate_tool_arguments(tool, arguments) -> None:
         for name in ("offset", "limit"):
             if name in arguments and (type(arguments[name]) is not int or arguments[name] < 1):
                 raise ValueError(f"{name} must be a positive integer")
+        expected_hash = arguments.get("expected_content_hash")
+        if expected_hash is not None and (
+            not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+        ):
+            raise ValueError("expected_content_hash must be a lowercase SHA-256 hex digest")
     if tool.name == "edit_file":
         for name in ("old_string", "new_string"):
             if name in arguments and not isinstance(arguments[name], str):

@@ -188,6 +188,34 @@ def test_read_file_offset_limit(tmp_path):
     assert "line14" not in r  # 5-line limit stops at content line13
 
 
+def test_read_file_pages_are_version_bound_and_locatable(tmp_path):
+    read = get_tool("read_file")
+    path = tmp_path / "pages.txt"
+    path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    first = read.execute(file_path=str(path), limit=2)
+
+    assert first.facts.line_start == 1
+    assert first.facts.line_end == 2
+    assert first.facts.total_lines == 3
+    assert first.facts.next_offset == 3
+    assert first.facts.content_hash is not None
+    assert "next offset: 3" in first
+    second = read.execute(
+        file_path=str(path),
+        offset=first.facts.next_offset,
+        expected_content_hash=first.facts.content_hash,
+    )
+    assert second.facts.line_start == second.facts.line_end == 3
+    assert second.facts.next_offset is None
+    assert "3\tthree" in second
+
+    path.write_text("changed\n", encoding="utf-8")
+    changed = read.execute(file_path=str(path), offset=3, expected_content_hash=first.facts.content_hash)
+    assert changed.status.value == "error"
+    assert "changed since the previous page" in changed
+
+
 def test_read_write_unicode_roundtrip(tmp_path):
     """Non-ASCII content must survive write->read as UTF-8 regardless of OS locale.
 
