@@ -1,0 +1,5 @@
+pytest 8.3.5：测试入门资料卡
+性质：基于官方固定提交的中文整理，非官方译文；原文短语用于对照。只涵盖以下三个维度。
+用例写法：入门示例用普通测试函数和 assert 语句编写检查，不要求该示例继承 TestCase。原文片段：def test_answer(): / assert func(3) == 5
+测试发现：入门页说明默认运行当前目录及子目录中符合 test_*.py 或 *_test.py 命名的文件。原文短语：test_*.py or \*_test.py
+运行入口：安装 pytest 后，入门页用 pytest 命令启动测试。原文命令：$ pytest

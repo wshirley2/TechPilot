@@ -1,0 +1,5 @@
+unittest（CPython 3.12.9）：测试入门资料卡
+性质：基于官方固定提交的中文整理，非官方译文；原文短语用于对照。只涵盖以下三个维度。
+用例写法：基础示例继承 unittest.TestCase，在测试方法里调用 assertEqual 等断言方法。原文片段：class TestStringMethods(unittest.TestCase): / self.assertEqual('foo'.upper(), 'FOO')
+测试发现：discover 的文件名匹配模式默认是 test*.py；发现的测试模块或包必须能从项目顶层目录导入。原文短语：Pattern to match test files (``test*.py`` default)
+运行入口：在项目目录执行 python -m unittest discover 进行测试发现和运行。原文命令：python -m unittest discover

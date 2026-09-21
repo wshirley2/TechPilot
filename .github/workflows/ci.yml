@@ -79,6 +79,13 @@ jobs:
           tests/techpilot/test_role_skill_contracts.py
           tests/techpilot/test_user_config.py
 
+      - name: Run research tests
+        run: >-
+          python -m pytest -v
+          tests/techpilot/test_research_contracts.py
+          tests/techpilot/test_research_workflow.py
+          tests/techpilot/test_research_rendering.py
+
       - name: Run compatibility tests
         run: >-
           python -m pytest -v
@@ -87,6 +94,7 @@ jobs:
           tests/test_runtime_events.py
           tests/test_session.py
           tests/test_tool_execution.py
+          tests/test_tool_boundaries.py
           tests/test_tools.py
 
       - name: Compile
