@@ -18,7 +18,13 @@ from techpilot.engine.permissions import (
     PermissionManager,
     PermissionRequest,
 )
-from techpilot.engine.tool_execution import PreparedToolCall, ToolConcurrency, ToolEffect, ToolExecutionDescription
+from techpilot.engine.tool_execution import (
+    PreparedToolCall,
+    ToolConcurrency,
+    ToolEffect,
+    ToolExecutionDescription,
+    declared_tool_description,
+)
 from techpilot.engine.tool_results import ToolResult, ToolStatus, tool_result
 from techpilot.engine.tool_validation import validate_tool_arguments
 from techpilot.engine.tools.base import Tool
@@ -138,7 +144,18 @@ class RepositoryToolExecutor:
             "agent": ToolEffect.DELEGATE,
         }.get(tool.name)
         if effect is None:
-            return None
+            declared = declared_tool_description(tool, arguments)
+            if declared is None:
+                return None
+            validate_tool_arguments(tool, arguments)
+            context = _RepositoryPreparedContext(self.repository_root, PathBoundary.REPOSITORY, ())
+            return PreparedToolCall.create(
+                tool.name,
+                arguments,
+                declared,
+                normalized_arguments=arguments,
+                host_context=context,
+            )
         validate_tool_arguments(tool, arguments)
         normalized = dict(arguments)
         path_boundary = PathBoundary.REPOSITORY
@@ -268,6 +285,7 @@ class RepositoryToolExecutor:
             normalized,
             path_boundary=path_boundary,
             affected_paths=affected_paths,
+            declared_effect=prepared.description.effect if prepared is not None else ToolEffect.UNKNOWN,
         )
         assessment = self._execution_control_policy.assess(control_request)
         self._emit_execution_control_assessment(
@@ -323,9 +341,9 @@ class RepositoryToolExecutor:
         request = PermissionRequest(
             tool_call_id=tool_call_id,
             tool_name=tool.name,
-            effect=_TOOL_EFFECTS.get(tool.name, PermissionEffect.UNKNOWN),
+            effect=_permission_effect(tool.name, prepared.description.effect if prepared is not None else ToolEffect.UNKNOWN),
             normalized_arguments=normalized,
-            reason="Repository-scoped read request",
+            reason="Repository-scoped tool request",
             scope=str(self.repository_root),
         )
         decision = self.permission_manager.authorize(request)
@@ -496,9 +514,10 @@ class RepositoryToolExecutor:
         *,
         path_boundary: PathBoundary,
         affected_paths: tuple[str, ...],
+        declared_effect: ToolEffect,
     ) -> NormalizedToolRequest:
         command = _normalized_command(normalized.get("command")) if tool_name == "bash" else None
-        operation = _operation_kind(tool_name, command)
+        operation = _operation_kind(tool_name, command, declared_effect)
         return NormalizedToolRequest(
             tool_name=tool_name,
             operation=operation,
@@ -607,7 +626,11 @@ def _git_subcommand(names: tuple[str, ...]) -> str | None:
     return None
 
 
-def _operation_kind(tool_name: str, command: NormalizedCommand | None) -> OperationKind:
+def _operation_kind(
+    tool_name: str,
+    command: NormalizedCommand | None,
+    declared_effect: ToolEffect = ToolEffect.UNKNOWN,
+) -> OperationKind:
     fixed = {
         "read_file": OperationKind.READ,
         "glob": OperationKind.SEARCH,
@@ -619,6 +642,13 @@ def _operation_kind(tool_name: str, command: NormalizedCommand | None) -> Operat
     }.get(tool_name)
     if fixed is not None:
         return fixed
+    declared = {
+        ToolEffect.READ: OperationKind.READ,
+        ToolEffect.WRITE: OperationKind.WRITE,
+        ToolEffect.NETWORK: OperationKind.NETWORK,
+    }.get(declared_effect)
+    if declared is not None:
+        return declared
     tokens = tuple(token.lower() for token in command.tokens) if command is not None else ()
     names = tuple(Path(token).name for token in tokens)
     if names[:2] == ("git", "rm") or names[:1] in {"rm", "del", "erase", "rmdir", "rd", "remove-item", "unlink"}:
@@ -630,6 +660,18 @@ def _operation_kind(tool_name: str, command: NormalizedCommand | None) -> Operat
     if command is not None and command.kind is CommandKind.PUBLISH:
         return OperationKind.PUBLISH
     return OperationKind.COMMAND
+
+
+def _permission_effect(tool_name: str, declared_effect: ToolEffect) -> PermissionEffect:
+    """Use a custom tool's prepared effect instead of treating it as unknown."""
+
+    built_in = _TOOL_EFFECTS.get(tool_name)
+    if built_in is not None:
+        return built_in
+    try:
+        return PermissionEffect(declared_effect.value)
+    except ValueError:
+        return PermissionEffect.UNKNOWN
 
 
 def _file_categories(paths: tuple[str, ...], command: NormalizedCommand | None) -> frozenset[FileCategory]:

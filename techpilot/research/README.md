@@ -17,6 +17,10 @@
   业务事实存于 `store/task.json` 和 `store/snapshots/<snapshot_id>.json`。
 - `runtime_files.py`：固定 Provider 响应驱动真实 Runtime 的 read/write 工具，沿用
   RepositoryToolExecutor、Permission、Trusted Diff、Session 及工具状态检查。
+- `host_files.py`、`tools.py`：宿主限定资料、store 与报告目录；提供导入、证据查询、
+  按行补读和报告提交四个业务工具，不在工具内部创建 Provider 或嵌套 Runtime。
+- `runtime.py`：`build_research_runtime(...)` 显式装配独立 Research Runtime。证据读取自动
+  允许，导入快照与提交报告必须由宿主确认；普通 Chat 默认工具集不变。
 - `scripts/run_m1_demo.py`：显式离线入口，仅预批准新演示目录内 store/reports 的新文件
   写入；不会把该 prompt 安装到普通 Chat，不增加权限，不改变 C3/C4/C5 或 M0 评测。
 
@@ -112,9 +116,9 @@ M0 冻结评测与现有安全合同不变，不自动暂存、提交、推送�
 - 生产工具复用受控 IO 边界，不在内部嵌套 FixedToolProvider/Runtime；演示适配器继续保留做回归。
 - 下一步先完成完整资料与最小 research 接入的实施卡；Bash 并发的首个窄切片已完成：无 Shell 元字符的受限 `git status`/`git diff`、`git rev-parse --show-toplevel`、`git branch --show-current` 可并行。测试、构建、`rg`、路径或修订参数和未知命令仍独占，不阻塞首个真实任务。
 
-本补充已实现 Bash 并发窄切片、Bash 结构化结果与完整资料分页，未实现 research 接口、受控完整
-输出产物或会话 cwd。2026-09-21 分页/研究工作流回归为 124 passed、2 skipped；Ruff 与无字节码
-导入检查通过。个人知识库影响：需要更新；相关主题为
+本补充已实现 Bash 并发窄切片、Bash 结构化结果、完整资料分页和可显式装配的 research 接口；
+受控完整输出产物或会话 cwd 尚未实现。2026-09-21 分页/研究工作流回归为 124 passed、2 skipped；
+Ruff 与无字节码导入检查通过。个人知识库影响：需要更新；相关主题为
 工具调度与权限、Bash/cwd、结构化结果和业务完成边界；证据见设计稿及现有
 `engine/tool_execution.py`、`chat/executor.py`、`engine/tool_results.py`；收件箱待记录。
 

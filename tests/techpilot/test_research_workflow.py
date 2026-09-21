@@ -3,14 +3,18 @@
 import hashlib
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.run_m1_demo import ROOT, DemoWritePrompt, run_demo
-from techpilot.engine.events import RuntimeEventType
+from techpilot.engine.events import CallbackEventSink, RuntimeEventType
+from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import DenyPermissionPrompt, PermissionDecision
-from techpilot.research.contracts import ReportArtifact, ReportClaim, ResearchTask
+from techpilot.research.contracts import EvidenceFragment, ReportArtifact, ReportClaim, ResearchTask, SourceSnapshot
 from techpilot.research.host_files import HostResearchFiles
+from techpilot.research.runtime import build_research_runtime
 from techpilot.research.runtime_files import MAX_IMPORT_LINES, ResearchIOError, RuntimeResearchFiles
 from techpilot.research.tools import (
     ResearchImportSourceTool,
@@ -20,6 +24,7 @@ from techpilot.research.tools import (
     ResearchToolService,
 )
 from techpilot.research.workflow import ResearchWorkflow
+from techpilot.runtime import RuntimeBootstrap
 
 
 @pytest.fixture
@@ -338,6 +343,38 @@ def test_research_submit_tool_only_uses_issued_evidence_and_new_artifact(tmp_pat
     assert delivered["snapshot_ids"] == [snapshot.snapshot_id]
     rejected = submit.execute([], [snapshot.snapshot_id], "report.md")
     assert rejected.status.value == "effect unknown"
+
+
+def test_explicit_research_runtime_runs_the_full_tool_chain(tmp_path):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    content = "documented fact\n"
+    (source_root / "source.txt").write_text(content, encoding="utf-8")
+    task = ResearchTask("runtime", "What is documented?", ("A",), (), tmp_path / "reports")
+    snapshot = SourceSnapshot("source", content, datetime.now(timezone.utc))
+    evidence = EvidenceFragment.from_snapshot(snapshot, 1, 1)
+    responses = iter([
+        LLMResponse(tool_calls=[ToolCall("import", "research_import_source", {"source_id": "source", "source_path": "source.txt"})]),
+        LLMResponse(tool_calls=[ToolCall("query", "research_query_evidence", {"snapshot_id": snapshot.snapshot_id, "query": "documented"})]),
+        LLMResponse(tool_calls=[ToolCall("read", "research_read_evidence", {"snapshot_id": snapshot.snapshot_id, "start_line": 1, "end_line": 1})]),
+        LLMResponse(tool_calls=[ToolCall("submit", "research_submit_report", {"claims": [{"topic": "事实", "conclusion": "已记录", "evidence_ids": [evidence.evidence_id]}], "snapshot_ids": [snapshot.snapshot_id], "output_name": "report.md"})]),
+        LLMResponse(content="done"),
+    ])
+    provider = SimpleNamespace(model="fake", total_prompt_tokens=0, total_completion_tokens=0, estimated_cost=0.0,
+                               chat=lambda *args, **kwargs: next(responses))
+    prompt = SimpleNamespace(decide=lambda request: PermissionDecision.allow("test approval"))
+    events = []
+    assembled = build_research_runtime(
+        bootstrap=RuntimeBootstrap(provider_factory=lambda _config: provider), repository=tmp_path,
+        session_directory=tmp_path / "sessions", source_root=source_root, store_directory=tmp_path / "store",
+        task=task, event_sink=CallbackEventSink(events.append), permission_prompt=prompt,
+    )
+
+    assert assembled.runtime.run_turn("research") == "done"
+    assert (task.artifact_directory / "report.md").exists()
+    assert {event.payload.get("tool_name") for event in events if event.event_type is RuntimeEventType.TOOL_COMPLETED} == {
+        "research_import_source", "research_query_evidence", "research_read_evidence", "research_submit_report",
+    }
 
 
 def test_source_instructions_are_only_searchable_data(workflow):
