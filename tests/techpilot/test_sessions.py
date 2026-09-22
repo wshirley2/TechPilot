@@ -113,6 +113,49 @@ def test_session_keeps_raw_facts_when_context_projection_is_compressed(tmp_path)
     assert projection.model_messages == [{"role": "user", "content": "[summary] first"}]
 
 
+def test_session_replays_messages_after_context_projection_checkpoint(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    store.create("session-2", repository_root=tmp_path, model="fake-model")
+    store.append_runtime(_event(RuntimeEventType.TURN_STARTED, "session-2", payload={"user_input": "first"}))
+    store.append(SessionEvent(
+        event_type=RuntimeEventType.CONTEXT_COMPRESSED.value,
+        session_id="session-2",
+        payload={"message_projection": [{"role": "user", "content": "[summary] first"}]},
+    ))
+    store.append_runtime(_event(RuntimeEventType.TURN_COMPLETED, "session-2", payload={"content": "first answer"}))
+    store.append_runtime(_event(RuntimeEventType.TURN_STARTED, "session-2", payload={"user_input": "read README"}))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_REQUESTED,
+        "session-2",
+        tool_call_id="read-2",
+        payload={"tool_name": "read_file", "arguments": {"file_path": "README.md"}, "assistant_content": ""},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_COMPLETED,
+        "session-2",
+        tool_call_id="read-2",
+        payload={"tool_name": "read_file", "result": "contents", "interrupted": False},
+    ))
+
+    projection = store.replay("session-2")
+
+    assert projection.model_messages == [
+        {"role": "user", "content": "[summary] first"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "read README"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "read-2",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"file_path": "README.md"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "read-2", "content": "contents"},
+    ]
+
+
 def test_session_replay_preserves_unified_runtime_identity(tmp_path):
     source = tmp_path / "source"
     workspace = tmp_path / "workspace"

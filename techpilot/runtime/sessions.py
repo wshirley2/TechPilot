@@ -194,6 +194,7 @@ class SessionStore:
         compressed_projection: list[dict[str, Any]] | None = None
 
         for event in events:
+            message_count_before = len(projection.messages)
             payload = event.payload
             terminal_result = TaskRuntimeResult.from_terminal_event(event.event_type, payload)
             if terminal_result is not None:
@@ -299,6 +300,19 @@ class SessionStore:
                 candidate = payload.get("message_projection")
                 if _is_message_list(candidate):
                     compressed_projection = copy.deepcopy(candidate)
+
+            # A compression event is a checkpoint for the model-visible
+            # projection, not the end of the Session.  Continue rebuilding
+            # messages produced after that checkpoint so a resumed Agent sees
+            # the later context as well as the compressed history.
+            if (
+                compressed_projection is not None
+                and event.event_type != RuntimeEventType.CONTEXT_COMPRESSED.value
+                and len(projection.messages) > message_count_before
+            ):
+                compressed_projection.extend(
+                    copy.deepcopy(projection.messages[message_count_before:])
+                )
 
         projection.model_messages = compressed_projection or copy.deepcopy(projection.messages)
         return projection
