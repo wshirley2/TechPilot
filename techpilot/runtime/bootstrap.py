@@ -28,6 +28,7 @@ from .contracts import (
     TaskRuntimePaths,
     TaskRuntimeResult,
 )
+from .effect_journal import EffectJournalExecutor, EffectJournalStore
 from .sessions import SessionEventSink, SessionProjection, SessionStore
 
 ProviderFactory = Callable[[Config], object]
@@ -87,6 +88,7 @@ class TaskRuntime:
     session_sink: SessionEventSink | None = None
     base_system_context: str = ""
     role_context: str | None = None
+    goal_context: str | None = None
     active_role: ActiveRole | None = None
     base_tools: tuple[Tool, ...] = ()
     role_tool_catalog: dict[str, Tool] = field(default_factory=dict)
@@ -204,6 +206,26 @@ class TaskRuntime:
         finally:
             self._restore_role_snapshot(previous)
 
+    @contextmanager
+    def goal_scope(self, context: str) -> Iterator[None]:
+        """Temporarily expose durable Goal facts on every provider request.
+
+        Goal facts are intentionally system context rather than a historical
+        Chat message: context compression and Session replay must not be able
+        to erase the active outcome while a Goal step is running.
+        """
+
+        if not context.strip():
+            raise ValueError("Goal context cannot be empty")
+        previous = self.goal_context
+        self.goal_context = context
+        self._refresh_system_context()
+        try:
+            yield
+        finally:
+            self.goal_context = previous
+            self._refresh_system_context()
+
     def _role_snapshot(self) -> _RoleRuntimeSnapshot:
         return _RoleRuntimeSnapshot(active_role=self.active_role, tools=tuple(self.tools))
 
@@ -251,7 +273,9 @@ class TaskRuntime:
         self.agent.update_system_context(self._system_context(self.role_context))
 
     def _system_context(self, role_context: str | None) -> str:
-        context = "\n\n".join(part for part in (self.base_system_context, role_context) if part)
+        context = "\n\n".join(
+            part for part in (self.base_system_context, role_context, self.goal_context) if part
+        )
         return _with_runtime_identity(context, self.mode, self.config.model)
 
     def consume_recovery_notices(self) -> list[str]:
@@ -461,6 +485,16 @@ class RuntimeBootstrap:
                 task_id=inputs.task_id,
                 run_id=inputs.run_id,
                 source_repository_root=source_repository,
+            )
+        # Session events are conversational history. The Effect Journal is a
+        # separate write-ahead record for non-read Tool effects, so ordinary
+        # Chat and Goal recovery can survive process loss too. Managed Run
+        # keeps its compatibility executor until that deprecated route is
+        # removed rather than silently changing its workspace contract here.
+        if mode is not RuntimeMode.MANAGED_RUN:
+            agent.tool_executor = EffectJournalExecutor(
+                agent.tool_executor,
+                EffectJournalStore.for_session_directory(session_store.directory),
             )
         runtime = TaskRuntime(
             identity=TaskRuntimeIdentity(

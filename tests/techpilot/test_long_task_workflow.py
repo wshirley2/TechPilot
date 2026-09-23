@@ -8,8 +8,11 @@ import pytest
 from techpilot.engine.events import CallbackEventSink
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import PermissionDecision
+from techpilot.engine.tool_execution import ToolEffect
 from techpilot.engine.tools import WriteFileTool
 from techpilot.runtime import (
+    EffectJournalState,
+    EffectJournalStore,
     LongTaskRecoveryRequired,
     LongTaskStatus,
     LongTaskWorkflow,
@@ -135,22 +138,52 @@ def test_long_task_workflow_runs_real_runtime_and_binds_checkpoint_to_session(tm
     assert runtime.agent.tool_executor.calls == 1
 
 
+def test_goal_rehydrates_durable_outcome_into_each_step_without_leaking_to_chat(tmp_path):
+    first = _runtime(tmp_path, FixedProvider([]))
+    LongTaskWorkflow(first, task_id="task-goal-context", goal="Keep the original outcome").start_or_resume()
+
+    provider = FixedProvider([LLMResponse(content="continued")])
+    resumed = _runtime(tmp_path, provider, session_id=first.agent.session_id)
+    workflow = LongTaskWorkflow(
+        resumed,
+        task_id="task-goal-context",
+        goal="This constructor text must not replace the durable Goal",
+    )
+
+    result = workflow.run_step("continue")
+
+    assert result.response == "continued"
+    prompt = provider.requests[0]["messages"][0]["content"]
+    assert "## Current durable Goal" in prompt
+    assert "Keep the original outcome" in prompt
+    assert "constructor text" not in prompt
+    assert "## Current durable Goal" not in resumed.agent._full_messages()[0]["content"]
+
+
+def test_goal_rehydrates_confirmed_constraints_into_a_resumed_step(tmp_path):
+    first = _runtime(tmp_path, FixedProvider([]))
+    initial = LongTaskWorkflow(first, task_id="task-goal-constraint", goal="Safely update the formatter")
+    initial.start_or_resume()
+    initial.record_constraint("Only modify formatter.py")
+
+    provider = FixedProvider([LLMResponse(content="continued")])
+    resumed = _runtime(tmp_path, provider, session_id=first.agent.session_id)
+    workflow = LongTaskWorkflow(resumed, task_id="task-goal-constraint", goal="ignored")
+
+    assert workflow.run_step("continue").response == "continued"
+    prompt = provider.requests[0]["messages"][0]["content"]
+    assert "## Confirmed hard constraints" in prompt
+    assert "Only modify formatter.py" in prompt
+    assert "ignored" not in prompt
+
+
 def test_recovery_skips_a_completed_effect_after_interruption(tmp_path):
     first = _runtime(tmp_path, FixedProvider([_write_call()]))
     first_counter = first.agent.tool_executor
-
-    def interrupt_after_completion(phase: str, action_id: str) -> None:
-        assert action_id == "tool-write-1"
-        if phase == "after_effect_completed":
-            raise KeyboardInterrupt("test interruption after durable completion")
+    first.agent.tool_executor = InterruptAfterExecuteExecutor(first_counter)
 
     with pytest.raises(KeyboardInterrupt):
-        LongTaskWorkflow(
-            first,
-            task_id="task-2",
-            goal="write result",
-            fault_hook=interrupt_after_completion,
-        ).run_turn("write the result")
+        LongTaskWorkflow(first, task_id="task-2", goal="write result").run_turn("write the result")
 
     resumed = _runtime(
         tmp_path,
@@ -163,40 +196,34 @@ def test_recovery_skips_a_completed_effect_after_interruption(tmp_path):
     assert result.response == "recovered"
     assert result.task.status is LongTaskStatus.SUCCEEDED
     assert first_counter.calls == 1
-    assert resumed_counter.calls == 0
+    assert resumed_counter.calls == 1
+    entry = EffectJournalStore.for_session_directory(tmp_path / "sessions").replay(first.agent.session_id).entries["write-1"]
+    assert entry.state is EffectJournalState.FINISHED
     assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "durable result\n"
 
 
-def test_recovery_stops_when_interruption_precedes_known_tool_outcome(tmp_path):
+def test_goal_projects_unfinished_shared_effect_as_recovery_required(tmp_path):
     runtime = _runtime(tmp_path, FixedProvider([_write_call()]))
     counter = runtime.agent.tool_executor
-
-    def interrupt_after_started(phase: str, action_id: str) -> None:
-        assert action_id == "tool-write-1"
-        if phase == "after_effect_started":
-            raise KeyboardInterrupt("test interruption before executor")
-
-    with pytest.raises(KeyboardInterrupt):
-        LongTaskWorkflow(
-            runtime,
-            task_id="task-3",
-            goal="write result",
-            fault_hook=interrupt_after_started,
-        ).run_turn("write the result")
-
-    resumed = _runtime(tmp_path, FixedProvider([LLMResponse(content="must not run")]), session_id=runtime.agent.session_id)
-    workflow = LongTaskWorkflow(resumed, task_id="task-3", goal="write result")
+    workflow = LongTaskWorkflow(runtime, task_id="task-3", goal="write result")
+    workflow.start_or_resume()
+    EffectJournalStore.for_session_directory(tmp_path / "sessions").start(
+        session_id=runtime.agent.session_id,
+        tool_call_id="write-1",
+        tool_name="write_file",
+        arguments={"file_path": "result.txt", "content": "durable result\n"},
+        effect=ToolEffect.WRITE,
+    )
 
     with pytest.raises(LongTaskRecoveryRequired):
         workflow.run_turn("continue")
     assert workflow.store.replay("task-3").status is LongTaskStatus.RECOVERY_REQUIRED
     assert counter.calls == 0
-    assert resumed.agent.tool_executor.calls == 0
     assert not (tmp_path / "result.txt").exists()
 
 
-def test_plain_session_reissues_the_requested_write_after_interruption(tmp_path):
-    """Control comparison: Session recovery alone has no completed-effect ledger."""
+def test_plain_session_replays_completed_write_without_reexecuting_it(tmp_path):
+    """Ordinary Chat receives the same completed-effect recovery boundary."""
 
     first = _runtime(tmp_path, FixedProvider([_write_call()]))
     first.agent.tool_executor = InterruptAfterExecuteExecutor(first.agent.tool_executor)
@@ -211,4 +238,7 @@ def test_plain_session_reissues_the_requested_write_after_interruption(tmp_path)
     )
     assert resumed.run_turn("continue") == "ordinary recovery"
     assert first.agent.tool_executor.calls == 1
+    # The provider repeats its request, so the outer counting decorator sees
+    # one call. Its inner journal returns the durable result without reaching
+    # the repository executor a second time.
     assert resumed.agent.tool_executor.calls == 1

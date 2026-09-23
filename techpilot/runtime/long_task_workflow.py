@@ -1,8 +1,7 @@
-"""Explicit long-task execution over the existing Chat Runtime.
+"""Goal lifecycle over the existing Chat Runtime.
 
-This opt-in adapter does not alter normal Chat, permission decisions, Tool
-effects, C5 scheduling, or Session facts.  It only places durable Task facts
-around a Tool effect so recovery can execute, skip, or request reconciliation.
+Goals add durable lifecycle, outcome, constraints, and checkpoints. Tool
+execution and effect recovery stay in the shared Runtime Effect Journal.
 """
 
 from __future__ import annotations
@@ -12,9 +11,11 @@ from dataclasses import dataclass
 
 from techpilot.engine.agent import ToolExecutionContext
 from techpilot.engine.tool_execution import ToolEffect, ToolExecutionDescription, default_tool_description
+from techpilot.engine.tool_results import ToolStatus, tool_result
 from techpilot.engine.tools.base import Tool
 
 from .bootstrap import TaskRuntime
+from .effect_journal import EffectJournalStore
 from .long_tasks import (
     EffectDisposition,
     LongTaskBudget,
@@ -26,11 +27,12 @@ from .long_tasks import (
     TaskCheckpoint,
 )
 
-FaultHook = Callable[[str, str], None]
-
 
 class LongTaskRecoveryRequired(LongTaskStateError):
-    """A resumed Task has an effect whose outcome cannot be inferred safely."""
+    """A Goal cannot advance until shared Runtime recovery is reconciled."""
+
+
+FaultHook = Callable[[str, str], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,12 +45,7 @@ class LongTaskWorkflowResult:
 
 
 class LongTaskWorkflow:
-    """Run explicitly managed work through a normal ``TaskRuntime``.
-
-    ``fault_hook`` exists only for deterministic interruption tests.  It may
-    raise ``KeyboardInterrupt`` at a named effect boundary to model process
-    loss; production callers leave it unset.
-    """
+    """Run an explicit durable Goal through a normal ``TaskRuntime``."""
 
     def __init__(
         self,
@@ -57,15 +54,15 @@ class LongTaskWorkflow:
         task_id: str,
         goal: str,
         budget: LongTaskBudget | None = None,
-        fault_hook: FaultHook | None = None,
     ) -> None:
         if runtime.session_store is None:
             raise ValueError("Long Task workflow requires Runtime Session persistence")
         self.runtime = runtime
         self.task_id = task_id
         self.goal = goal
+        # Kept only to replay historical Task records. Goal no longer applies
+        # its own per-effect budget; Runtime owns Tool execution control.
         self.budget = budget or LongTaskBudget()
-        self.fault_hook = fault_hook
         self.store = LongTaskStore.for_repository(
             runtime.repository,
             session_directory=runtime.session_store.directory,
@@ -101,25 +98,17 @@ class LongTaskWorkflow:
         """Execute one Runtime turn and checkpoint it while keeping the Task running."""
 
         task = self.start_or_resume()
+        self._require_effect_recovery_clear(task)
         if task.status is LongTaskStatus.RECOVERY_REQUIRED:
             raise LongTaskRecoveryRequired(
                 "Long Task has an interrupted effect; inspect and reconcile it before continuing"
             )
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot run: {task.status.value}")
-        original_executor = self.runtime.agent.tool_executor
-        with self.store.acquire_lease(self.task_id) as lease:
-            self.runtime.agent.tool_executor = _LongTaskToolExecutor(
-                delegate=original_executor,
-                store=self.store,
-                task_id=self.task_id,
-                lease=lease,
-                fault_hook=self.fault_hook,
-            )
-            try:
+        with self.store.acquire_lease(self.task_id):
+            with self.runtime.goal_scope(self._goal_context(task)):
                 response = self.runtime.run_turn(user_input)
-            finally:
-                self.runtime.agent.tool_executor = original_executor
+            self._require_effect_recovery_clear(task)
             task = self.store.replay(self.task_id)
             if task.status is not LongTaskStatus.RUNNING:
                 raise LongTaskStateError(f"Long Task stopped during turn: {task.status.value}")
@@ -135,6 +124,22 @@ class LongTaskWorkflow:
             task = self.store.replay(self.task_id)
         return LongTaskWorkflowResult(response=response, task=task, checkpoint=checkpoint)
 
+    @staticmethod
+    def _goal_context(task: LongTaskProjection) -> str:
+        """Render durable task facts as non-compressible per-step context."""
+
+        lines = [
+            "## Current durable Goal",
+            f"- Task ID: {task.task_id}",
+            f"- Required outcome: {task.goal}",
+            f"- Lifecycle state: {task.status.value}",
+            "- Treat the required outcome as active runtime context. Do not assume a conversation summary preserves it.",
+        ]
+        if task.active_constraints:
+            lines.extend(("", "## Confirmed hard constraints"))
+            lines.extend(f"- {constraint.text}" for constraint in task.active_constraints)
+        return "\n".join(lines)
+
     def finish(self, *, result: str = "") -> LongTaskProjection:
         """Explicitly mark a fully checkpointed Task complete after its final step."""
 
@@ -143,9 +148,78 @@ class LongTaskWorkflow:
             raise LongTaskStateError(f"Long Task cannot finish: {task.status.value}")
         return self.store.succeed(self.task_id, result=result)
 
+    def record_constraint(self, text: str) -> LongTaskProjection:
+        """Persist a user-confirmed hard rule for all later Goal steps."""
 
-class _LongTaskToolExecutor:
-    """Decorate the current executor; never replace its permissions or policy."""
+        return self.store.record_constraint(self.task_id, text)
+
+    def _require_effect_recovery_clear(self, task: LongTaskProjection) -> None:
+        """Project shared recovery facts into the Goal lifecycle, without copying them."""
+
+        effects = EffectJournalStore.for_session_directory(self.runtime.session_store.directory)
+        ambiguous = effects.replay(self.runtime.agent.session_id).ambiguous_entries
+        if not ambiguous:
+            return
+        self.store.require_recovery(
+            task.task_id,
+            reason="Shared Effect Journal has an unfinished Tool effect",
+        )
+        raise LongTaskRecoveryRequired(
+            "Shared Effect Journal has an unfinished Tool effect; inspect and reconcile it before continuing"
+        )
+
+
+class LegacyLongTaskWorkflow(LongTaskWorkflow):
+    """Compatibility adapter for frozen RS-6 effect-ledger replay cases.
+
+    It is intentionally not exported as the Chat/Goal workflow. New product
+    execution uses :class:`LongTaskWorkflow` and the shared Effect Journal.
+    """
+
+    def __init__(self, *args: object, fault_hook: FaultHook | None = None, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.fault_hook = fault_hook
+
+    def run_step(self, user_input: str) -> LongTaskWorkflowResult:
+        task = self.start_or_resume()
+        if task.status is LongTaskStatus.RECOVERY_REQUIRED:
+            raise LongTaskRecoveryRequired(
+                "Long Task has an interrupted legacy effect; inspect and reconcile it before continuing"
+            )
+        if task.status is not LongTaskStatus.RUNNING:
+            raise LongTaskStateError(f"Long Task cannot run: {task.status.value}")
+        original_executor = self.runtime.agent.tool_executor
+        with self.store.acquire_lease(self.task_id) as lease:
+            with self.runtime.goal_scope(self._goal_context(task)):
+                self.runtime.agent.tool_executor = _LegacyLongTaskToolExecutor(
+                    delegate=original_executor,
+                    store=self.store,
+                    task_id=self.task_id,
+                    lease=lease,
+                    fault_hook=self.fault_hook,
+                )
+                try:
+                    response = self.runtime.run_turn(user_input)
+                finally:
+                    self.runtime.agent.tool_executor = original_executor
+            task = self.store.replay(self.task_id)
+            if task.status is not LongTaskStatus.RUNNING:
+                raise LongTaskStateError(f"Long Task stopped during turn: {task.status.value}")
+            session = self.runtime.session_store.replay(self.runtime.agent.session_id)
+            if not session.events:
+                raise LongTaskStateError("Runtime Session did not record a turn cursor")
+            checkpoint = self.store.checkpoint(
+                self.task_id,
+                message_projection=list(self.runtime.agent.messages),
+                recovery_reason="completed legacy controlled Runtime turn",
+                session_event_cursor=session.events[-1].event_id,
+            )
+            task = self.store.replay(self.task_id)
+        return LongTaskWorkflowResult(response=response, task=task, checkpoint=checkpoint)
+
+
+class _LegacyLongTaskToolExecutor:
+    """Frozen evaluator-only copy of the retired Task effect ledger boundary."""
 
     def __init__(
         self,
@@ -197,7 +271,7 @@ class _LongTaskToolExecutor:
         description = self._describe(tool, arguments)
         is_effect = description.effect is not ToolEffect.READ
         if action is None:
-            task = self.store.plan_action(
+            self.store.plan_action(
                 self.task_id,
                 action_id=action_id,
                 kind=f"tool:{tool.name}",
@@ -224,6 +298,12 @@ class _LongTaskToolExecutor:
                 self.store.fail_effect(self.task_id, action_id, reason=result)
                 self._turn_stop_message = "Long Task tool effect was not approved or was blocked; turn stopped."
                 return result
+            if tool_result(result).status is ToolStatus.EFFECT_UNKNOWN:
+                self._turn_stop_message = (
+                    "Long Task recovery required: the tool result leaves the effect outcome unknown; "
+                    "no further tools were executed."
+                )
+                return result
             self.store.complete_effect(self.task_id, action_id, result=result)
             self._fault("after_effect_completed", action_id)
             return result
@@ -240,12 +320,7 @@ class _LongTaskToolExecutor:
     ) -> str:
         execute_call = getattr(self.delegate, "execute_call", None)
         if callable(execute_call):
-            return execute_call(
-                tool,
-                dict(arguments),
-                tool_call_id=tool_call_id,
-                execution_context=execution_context,
-            )
+            return execute_call(tool, dict(arguments), tool_call_id=tool_call_id, execution_context=execution_context)
         execute = getattr(self.delegate, "execute", None)
         if callable(execute):
             return execute(tool, dict(arguments))
@@ -263,6 +338,4 @@ class _LongTaskToolExecutor:
 
 
 def _known_not_executed(result: str) -> bool:
-    """Recognize only results that prove C3 or policy blocked the call."""
-
     return result.startswith(("Denied ", "Permission denied ", "Policy denied "))

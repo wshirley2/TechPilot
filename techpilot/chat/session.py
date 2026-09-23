@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
@@ -21,10 +22,18 @@ from rich.text import Text
 
 from techpilot.engine.context import estimate_tokens
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
-from techpilot.engine.tool_results import display_tool_status
+from techpilot.engine.tool_results import ToolResult, ToolStatus, display_tool_status
 from techpilot.engine.tools.edit import _changed_files
 
-from ..runtime import TaskRuntime
+from ..runtime import (
+    EffectJournalState,
+    EffectJournalStore,
+    LongTaskStateError,
+    LongTaskStatus,
+    LongTaskStore,
+    LongTaskWorkflow,
+    TaskRuntime,
+)
 
 InputFunction = Callable[[str], str]
 _DETAIL_PAGE_SIZE = 8_000
@@ -88,6 +97,7 @@ class SlashCommandCompleter(Completer):
         ("/resume", "恢复指定 Session"),
         ("/details", "切换工具结果详情显示"),
         ("/model", "查看或切换模型"),
+        ("/goal", "创建、继续或管理可恢复的长程目标"),
         ("/clear", "清空当前对话消息"),
         ("/exit", "退出 Chat"),
         ("/quit", "退出 Chat"),
@@ -251,6 +261,7 @@ class ChatSession:
         self.console = console or Console()
         self.input_fn = input_fn
         self._prompt_session: PromptSession[str] | None = None
+        self._goal_workflow: LongTaskWorkflow | None = None
 
     def run(self) -> int:
         self.show_startup()
@@ -258,15 +269,18 @@ class ChatSession:
             try:
                 user_input = self._read_input("You > ").strip()
             except EOFError:
+                self._pause_active_goal("Chat input closed before Goal completion")
                 self.console.print("\nBye!")
                 return 0
             except KeyboardInterrupt:
+                self._pause_active_goal("Chat interrupted before Goal completion")
                 self.console.print("\nBye!")
                 return 0
 
             if not user_input:
                 continue
             if user_input.lower() in {"exit", "quit", "/exit", "/quit"}:
+                self._pause_active_goal("Chat exited before Goal completion")
                 self.console.print("Bye!")
                 return 0
             if user_input.startswith("/"):
@@ -274,13 +288,16 @@ class ChatSession:
                 continue
 
             try:
-                response = self.runtime.run_turn(user_input)
+                response = self._run_user_turn(user_input)
                 # Providers used by embedders may not stream token callbacks.
                 sink = self.runtime.agent.event_sink
                 if not getattr(sink, "last_turn_streamed", False) and response:
                     self.console.print(Markdown(response))
             except KeyboardInterrupt:
-                self.console.print("[yellow]Turn cancelled. The chat session is still active.[/yellow]")
+                if self._goal_workflow is not None:
+                    self.console.print("[yellow]Goal step cancelled. Use /goal status before continuing.[/yellow]")
+                else:
+                    self.console.print("[yellow]Turn cancelled. The chat session is still active.[/yellow]")
             except Exception as error:
                 self.console.print(f"[red]Error: {error}[/red]")
             finally:
@@ -338,6 +355,7 @@ class ChatSession:
             "/resume": lambda: self._resume(argument.strip()),
             "/details": lambda: self._details(argument.strip()),
             "/model": lambda: self._model(argument.strip()),
+            "/goal": lambda: self._goal(argument.strip()),
             "/clear": self._clear,
         }
         handler = handlers.get(command.lower())
@@ -355,6 +373,12 @@ class ChatSession:
             "/tokens  Provider token usage and estimated cost",
             "/compact Compress model context",
             "/model [name]  Show or switch model",
+            "/goal <outcome>  Start a durable Goal and run its first step",
+            "/goal [status|pause|resume <id>|complete|clear|cancel]  Manage the active Goal",
+            "/goal constraint <rule>  Add a confirmed hard constraint to the active Goal",
+            "/goal constraint remove <id>  Retire one confirmed hard constraint",
+            "/goal constraints  List confirmed hard constraints",
+            "/goal recover <tool-call-id> <completed|not-executed> <reason>  Record an operator-verified effect outcome",
             "/clear   Clear conversation messages",
         ]
         lines.extend([
@@ -396,6 +420,272 @@ class ChatSession:
         table.add_row("Usage", f"{prompt} prompt + {completion} completion = {prompt + completion} total")
         table.add_row("Estimated cost", cost_text)
         self.console.print(table)
+
+    def _run_user_turn(self, user_input: str) -> str:
+        """Run ordinary Chat, or the currently selected durable Goal."""
+
+        if self._goal_workflow is None:
+            return self.runtime.run_turn(user_input)
+        result = self._goal_workflow.run_step(user_input)
+        return result.response
+
+    def _goal(self, value: str) -> None:
+        """Expose an explicit, Codex-like Goal lifecycle inside ordinary Chat."""
+
+        command, separator, argument = value.partition(" ")
+        normalized = command.lower()
+        argument = argument.strip()
+        if not value:
+            self._show_goal_status()
+            return
+        if normalized == "status" and not separator:
+            self._show_goal_status()
+            return
+        if normalized == "pause" and not separator:
+            self._pause_active_goal("Paused by user")
+            return
+        if normalized == "clear" and not separator:
+            if not self._pause_active_goal("Goal cleared from this Chat"):
+                return
+            self._goal_workflow = None
+            self.console.print("[yellow]Goal 已从当前 Chat 解绑；它已暂停，可在恢复原 Session 后用 /goal resume <id> 继续。[/yellow]")
+            return
+        if normalized == "cancel" and not separator:
+            workflow = self._require_goal()
+            if workflow is None:
+                return
+            try:
+                task = workflow.store.cancel(workflow.task_id, reason="Cancelled by user")
+            except (OSError, LongTaskStateError, ValueError) as error:
+                self.console.print(f"[red]Could not cancel Goal: {error}[/red]")
+                return
+            self._goal_workflow = None
+            self.console.print(f"[yellow]Goal cancelled: {task.task_id}[/yellow]")
+            return
+        if normalized == "complete" and not separator:
+            workflow = self._require_goal()
+            if workflow is None:
+                return
+            try:
+                task = workflow.finish(result="Completed by user")
+            except (OSError, LongTaskStateError, ValueError) as error:
+                self.console.print(f"[red]Could not complete Goal: {error}[/red]")
+                return
+            self._goal_workflow = None
+            self.console.print(f"[green]Goal completed: {task.task_id}[/green]")
+            return
+        if normalized == "resume":
+            self._resume_goal(argument)
+            return
+        if normalized == "constraint":
+            self._record_goal_constraint(argument)
+            return
+        if normalized == "constraints" and not separator:
+            self._show_goal_constraints()
+            return
+        if normalized == "recover":
+            self._recover_goal_effect(argument)
+            return
+        if self._goal_workflow is not None:
+            self.console.print("[yellow]已有运行中的 Goal；请先用 /goal status、/goal complete、/goal pause 或 /goal clear。[/yellow]")
+            return
+        self._start_goal(value)
+
+    def _start_goal(self, goal: str) -> None:
+        task_id = f"goal-{uuid4().hex[:12]}"
+        self._goal_workflow = LongTaskWorkflow(self.runtime, task_id=task_id, goal=goal)
+        self.console.print(f"[green]Goal started: {task_id}[/green]")
+        try:
+            response = self._run_user_turn(goal)
+        except KeyboardInterrupt:
+            self.console.print("[yellow]Goal step cancelled. Use /goal status before continuing.[/yellow]")
+            return
+        except Exception as error:
+            self.console.print(f"[red]Goal step failed: {error}[/red]")
+            return
+        finally:
+            self._ensure_session_persisted()
+        sink = self.runtime.agent.event_sink
+        if not getattr(sink, "last_turn_streamed", False) and response:
+            self.console.print(Markdown(response))
+
+    def _resume_goal(self, task_id: str) -> None:
+        if not task_id:
+            self.console.print("[yellow]Usage: /goal resume <goal-id>[/yellow]")
+            return
+        if self._goal_workflow is not None:
+            self.console.print("[yellow]当前 Chat 已绑定一个 Goal；请先 /goal clear 或完成它。[/yellow]")
+            return
+        store = LongTaskStore.for_repository(
+            self.runtime.repository,
+            session_directory=self.runtime.session_store.directory,
+        )
+        try:
+            task = store.replay(task_id)
+        except (OSError, ValueError) as error:
+            self.console.print(f"[red]Could not resume Goal: {error}[/red]")
+            return
+        if task.session_id != self.runtime.agent.session_id:
+            self.console.print(
+                "[yellow]该 Goal 属于另一个 Session；请先 /resume <session-id>，再执行 /goal resume <goal-id>。[/yellow]"
+            )
+            return
+        workflow = LongTaskWorkflow(
+            self.runtime,
+            task_id=task.task_id,
+            goal=task.goal,
+            budget=task.budget,
+        )
+        try:
+            current = workflow.start_or_resume(reason="Resumed from Chat Goal command")
+        except LongTaskStateError as error:
+            self.console.print(f"[red]Could not resume Goal: {error}[/red]")
+            return
+        self._goal_workflow = workflow
+        self.console.print(f"[green]Goal resumed: {current.task_id} ({current.status.value})[/green]")
+        self._show_goal_status()
+
+    def _show_goal_status(self) -> None:
+        workflow = self._goal_workflow
+        if workflow is None:
+            self.console.print("[dim]No active Goal. Start one with /goal <outcome>.[/dim]")
+            return
+        try:
+            task = workflow.store.replay(workflow.task_id)
+        except (OSError, ValueError) as error:
+            self.console.print(f"[red]Could not read Goal status: {error}[/red]")
+            return
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Field", style="cyan")
+        table.add_column("Value")
+        table.add_row("Goal ID", task.task_id)
+        table.add_row("Status", task.status.value)
+        table.add_row("Outcome", task.goal)
+        table.add_row("Hard constraints", str(len(task.active_constraints)))
+        table.add_row("Pending actions", str(len(task.pending_action_ids)))
+        table.add_row("Completed effects", str(len(task.completed_effect_ids)))
+        table.add_row("Checkpoints", str(len(task.checkpoints)))
+        self.console.print(table)
+
+    def _record_goal_constraint(self, text: str) -> None:
+        if not text:
+            self.console.print("[yellow]Usage: /goal constraint <rule>[/yellow]")
+            return
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        action, separator, argument = text.partition(" ")
+        if action.lower() == "remove":
+            if not separator or not argument.strip():
+                self.console.print("[yellow]Usage: /goal constraint remove <id>[/yellow]")
+                return
+            try:
+                workflow.store.remove_constraint(
+                    workflow.task_id,
+                    argument.strip(),
+                    reason="Removed by user from Chat Goal command",
+                )
+            except (OSError, LongTaskStateError, ValueError) as error:
+                self.console.print(f"[red]Could not remove Goal constraint: {error}[/red]")
+                return
+            self.console.print(f"[green]Goal constraint removed: {argument.strip()}[/green]")
+            return
+        try:
+            task = workflow.record_constraint(text)
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self.console.print(f"[red]Could not record Goal constraint: {error}[/red]")
+            return
+        constraint = next((item for item in task.active_constraints if item.text == text.strip()), None)
+        if constraint is None:
+            self.console.print("[yellow]Goal constraint was already recorded.[/yellow]")
+            return
+        self.console.print(f"[green]Goal constraint recorded: {constraint.constraint_id}[/green]")
+
+    def _show_goal_constraints(self) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        try:
+            task = workflow.store.replay(workflow.task_id)
+        except (OSError, ValueError) as error:
+            self.console.print(f"[red]Could not read Goal constraints: {error}[/red]")
+            return
+        if not task.active_constraints:
+            self.console.print("[dim]No confirmed hard constraints for this Goal.[/dim]")
+            return
+        table = Table(title="Goal hard constraints", show_header=True)
+        table.add_column("ID", style="cyan")
+        table.add_column("Source")
+        table.add_column("Rule")
+        for constraint in task.active_constraints:
+            table.add_row(constraint.constraint_id, constraint.source, constraint.text)
+        self.console.print(table)
+
+    def _recover_goal_effect(self, value: str) -> None:
+        """Write a user-confirmed effect fact, then reopen the blocked Goal."""
+
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        parts = value.split(maxsplit=2)
+        if len(parts) != 3:
+            self.console.print(
+                "[yellow]Usage: /goal recover <tool-call-id> <completed|not-executed> <reason>[/yellow]"
+            )
+            return
+        tool_call_id, disposition, reason = parts
+        normalized = disposition.lower()
+        if normalized == "completed":
+            state = EffectJournalState.FINISHED
+            outcome = ToolResult(f"[reconciled completed] {reason}", ToolStatus.COMPLETED)
+        elif normalized == "not-executed":
+            state = EffectJournalState.NOT_EXECUTED
+            outcome = ToolResult(f"[reconciled not executed] {reason}", ToolStatus.NOT_EXECUTED)
+        else:
+            self.console.print(
+                "[yellow]Effect outcome must be completed or not-executed; it is never inferred from a model reply.[/yellow]"
+            )
+            return
+        journal = EffectJournalStore.for_session_directory(self.runtime.session_store.directory)
+        try:
+            entry = journal.reconcile(
+                self.runtime.agent.session_id,
+                tool_call_id,
+                state=state,
+                result=outcome,
+                reason=reason,
+            )
+            task = workflow.store.replay(workflow.task_id)
+            if task.status is LongTaskStatus.RECOVERY_REQUIRED:
+                task = workflow.store.resume(
+                    workflow.task_id,
+                    reason="Shared Effect Journal reconciled by user from Chat Goal command",
+                )
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self.console.print(f"[red]Could not reconcile Goal effect: {error}[/red]")
+            return
+        self.console.print(
+            f"[green]Goal effect reconciled: {entry.tool_call_id} ({entry.state.value}); Goal {task.status.value}.[/green]"
+        )
+
+    def _require_goal(self) -> LongTaskWorkflow | None:
+        if self._goal_workflow is None:
+            self.console.print("[yellow]No active Goal. Start one with /goal <outcome>.[/yellow]")
+        return self._goal_workflow
+
+    def _pause_active_goal(self, reason: str) -> bool:
+        workflow = self._goal_workflow
+        if workflow is None:
+            return False
+        try:
+            task = workflow.store.replay(workflow.task_id)
+            if task.status is LongTaskStatus.RUNNING:
+                task = workflow.store.pause(workflow.task_id, reason=reason)
+            self.console.print(f"[yellow]Goal paused: {task.task_id}[/yellow]")
+            return True
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self.console.print(f"[red]Could not pause Goal: {error}[/red]")
+            return False
 
     def _show_tools(self) -> None:
         for tool in self.runtime.tools:
@@ -577,6 +867,9 @@ class ChatSession:
         self.console.print(
             f"[green]Resumed Session {item.session_id} ({len(item.model_messages)} messages).[/green]{warning}"
         )
+        if self._goal_workflow is not None:
+            self._goal_workflow = None
+            self.console.print("[yellow]已解绑旧 Session 的 Goal；如需继续，请使用 /goal resume <goal-id>。[/yellow]")
         self._show_recovery_notices()
 
     def _details(self, value: str) -> None:
@@ -697,6 +990,9 @@ class ChatSession:
             self.console.print(f"Current model: [cyan]{self.runtime.config.model}[/cyan]")
 
     def _clear(self) -> None:
+        if self._goal_workflow is not None:
+            self.console.print("[yellow]当前 Goal 不能直接 /clear；请用 /goal clear 暂停并解绑，避免破坏可恢复上下文。[/yellow]")
+            return
         self.runtime.agent.reset()
         self.console.print("[yellow]Conversation messages cleared.[/yellow]")
 

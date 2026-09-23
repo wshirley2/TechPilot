@@ -145,6 +145,16 @@ class LongTaskAction:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskConstraint:
+    """A user-confirmed rule that must survive chat compression and resume."""
+
+    constraint_id: str
+    text: str
+    source: str = "user_confirmed"
+    version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class TaskCheckpoint:
     """A recovery index over Task facts, never a replacement for them."""
 
@@ -171,6 +181,7 @@ class LongTaskProjection:
     budget: LongTaskBudget = field(default_factory=LongTaskBudget)
     events: list[LongTaskEvent] = field(default_factory=list)
     actions: dict[str, LongTaskAction] = field(default_factory=dict)
+    constraints: dict[str, TaskConstraint] = field(default_factory=dict)
     checkpoints: list[TaskCheckpoint] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     recovery_blockers: list[str] = field(default_factory=list)
@@ -190,6 +201,10 @@ class LongTaskProjection:
     @property
     def ambiguous_effect_ids(self) -> tuple[str, ...]:
         return tuple(sorted(action.effect_id for action in self.actions.values() if action.effect_id and action.status is LongTaskActionStatus.STARTED))
+
+    @property
+    def active_constraints(self) -> tuple[TaskConstraint, ...]:
+        return tuple(self.constraints[constraint_id] for constraint_id in sorted(self.constraints))
 
 
 @dataclass
@@ -350,6 +365,55 @@ class LongTaskStore:
         ))
         return self.replay(projection.task_id).checkpoints[-1]
 
+    def record_constraint(
+        self,
+        task_id: str,
+        text: str,
+        *,
+        source: str = "user_confirmed",
+        constraint_id: str | None = None,
+    ) -> LongTaskProjection:
+        """Append an explicit task rule; inference is deliberately out of scope."""
+
+        projection = self.replay(task_id)
+        self._require_not_terminal(projection)
+        normalized_text = text.strip()
+        if not normalized_text:
+            raise ValueError("Constraint text cannot be empty")
+        if len(normalized_text) > 2_000:
+            raise ValueError("Constraint text is too long")
+        normalized_source = source.strip()
+        if not normalized_source:
+            raise ValueError("Constraint source cannot be empty")
+        if any(item.text == normalized_text for item in projection.active_constraints):
+            return projection
+        safe_id = self._normalize_id(constraint_id or uuid4().hex, "constraint id")
+        if safe_id in projection.constraints:
+            raise LongTaskStateError(f"Constraint id already exists: {safe_id}")
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="constraint_recorded",
+            payload={"constraint_id": safe_id, "text": normalized_text, "source": normalized_source, "version": 1},
+        ))
+        return self.replay(projection.task_id)
+
+    def remove_constraint(self, task_id: str, constraint_id: str, *, reason: str) -> LongTaskProjection:
+        """Explicitly retire a rule while preserving its audit trail."""
+
+        projection = self.replay(task_id)
+        self._require_not_terminal(projection)
+        safe_id = self._normalize_id(constraint_id, "constraint id")
+        if safe_id not in projection.constraints:
+            raise LongTaskStateError(f"Unknown constraint: {safe_id}")
+        if not reason.strip():
+            raise ValueError("Constraint removal reason cannot be empty")
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="constraint_removed",
+            payload={"constraint_id": safe_id, "reason": reason.strip()},
+        ))
+        return self.replay(projection.task_id)
+
     def acquire_lease(self, task_id: str, *, owner_id: str | None = None) -> LongTaskLease:
         """Acquire the single-process execution lease for one existing Task.
 
@@ -420,6 +484,21 @@ class LongTaskStore:
             ))
         else:
             self.append(LongTaskEvent(task_id=projection.task_id, event_type="task_resumed", payload={"reason": reason or "resumed"}))
+        return self.replay(projection.task_id)
+
+    def require_recovery(self, task_id: str, *, reason: str) -> LongTaskProjection:
+        """Pause Goal progress when an external Runtime recovery fact is unresolved."""
+
+        projection = self.replay(task_id)
+        self._require_not_terminal(projection)
+        if not reason.strip():
+            raise ValueError("Recovery reason cannot be empty")
+        if projection.status is not LongTaskStatus.RECOVERY_REQUIRED:
+            self.append(LongTaskEvent(
+                task_id=projection.task_id,
+                event_type="task_recovery_required",
+                payload={"reason": reason.strip(), "effect_ids": [], "blockers": ["shared_effect_journal"]},
+            ))
         return self.replay(projection.task_id)
 
     def succeed(self, task_id: str, *, result: str = "") -> LongTaskProjection:
@@ -582,6 +661,24 @@ class LongTaskStore:
                 effect_id=payload.get("effect_id") if isinstance(payload.get("effect_id"), str) else None,
                 dependencies=tuple(dependencies),
             )
+        elif event.event_type == "constraint_recorded":
+            constraint_id = _required_string(payload, "constraint_id")
+            if constraint_id in projection.constraints:
+                raise LongTaskStateError(f"Constraint id already exists: {constraint_id}")
+            version = _required_int(payload, "version")
+            if version <= 0:
+                raise ValueError("Constraint version must be positive")
+            projection.constraints[constraint_id] = TaskConstraint(
+                constraint_id=constraint_id,
+                text=_required_string(payload, "text"),
+                source=_required_string(payload, "source"),
+                version=version,
+            )
+        elif event.event_type == "constraint_removed":
+            constraint_id = _required_string(payload, "constraint_id")
+            if constraint_id not in projection.constraints:
+                raise LongTaskStateError(f"Unknown constraint: {constraint_id}")
+            del projection.constraints[constraint_id]
         elif event.event_type == "effect_started":
             self._replace_action(projection, _required_string(payload, "action_id"), LongTaskActionStatus.STARTED)
         elif event.event_type == "effect_completed" or event.event_type == "action_completed":
@@ -671,6 +768,11 @@ class LongTaskStore:
     def _require_running(projection: LongTaskProjection) -> None:
         if projection.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Task is not running: {projection.status.value}")
+
+    @staticmethod
+    def _require_not_terminal(projection: LongTaskProjection) -> None:
+        if projection.status in {LongTaskStatus.CANCELLED, LongTaskStatus.SUCCEEDED, LongTaskStatus.FAILED}:
+            raise LongTaskStateError(f"Task is terminal: {projection.status.value}")
 
     def _validate_session_cursor(self, projection: LongTaskProjection, session_event_cursor: str) -> str:
         if self.session_store is None:

@@ -28,7 +28,6 @@ from techpilot.runtime import (
     LongTaskRecoveryRequired,
     LongTaskStateError,
     LongTaskStatus,
-    LongTaskWorkflow,
     RuntimeBootstrap,
     RuntimeBootstrapInput,
 )
@@ -43,7 +42,12 @@ from techpilot.runtime.extensions import (
     ToolAllowlist,
     ToolRequest,
 )
+from techpilot.runtime.long_task_workflow import LegacyLongTaskWorkflow
 from techpilot.runtime.sessions import SessionEventSink, SessionStore
+
+# Frozen RS-6 v0 cards model the retired Task-local effect ledger. New Chat
+# and Goal execution uses LongTaskWorkflow with the shared Effect Journal.
+LongTaskWorkflow = LegacyLongTaskWorkflow
 
 from .contracts import ReplayCase, ReplayOutcome, ReplayReport, ReplayTrack
 

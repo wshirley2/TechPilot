@@ -19,9 +19,20 @@ from techpilot.cli import _normalize_command
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import PermissionDecision
+from techpilot.engine.tool_execution import ToolEffect
 from techpilot.engine.tools.glob_tool import GlobTool
 from techpilot.engine.tools.grep import GrepTool
-from techpilot.runtime import ActiveRole, ChatRuntime, RuntimeBootstrap, RuntimeBootstrapInput, TaskRuntime
+from techpilot.runtime import (
+    ActiveRole,
+    ChatRuntime,
+    EffectJournalState,
+    EffectJournalStore,
+    LongTaskStatus,
+    LongTaskStore,
+    RuntimeBootstrap,
+    RuntimeBootstrapInput,
+    TaskRuntime,
+)
 from techpilot.runtime.contracts import RuntimeMode
 from techpilot.runtime.sessions import SessionEvent, SessionStore
 from techpilot.safety.paths import ignored_child_names
@@ -45,6 +56,7 @@ def test_slash_command_completer_lists_and_filters_local_commands():
     all_commands = [item.text for item in completer.get_completions(Document("/"), None)]
     assert "/help" in all_commands
     assert "/status" in all_commands
+    assert "/goal" in all_commands
     assert "/exit" in all_commands
 
     status_commands = [item.text for item in completer.get_completions(Document("/s"), None)]
@@ -55,6 +67,156 @@ def test_slash_command_completer_lists_and_filters_local_commands():
 
 def test_slash_command_completer_does_not_expose_plan_in_chat():
     assert "/plan" not in [item.text for item in SlashCommandCompleter().get_completions(Document("/"), None)]
+
+
+def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([LLMResponse(content="first Goal step"), LLMResponse(content="second Goal step")])
+    runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
+    inputs = iter([
+        "/goal inspect the project in two steps",
+        "continue the Goal",
+        "/goal status",
+        "/goal complete",
+        "/exit",
+    ])
+
+    assert ChatSession(runtime, console=console, input_fn=lambda _prompt: next(inputs)).run() == 0
+
+    task_directories = list((repository / ".techpilot" / "tasks").glob("goal-*"))
+    assert len(task_directories) == 1
+    task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_directories[0].name)
+    assert task.status is LongTaskStatus.SUCCEEDED
+    assert len(task.checkpoints) == 2
+    assert task.session_id == runtime.agent.session_id
+    rendered = output.getvalue()
+    assert "Goal started:" in rendered
+    assert "Goal completed:" in rendered
+    assert "second Goal step" in rendered
+
+
+def test_chat_goal_constraint_is_durable_and_visible_to_later_goal_step(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([LLMResponse(content="first Goal step"), LLMResponse(content="constrained step")])
+    runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
+    inputs = iter([
+        "/goal update the formatter",
+        "/goal constraint Only modify formatter.py",
+        "/goal constraints",
+        "continue the Goal",
+        "/exit",
+    ])
+
+    assert ChatSession(runtime, console=console, input_fn=lambda _prompt: next(inputs)).run() == 0
+
+    task_directory = next((repository / ".techpilot" / "tasks").glob("goal-*"))
+    task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_directory.name)
+    assert [constraint.text for constraint in task.active_constraints] == ["Only modify formatter.py"]
+    assert "Only modify formatter.py" in provider.requests[1]["messages"][0]["content"]
+    rendered = output.getvalue()
+    assert "Goal constraint recorded:" in rendered
+    assert "Goal hard constraints" in rendered
+
+
+def test_chat_goal_recover_records_operator_fact_and_resumes_goal(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    runtime = make_runtime(
+        repository,
+        FakeProvider([LLMResponse(content="first Goal step")]),
+        console,
+        session_directory=tmp_path / "sessions",
+    )
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("inspect the project")
+    workflow = chat._goal_workflow
+    assert workflow is not None
+    journal = EffectJournalStore.for_session_directory(runtime.session_store.directory)
+    journal.start(
+        session_id=runtime.agent.session_id,
+        tool_call_id="write-1",
+        tool_name="write_file",
+        arguments={"file_path": "notes.txt"},
+        effect=ToolEffect.WRITE,
+    )
+    workflow.store.require_recovery(workflow.task_id, reason="Shared Effect Journal has an unfinished Tool effect")
+
+    chat._goal("recover write-1 completed operator verified the target contents")
+
+    effect = journal.replay(runtime.agent.session_id).entries["write-1"]
+    assert effect.state is EffectJournalState.FINISHED
+    assert effect.reconciliation_reason == "operator verified the target contents"
+    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.RUNNING
+    assert "Goal effect reconciled: write-1 (finished); Goal running." in output.getvalue()
+
+
+def test_chat_exit_pauses_an_unfinished_goal(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    runtime = make_runtime(
+        repository,
+        FakeProvider([LLMResponse(content="Goal step complete")]),
+        console,
+        session_directory=tmp_path / "sessions",
+    )
+    inputs = iter(["/goal inspect the project", "/exit"])
+
+    assert ChatSession(runtime, console=console, input_fn=lambda _prompt: next(inputs)).run() == 0
+
+    task_directory = next((repository / ".techpilot" / "tasks").glob("goal-*"))
+    task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_directory.name)
+    assert task.status is LongTaskStatus.PAUSED
+    assert "Goal paused:" in output.getvalue()
+
+
+def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    repository = copy_benchmark(tmp_path / "repository")
+    session_directory = tmp_path / "sessions"
+    first_console = Console(file=StringIO(), force_terminal=False, color_system=None)
+    first = make_runtime(
+        repository,
+        FakeProvider([LLMResponse(content="first Goal step")]),
+        first_console,
+        session_directory=session_directory,
+    )
+    first_inputs = iter(["/goal inspect the project", "/exit"])
+    assert ChatSession(first, console=first_console, input_fn=lambda _prompt: next(first_inputs)).run() == 0
+    task_directory = next((repository / ".techpilot" / "tasks").glob("goal-*"))
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    resumed = make_runtime(
+        repository,
+        FakeProvider([LLMResponse(content="recovered Goal step")]),
+        console,
+        session_directory=session_directory,
+        resume_session_id=first.agent.session_id,
+    )
+    resumed_inputs = iter([
+        f"/goal resume {task_directory.name}",
+        "continue the Goal",
+        "/goal complete",
+        "/exit",
+    ])
+
+    assert ChatSession(resumed, console=console, input_fn=lambda _prompt: next(resumed_inputs)).run() == 0
+
+    task = LongTaskStore.for_repository(repository, session_directory=session_directory).replay(task_directory.name)
+    assert task.status is LongTaskStatus.SUCCEEDED
+    assert len(task.checkpoints) == 2
+    assert "Goal resumed:" in output.getvalue()
+    assert "recovered Goal step" in output.getvalue()
 
 
 def test_limit_backfilled_read_file_is_rendered_as_not_executed():
@@ -397,6 +559,7 @@ def make_runtime(
     *,
     permission_prompt=None,
     session_directory: Path | None = None,
+    resume_session_id: str | None = None,
 ):
     sink = TerminalEventSink(console)
     bootstrap = RuntimeBootstrap(provider_factory=lambda config: provider)
@@ -405,6 +568,7 @@ def make_runtime(
         event_sink=sink,
         permission_prompt=permission_prompt,
         session_directory=session_directory,
+        resume_session_id=resume_session_id,
     ))
 
 

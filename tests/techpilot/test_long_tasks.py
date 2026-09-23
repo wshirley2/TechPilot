@@ -63,6 +63,24 @@ def test_checkpoint_indexes_task_facts_without_overwriting_raw_session_facts(tmp
     assert store.path_for("repair-task") != sessions.path_for("chat-session")
 
 
+def test_confirmed_constraint_is_append_only_and_removal_survives_replay(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+
+    recorded = store.record_constraint(
+        "repair-task",
+        "Only modify formatter.py",
+        constraint_id="formatter-only",
+    )
+    removed = store.remove_constraint("repair-task", "formatter-only", reason="User widened the scope")
+    replayed = LongTaskStore.for_repository(tmp_path).replay("repair-task")
+
+    assert [item.text for item in recorded.active_constraints] == ["Only modify formatter.py"]
+    assert removed.active_constraints == ()
+    assert replayed.active_constraints == ()
+    assert [event.event_type for event in replayed.events][-2:] == ["constraint_recorded", "constraint_removed"]
+
+
 def test_resume_skips_a_durably_completed_effect_without_calling_it_again(tmp_path):
     store = LongTaskStore.for_repository(tmp_path)
     _create(store, tmp_path)

@@ -9,6 +9,14 @@ from .contracts import (
     TaskRuntimePaths,
     TaskRuntimeResult,
 )
+from .effect_journal import (
+    EffectJournalEntry,
+    EffectJournalError,
+    EffectJournalExecutor,
+    EffectJournalProjection,
+    EffectJournalState,
+    EffectJournalStore,
+)
 from .extensions import (
     RUNTIME_ROLE_API_VERSION,
     ArtifactRequirement,
@@ -43,6 +51,7 @@ from .long_tasks import (
     LongTaskStore,
     LongTaskStoreError,
     TaskCheckpoint,
+    TaskConstraint,
 )
 
 __all__ = [
@@ -51,6 +60,12 @@ __all__ = [
     "ArtifactRequirement",
     "ChatRuntime",
     "EffectDisposition",
+    "EffectJournalEntry",
+    "EffectJournalError",
+    "EffectJournalExecutor",
+    "EffectJournalProjection",
+    "EffectJournalState",
+    "EffectJournalStore",
     "EvaluationInterface",
     "LongTaskAction",
     "LongTaskActionStatus",
@@ -84,6 +99,7 @@ __all__ = [
     "SkillSpec",
     "SkillVersion",
     "TaskCheckpoint",
+    "TaskConstraint",
     "TaskRuntime",
     "TaskRuntimeIdentity",
     "TaskRuntimePaths",
