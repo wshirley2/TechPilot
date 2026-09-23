@@ -374,8 +374,8 @@ class ChatSession:
             "/tokens  Provider token usage and estimated cost",
             "/compact Compress model context",
             "/model [name]  Show or switch model",
-            "/goal <outcome>  Start a durable Goal and run its first step",
-            "/goal [status|pause|resume <id>|complete|clear|cancel]  Manage the active Goal; complete requires a verified claim",
+            "/goal <outcome>  Create a durable Goal setup",
+            "/goal [start|status|pause|resume <id>|complete|clear|cancel]  Manage the active Goal; start requires acceptance checks",
             "/goal constraint <rule>  Add a confirmed hard constraint to the active Goal",
             "/goal constraint remove <id>  Retire one confirmed hard constraint",
             "/goal constraints  List confirmed hard constraints",
@@ -452,7 +452,9 @@ class ChatSession:
             if not self._pause_active_goal("Goal cleared from this Chat"):
                 return
             self._goal_workflow = None
-            self.console.print("[yellow]Goal 已从当前 Chat 解绑；它已暂停，可在恢复原 Session 后用 /goal resume <id> 继续。[/yellow]")
+            self.console.print(
+                "[yellow]Goal 已从当前 Chat 解绑；恢复原 Session 后可用 /goal resume <id> 查看或继续配置。[/yellow]"
+            )
             return
         if normalized == "cancel" and not separator:
             workflow = self._require_goal()
@@ -478,6 +480,9 @@ class ChatSession:
             self._goal_workflow = None
             self.console.print(f"[green]Goal completed: {task.task_id}[/green]")
             return
+        if normalized == "start" and not separator:
+            self._start_goal_execution()
+            return
         if normalized == "resume":
             self._resume_goal(argument)
             return
@@ -497,6 +502,12 @@ class ChatSession:
             self._recover_goal_effect(argument)
             return
         if self._goal_workflow is not None:
+            task = self._goal_workflow.store.replay(self._goal_workflow.task_id)
+            if task.status is LongTaskStatus.SETUP:
+                self.console.print(
+                    "[yellow]Goal is in setup. Add /goal criterion ... then run /goal start before sending work input.[/yellow]"
+                )
+                return
             self.console.print("[yellow]已有运行中的 Goal；请先用 /goal status、/goal complete、/goal pause 或 /goal clear。[/yellow]")
             return
         self._start_goal(value)
@@ -504,13 +515,28 @@ class ChatSession:
     def _start_goal(self, goal: str) -> None:
         task_id = f"goal-{uuid4().hex[:12]}"
         self._goal_workflow = LongTaskWorkflow(self.runtime, task_id=task_id, goal=goal)
-        self.console.print(f"[green]Goal started: {task_id}[/green]")
         try:
-            response = self._run_user_turn(goal)
+            task = self._goal_workflow.create_for_setup()
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self._goal_workflow = None
+            self.console.print(f"[red]Could not create Goal setup: {error}[/red]")
+            return
+        self.console.print(f"[green]Goal setup created: {task.task_id}[/green]")
+        self.console.print("[dim]Add /goal criterion ... and optional /goal constraint ..., then run /goal start.[/dim]")
+        self._show_goal_status()
+
+    def _start_goal_execution(self) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        try:
+            task = workflow.start()
+            self.console.print(f"[green]Goal started: {task.task_id}[/green]")
+            response = self._run_user_turn(task.goal)
         except KeyboardInterrupt:
             self.console.print("[yellow]Goal step cancelled. Use /goal status before continuing.[/yellow]")
             return
-        except Exception as error:
+        except (OSError, LongTaskStateError, ValueError) as error:
             self.console.print(f"[red]Goal step failed: {error}[/red]")
             return
         finally:
@@ -778,7 +804,8 @@ class ChatSession:
             task = workflow.store.replay(workflow.task_id)
             if task.status is LongTaskStatus.RUNNING:
                 task = workflow.store.pause(workflow.task_id, reason=reason)
-            self.console.print(f"[yellow]Goal paused: {task.task_id}[/yellow]")
+            label = "Goal setup saved" if task.status is LongTaskStatus.SETUP else "Goal paused"
+            self.console.print(f"[yellow]{label}: {task.task_id}[/yellow]")
             return True
         except (OSError, LongTaskStateError, ValueError) as error:
             self.console.print(f"[red]Could not pause Goal: {error}[/red]")

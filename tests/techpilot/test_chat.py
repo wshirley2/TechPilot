@@ -90,6 +90,7 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
         "/goal inspect the project in two steps",
         "/goal criterion file-exists src/cli_data_tool/cli.py",
         "/goal criteria",
+        "/goal start",
         "continue the Goal",
         "/goal status",
         "/goal complete",
@@ -105,6 +106,7 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     assert len(task.checkpoints) == 2
     assert task.session_id == runtime.agent.session_id
     rendered = output.getvalue()
+    assert "Goal setup created:" in rendered
     assert "Goal started:" in rendered
     assert "Goal completed:" in rendered
     assert "second Goal step" in rendered
@@ -123,6 +125,8 @@ def test_chat_goal_complete_requires_a_verified_completion_claim(tmp_path, monke
     )
     chat = ChatSession(runtime, console=console)
     chat._start_goal("inspect the project")
+    chat._goal("criterion file-exists src/cli_data_tool/cli.py")
+    chat._goal("start")
 
     chat._goal("complete")
 
@@ -143,6 +147,8 @@ def test_chat_goal_constraint_is_durable_and_visible_to_later_goal_step(tmp_path
         "/goal update the formatter",
         "/goal constraint Only modify formatter.py",
         "/goal constraints",
+        "/goal criterion file-exists src/cli_data_tool/cli.py",
+        "/goal start",
         "continue the Goal",
         "/exit",
     ])
@@ -171,6 +177,8 @@ def test_chat_goal_recover_records_operator_fact_and_resumes_goal(tmp_path, monk
     )
     chat = ChatSession(runtime, console=console)
     chat._start_goal("inspect the project")
+    chat._goal("criterion file-exists src/cli_data_tool/cli.py")
+    chat._goal("start")
     workflow = chat._goal_workflow
     assert workflow is not None
     journal = EffectJournalStore.for_session_directory(runtime.session_store.directory)
@@ -192,7 +200,7 @@ def test_chat_goal_recover_records_operator_fact_and_resumes_goal(tmp_path, monk
     assert "Goal effect reconciled: write-1 (finished); Goal running." in output.getvalue()
 
 
-def test_chat_exit_pauses_an_unfinished_goal(tmp_path, monkeypatch):
+def test_chat_exit_keeps_an_unstarted_goal_in_setup(tmp_path, monkeypatch):
     monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
     output = StringIO()
     console = Console(file=output, force_terminal=False, color_system=None)
@@ -209,8 +217,9 @@ def test_chat_exit_pauses_an_unfinished_goal(tmp_path, monkeypatch):
 
     task_directory = next((repository / ".techpilot" / "tasks").glob("goal-*"))
     task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_directory.name)
-    assert task.status is LongTaskStatus.PAUSED
-    assert "Goal paused:" in output.getvalue()
+    assert task.status is LongTaskStatus.SETUP
+    assert not runtime.agent.llm.requests
+    assert "Goal setup saved:" in output.getvalue()
 
 
 def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, monkeypatch):
@@ -227,6 +236,7 @@ def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, mo
     first_inputs = iter([
         "/goal inspect the project",
         "/goal criterion file-exists src/cli_data_tool/cli.py",
+        "/goal start",
         "/exit",
     ])
     assert ChatSession(first, console=first_console, input_fn=lambda _prompt: next(first_inputs)).run() == 0

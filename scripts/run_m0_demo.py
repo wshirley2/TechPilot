@@ -1,7 +1,8 @@
 """Run three deterministic, no-provider-cost M0 demonstration paths.
 
 The script uses short fixed Provider responses so the actual Runtime, Tool
-executor, Permission path, Session persistence, and LongTaskWorkflow can be
+executor, Permission path, Session persistence, and the frozen legacy recovery
+adapter can be
 shown without presenting a model sample as a Runtime guarantee.
 """
 
@@ -28,7 +29,8 @@ from techpilot.engine.events import CallbackEventSink
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import PermissionDecision
 from techpilot.engine.tools import WriteFileTool
-from techpilot.runtime import LongTaskStatus, LongTaskWorkflow, RuntimeBootstrap, RuntimeBootstrapInput
+from techpilot.runtime import LongTaskStatus, RuntimeBootstrap, RuntimeBootstrapInput
+from techpilot.runtime.long_task_workflow import LegacyLongTaskWorkflow
 
 
 class FixedProvider:
@@ -203,7 +205,7 @@ def _demo_recovery(root: Path) -> dict[str, object]:
             raise KeyboardInterrupt("M0 deterministic interruption after durable completion")
 
     try:
-        LongTaskWorkflow(
+        LegacyLongTaskWorkflow(
             first,
             task_id="m0-recovery-demo",
             goal="write durable result",
@@ -222,7 +224,7 @@ def _demo_recovery(root: Path) -> dict[str, object]:
         write_only=True,
     )
     resumed_counter = resumed.agent.tool_executor
-    result = LongTaskWorkflow(resumed, task_id="m0-recovery-demo", goal="write durable result").run_turn("continue")
+    result = LegacyLongTaskWorkflow(resumed, task_id="m0-recovery-demo", goal="write durable result").run_turn("continue")
     assert result.task.status is LongTaskStatus.SUCCEEDED
     assert result.response == "恢复完成。"
     assert first_counter.calls == 1

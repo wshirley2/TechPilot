@@ -41,6 +41,38 @@ def _start_effect(store: LongTaskStore, action_id: str):
         return store.start_effect("repair-task", action_id, lease=lease)
 
 
+def test_setup_task_requires_an_acceptance_criterion_before_it_can_start(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    SessionStore.for_repository(tmp_path).create("chat-session", repository_root=tmp_path, model="fake-model")
+    created = store.create(
+        "setup-task",
+        goal="Repair the deterministic fixture.",
+        repository_root=tmp_path,
+        session_id="chat-session",
+        initial_status=LongTaskStatus.SETUP,
+    )
+
+    assert created.status is LongTaskStatus.SETUP
+    with pytest.raises(LongTaskStateError, match="requires at least one Runtime completion criterion"):
+        store.start("setup-task", reason="user requested execution")
+
+    store.record_completion_criterion(
+        "setup-task",
+        kind=CompletionCriterionKind.FILE_EXISTS,
+        path="README.md",
+    )
+    started = store.start("setup-task", reason="user accepted the completion condition")
+
+    assert started.status is LongTaskStatus.RUNNING
+    replayed = LongTaskStore.for_repository(tmp_path).replay("setup-task")
+    assert replayed.status is LongTaskStatus.RUNNING
+    assert [event.event_type for event in replayed.events] == [
+        "task_created",
+        "completion_criterion_recorded",
+        "task_started",
+    ]
+
+
 def test_checkpoint_indexes_task_facts_without_overwriting_raw_session_facts(tmp_path):
     sessions = SessionStore(tmp_path / ".techpilot" / "sessions")
     sessions.create("chat-session", repository_root=tmp_path, model="fake-model")

@@ -39,6 +39,7 @@ class LongTaskLeaseError(LongTaskStateError):
 
 
 class LongTaskStatus(str, Enum):
+    SETUP = "setup"
     RUNNING = "running"
     PAUSED = "paused"
     CANCELLED = "cancelled"
@@ -348,6 +349,7 @@ class LongTaskStore:
         repository_root: Path,
         session_id: str,
         budget: LongTaskBudget | None = None,
+        initial_status: LongTaskStatus = LongTaskStatus.RUNNING,
     ) -> LongTaskProjection:
         safe_id = self._normalize_task_id(task_id)
         if not goal.strip():
@@ -358,6 +360,7 @@ class LongTaskStore:
         if path.exists():
             return self.replay(safe_id)
         effective_budget = budget or LongTaskBudget()
+        starting_status = LongTaskStatus(initial_status)
         self.append(LongTaskEvent(
             task_id=safe_id,
             event_type="task_created",
@@ -366,9 +369,25 @@ class LongTaskStore:
                 "repository_root": str(repository_root.resolve()),
                 "session_id": session_id,
                 "budget": effective_budget.to_dict(),
+                "initial_status": starting_status.value,
             },
         ))
         return self.replay(safe_id)
+
+    def start(self, task_id: str, *, reason: str) -> LongTaskProjection:
+        """Leave explicit Goal setup only after the user defines an acceptance check."""
+
+        projection = self.replay(task_id)
+        if projection.status is not LongTaskStatus.SETUP:
+            raise LongTaskStateError(f"Only setup Goals can start, got: {projection.status.value}")
+        if not projection.active_completion_criteria:
+            raise LongTaskStateError("Goal setup requires at least one Runtime completion criterion before starting")
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="task_started",
+            payload={"reason": reason.strip() or "started after acceptance setup"},
+        ))
+        return self.replay(projection.task_id)
 
     def plan_action(
         self,
@@ -898,6 +917,8 @@ class LongTaskStore:
             if not isinstance(budget, dict):
                 raise TypeError("Long Task budget must be an object")
             projection.budget = LongTaskBudget.from_dict(budget)
+            initial_status = payload.get("initial_status", LongTaskStatus.RUNNING.value)
+            projection.status = LongTaskStatus(initial_status)
         elif event.event_type == "action_planned":
             action_id = _required_string(payload, "action_id")
             dependencies = payload.get("dependencies", [])
@@ -1018,7 +1039,7 @@ class LongTaskStore:
             )
         elif event.event_type == "task_paused":
             projection.status = LongTaskStatus.PAUSED
-        elif event.event_type == "task_resumed":
+        elif event.event_type == "task_started" or event.event_type == "task_resumed":
             projection.status = LongTaskStatus.RUNNING
         elif event.event_type == "task_cancelled":
             projection.status = LongTaskStatus.CANCELLED

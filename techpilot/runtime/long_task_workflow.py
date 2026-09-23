@@ -95,6 +95,27 @@ class LongTaskWorkflow:
             task = self.store.resume(self.task_id, reason=reason)
         return task
 
+    def create_for_setup(self) -> LongTaskProjection:
+        """Create a Chat Goal whose acceptance contract is set before execution."""
+
+        try:
+            task = self.store.replay(self.task_id)
+        except FileNotFoundError:
+            return self.store.create(
+                self.task_id,
+                goal=self.goal,
+                repository_root=self.runtime.repository,
+                session_id=self.runtime.agent.session_id,
+                budget=self.budget,
+                initial_status=LongTaskStatus.SETUP,
+            )
+        if task.repository_root != self.runtime.repository or task.session_id != self.runtime.agent.session_id:
+            raise LongTaskStateError("Long Task does not belong to this Runtime Session")
+        return task
+
+    def start(self, *, reason: str = "started from Chat Goal command") -> LongTaskProjection:
+        return self.store.start(self.task_id, reason=reason)
+
     def run_turn(self, user_input: str) -> LongTaskWorkflowResult:
         """Compatibility shortcut: run one step and explicitly finish the Task."""
 
@@ -401,6 +422,16 @@ class LegacyLongTaskWorkflow(LongTaskWorkflow):
     def __init__(self, *args: object, fault_hook: FaultHook | None = None, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         self.fault_hook = fault_hook
+
+    def finish(self, *, result: str = "", require_completion_claim: bool = False) -> LongTaskProjection:
+        """Preserve the frozen replay contract without Goal completion claims.
+
+        The evaluator-only workflow represents the retired Task-local effect
+        ledger. Its historical cards complete after their final checkpoint;
+        they must not inherit the product Goal's newer user-acceptance gate.
+        """
+
+        return super().finish(result=result, require_completion_claim=require_completion_claim)
 
     def run_step(self, user_input: str) -> LongTaskWorkflowResult:
         task = self.start_or_resume()
