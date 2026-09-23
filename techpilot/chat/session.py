@@ -26,6 +26,7 @@ from techpilot.engine.tool_results import ToolResult, ToolStatus, display_tool_s
 from techpilot.engine.tools.edit import _changed_files
 
 from ..runtime import (
+    CompletionCriterionKind,
     EffectJournalState,
     EffectJournalStore,
     LongTaskStateError,
@@ -374,10 +375,13 @@ class ChatSession:
             "/compact Compress model context",
             "/model [name]  Show or switch model",
             "/goal <outcome>  Start a durable Goal and run its first step",
-            "/goal [status|pause|resume <id>|complete|clear|cancel]  Manage the active Goal",
+            "/goal [status|pause|resume <id>|complete|clear|cancel]  Manage the active Goal; complete requires a verified claim",
             "/goal constraint <rule>  Add a confirmed hard constraint to the active Goal",
             "/goal constraint remove <id>  Retire one confirmed hard constraint",
             "/goal constraints  List confirmed hard constraints",
+            "/goal criterion <file-exists|file-contains|test-command> ...  Add a Runtime completion check",
+            "/goal criterion remove <id>  Retire one completion check",
+            "/goal criteria  List Runtime completion checks",
             "/goal recover <tool-call-id> <completed|not-executed> <reason>  Record an operator-verified effect outcome",
             "/clear   Clear conversation messages",
         ]
@@ -467,7 +471,7 @@ class ChatSession:
             if workflow is None:
                 return
             try:
-                task = workflow.finish(result="Completed by user")
+                task = workflow.finish(result="Completed by user after verified completion claim")
             except (OSError, LongTaskStateError, ValueError) as error:
                 self.console.print(f"[red]Could not complete Goal: {error}[/red]")
                 return
@@ -482,6 +486,12 @@ class ChatSession:
             return
         if normalized == "constraints" and not separator:
             self._show_goal_constraints()
+            return
+        if normalized == "criterion":
+            self._record_goal_criterion(argument)
+            return
+        if normalized == "criteria" and not separator:
+            self._show_goal_criteria()
             return
         if normalized == "recover":
             self._recover_goal_effect(argument)
@@ -562,6 +572,12 @@ class ChatSession:
         table.add_row("Status", task.status.value)
         table.add_row("Outcome", task.goal)
         table.add_row("Hard constraints", str(len(task.active_constraints)))
+        table.add_row("Completion criteria", str(len(task.active_completion_criteria)))
+        claim = task.active_completion_claim
+        table.add_row("Completion claim", f"ready ({claim.claim_id})" if claim else "not ready")
+        verification = task.last_completion_verification
+        if verification is not None:
+            table.add_row("Last verification", "passed" if verification.passed else "failed")
         table.add_row("Pending actions", str(len(task.pending_action_ids)))
         table.add_row("Completed effects", str(len(task.completed_effect_ids)))
         table.add_row("Checkpoints", str(len(task.checkpoints)))
@@ -619,6 +635,87 @@ class ChatSession:
         table.add_column("Rule")
         for constraint in task.active_constraints:
             table.add_row(constraint.constraint_id, constraint.source, constraint.text)
+        self.console.print(table)
+
+    def _record_goal_criterion(self, text: str) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        before_ids = {criterion.criterion_id for criterion in workflow.store.replay(workflow.task_id).active_completion_criteria}
+        action, separator, remainder = text.partition(" ")
+        normalized = action.lower()
+        remainder = remainder.strip()
+        if normalized == "remove":
+            if not remainder:
+                self.console.print("[yellow]Usage: /goal criterion remove <id>[/yellow]")
+                return
+            try:
+                workflow.store.remove_completion_criterion(
+                    workflow.task_id,
+                    remainder,
+                    reason="Removed by user from Chat Goal command",
+                )
+            except (OSError, LongTaskStateError, ValueError) as error:
+                self.console.print(f"[red]Could not remove completion criterion: {error}[/red]")
+                return
+            self.console.print(f"[green]Goal completion criterion removed: {remainder}[/green]")
+            return
+        try:
+            if normalized == "file-exists" and remainder:
+                task = workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path=remainder)
+            elif normalized == "file-contains":
+                path, separator, expected = remainder.partition(" ")
+                if not path or not separator or not expected.strip():
+                    raise ValueError("file-contains requires a path and expected text")
+                task = workflow.record_completion_criterion(
+                    CompletionCriterionKind.FILE_CONTAINS,
+                    path=path,
+                    expected_text=expected.strip(),
+                )
+            elif normalized == "test-command" and remainder:
+                task = workflow.record_completion_criterion(CompletionCriterionKind.TEST_COMMAND, command=remainder)
+            else:
+                self.console.print(
+                    "[yellow]Usage: /goal criterion file-exists <path> | "
+                    "file-contains <path> <text> | test-command <command>[/yellow]"
+                )
+                return
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self.console.print(f"[red]Could not record completion criterion: {error}[/red]")
+            return
+        criterion = next(
+            (item for item in task.active_completion_criteria if item.criterion_id not in before_ids),
+            None,
+        )
+        if criterion is None:
+            self.console.print("[yellow]Goal completion criterion was already recorded.[/yellow]")
+            return
+        self.console.print(f"[green]Goal completion criterion recorded: {criterion.criterion_id}[/green]")
+
+    def _show_goal_criteria(self) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        try:
+            task = workflow.store.replay(workflow.task_id)
+        except (OSError, ValueError) as error:
+            self.console.print(f"[red]Could not read Goal completion criteria: {error}[/red]")
+            return
+        if not task.active_completion_criteria:
+            self.console.print("[dim]No Runtime completion criteria. Add one before /goal complete.[/dim]")
+            return
+        table = Table(title="Goal completion criteria", show_header=True)
+        table.add_column("ID", style="cyan")
+        table.add_column("Kind")
+        table.add_column("Check")
+        for criterion in task.active_completion_criteria:
+            if criterion.kind is CompletionCriterionKind.FILE_EXISTS:
+                check = criterion.path or ""
+            elif criterion.kind is CompletionCriterionKind.FILE_CONTAINS:
+                check = f"{criterion.path}: contains {criterion.expected_text!r}"
+            else:
+                check = f"exact command exits 0: {criterion.command}"
+            table.add_row(criterion.criterion_id, criterion.kind.value, check)
         self.console.print(table)
 
     def _recover_goal_effect(self, value: str) -> None:

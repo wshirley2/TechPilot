@@ -9,11 +9,14 @@ from techpilot.engine.events import CallbackEventSink
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import PermissionDecision
 from techpilot.engine.tool_execution import ToolEffect
-from techpilot.engine.tools import WriteFileTool
+from techpilot.engine.tools import BashTool, WriteFileTool
 from techpilot.runtime import (
+    GOAL_COMPLETION_TOOL_NAME,
+    CompletionCriterionKind,
     EffectJournalState,
     EffectJournalStore,
     LongTaskRecoveryRequired,
+    LongTaskStateError,
     LongTaskStatus,
     LongTaskWorkflow,
     RuntimeBootstrap,
@@ -103,11 +106,12 @@ def _runtime(
     provider: FixedProvider,
     *,
     session_id: str | None = None,
+    tools=None,
 ):
     runtime = RuntimeBootstrap(provider_factory=lambda _config: provider).build(RuntimeBootstrapInput(
         repository=root,
         event_sink=CallbackEventSink(lambda _event: None),
-        tools=[WriteFileTool()],
+        tools=tools or [WriteFileTool()],
         model="fixed-long-task-provider",
         permission_prompt=AllowPrompt(),
         session_directory=root / "sessions",
@@ -136,6 +140,150 @@ def test_long_task_workflow_runs_real_runtime_and_binds_checkpoint_to_session(tm
     assert result.checkpoint.session_event_cursor
     assert runtime.session_store.replay(runtime.agent.session_id).events[-1].event_id == result.checkpoint.session_event_cursor
     assert runtime.agent.tool_executor.calls == 1
+
+
+def test_goal_completion_claim_requires_current_completed_tool_evidence(tmp_path):
+    runtime = _runtime(tmp_path, FixedProvider([
+        _write_call("write-evidence"),
+        LLMResponse(tool_calls=[ToolCall(
+            id="completion-proposal",
+            name=GOAL_COMPLETION_TOOL_NAME,
+            arguments={"summary": "result.txt was written", "evidence_tool_call_ids": ["write-evidence"]},
+        )]),
+        LLMResponse(content="The result was written and verified."),
+    ]))
+    workflow = LongTaskWorkflow(runtime, task_id="completion-claim", goal="write result")
+    workflow.start_or_resume()
+    workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path="result.txt")
+
+    step = workflow.run_step("write the result")
+
+    claim = step.task.active_completion_claim
+    assert claim is not None
+    assert claim.summary == "result.txt was written"
+    assert claim.evidence[0].tool_call_id == "write-evidence"
+    assert claim.evidence[0].tool_status == "completed"
+    assert workflow.finish().status is LongTaskStatus.SUCCEEDED
+    assert all(
+        GOAL_COMPLETION_TOOL_NAME in {item["function"]["name"] for item in request["tools"]}
+        for request in runtime.agent.llm.requests
+    )
+
+
+def test_goal_completion_records_failed_file_content_verification(tmp_path):
+    runtime = _runtime(tmp_path, FixedProvider([
+        _write_call("write-evidence"),
+        LLMResponse(tool_calls=[ToolCall(
+            id="completion-proposal",
+            name=GOAL_COMPLETION_TOOL_NAME,
+            arguments={"summary": "result.txt was written", "evidence_tool_call_ids": ["write-evidence"]},
+        )]),
+        LLMResponse(content="The result was written."),
+    ]))
+    workflow = LongTaskWorkflow(runtime, task_id="completion-failure", goal="write result")
+    workflow.start_or_resume()
+    workflow.record_completion_criterion(
+        CompletionCriterionKind.FILE_CONTAINS,
+        path="result.txt",
+        expected_text="expected but absent",
+    )
+    workflow.run_step("write the result")
+
+    with pytest.raises(LongTaskStateError, match="expected text not found"):
+        workflow.finish()
+
+    verification = workflow.store.replay("completion-failure").last_completion_verification
+    assert verification is not None
+    assert not verification.passed
+
+
+def test_goal_completion_accepts_a_cited_bash_test_with_exit_code_zero(tmp_path):
+    runtime = _runtime(
+        tmp_path,
+        FixedProvider([
+            LLMResponse(tool_calls=[ToolCall("test-evidence", "bash", {"command": "echo verified"})]),
+            LLMResponse(tool_calls=[ToolCall(
+                "completion-proposal",
+                GOAL_COMPLETION_TOOL_NAME,
+                {"summary": "test passed", "evidence_tool_call_ids": ["test-evidence"]},
+            )]),
+            LLMResponse(content="The test passed."),
+        ]),
+        tools=[BashTool()],
+    )
+    workflow = LongTaskWorkflow(runtime, task_id="completion-test", goal="run the test")
+    workflow.start_or_resume()
+    workflow.record_completion_criterion(CompletionCriterionKind.TEST_COMMAND, command="echo verified")
+
+    workflow.run_step("run the test")
+
+    assert workflow.finish().status is LongTaskStatus.SUCCEEDED
+
+
+def test_goal_completion_rejects_a_different_successful_bash_command(tmp_path):
+    runtime = _runtime(
+        tmp_path,
+        FixedProvider([
+            LLMResponse(tool_calls=[ToolCall("test-evidence", "bash", {"command": "echo not-the-test"})]),
+            LLMResponse(tool_calls=[ToolCall(
+                "completion-proposal",
+                GOAL_COMPLETION_TOOL_NAME,
+                {"summary": "a command passed", "evidence_tool_call_ids": ["test-evidence"]},
+            )]),
+            LLMResponse(content="The command passed."),
+        ]),
+        tools=[BashTool()],
+    )
+    workflow = LongTaskWorkflow(runtime, task_id="completion-wrong-test", goal="run the expected test")
+    workflow.start_or_resume()
+    workflow.record_completion_criterion(CompletionCriterionKind.TEST_COMMAND, command="echo expected-test")
+    workflow.run_step("run the expected test")
+
+    with pytest.raises(LongTaskStateError, match="no cited successful execution"):
+        workflow.finish()
+
+    verification = workflow.store.replay("completion-wrong-test").last_completion_verification
+    assert verification is not None
+    assert not verification.passed
+
+
+def test_goal_completion_tool_is_scoped_to_goal_steps(tmp_path):
+    provider = FixedProvider([LLMResponse(content="ordinary Chat"), LLMResponse(content="Goal step")])
+    runtime = _runtime(tmp_path, provider)
+
+    runtime.run_turn("ordinary Chat")
+    LongTaskWorkflow(runtime, task_id="goal-tool-scope", goal="inspect result").run_step("inspect")
+
+    assert GOAL_COMPLETION_TOOL_NAME not in {item["function"]["name"] for item in provider.requests[0]["tools"]}
+    assert GOAL_COMPLETION_TOOL_NAME in {item["function"]["name"] for item in provider.requests[1]["tools"]}
+    assert GOAL_COMPLETION_TOOL_NAME not in {item["function"]["name"] for item in runtime.agent._tool_schemas()}
+
+
+def test_goal_cannot_finish_without_a_fresh_verified_completion_claim(tmp_path):
+    runtime = _runtime(tmp_path, FixedProvider([LLMResponse(content="done")]))
+    workflow = LongTaskWorkflow(runtime, task_id="completion-missing", goal="inspect result")
+    workflow.run_step("inspect the result")
+
+    with pytest.raises(LongTaskStateError, match="fresh, Runtime-verified completion claim"):
+        workflow.finish()
+
+
+def test_goal_cannot_finish_with_claim_but_without_completion_criteria(tmp_path):
+    runtime = _runtime(tmp_path, FixedProvider([
+        _write_call("write-evidence"),
+        LLMResponse(tool_calls=[ToolCall(
+            id="completion-proposal",
+            name=GOAL_COMPLETION_TOOL_NAME,
+            arguments={"summary": "result.txt was written", "evidence_tool_call_ids": ["write-evidence"]},
+        )]),
+        LLMResponse(content="The result was written."),
+    ]))
+    workflow = LongTaskWorkflow(runtime, task_id="completion-no-criteria", goal="write result")
+
+    workflow.run_step("write the result")
+
+    with pytest.raises(LongTaskStateError, match="at least one Runtime completion criterion"):
+        workflow.finish()
 
 
 def test_goal_rehydrates_durable_outcome_into_each_step_without_leaking_to_chat(tmp_path):

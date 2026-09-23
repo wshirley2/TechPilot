@@ -9,12 +9,14 @@ from pathlib import Path
 import pytest
 
 from techpilot.runtime.long_tasks import (
+    CompletionCriterionKind,
     EffectDisposition,
     LongTaskBudget,
     LongTaskEvent,
     LongTaskStateError,
     LongTaskStatus,
     LongTaskStore,
+    TaskCompletionEvidence,
 )
 from techpilot.runtime.sessions import SessionEvent, SessionStore
 
@@ -174,6 +176,70 @@ def test_task_success_is_terminal_and_blocks_later_effects(tmp_path):
         store.plan_action("repair-task", action_id="later", kind="tool_effect", effect_id="later-v1")
     with pytest.raises(LongTaskStateError, match="interrupted Tasks"):
         store.resume("repair-task", reason="must not resume")
+
+
+def test_completion_claim_is_durable_only_for_its_latest_checkpoint(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+    first_checkpoint = store.checkpoint(
+        "repair-task",
+        message_projection=[],
+        recovery_reason="after validation",
+        session_event_cursor=_session_cursor(tmp_path),
+        checkpoint_id="after-validation",
+    )
+
+    claimed = store.record_completion_claim(
+        "repair-task",
+        summary="Validated formatter output.",
+        checkpoint_id=first_checkpoint.checkpoint_id,
+        session_event_cursor=first_checkpoint.session_event_cursor or "",
+        evidence=(TaskCompletionEvidence(
+            tool_call_id="test-formatter",
+            session_event_id="session-event-1",
+            tool_name="bash",
+            tool_status="completed",
+        ),),
+        claim_id="formatter-complete",
+    )
+
+    assert claimed.active_completion_claim is not None
+    assert claimed.active_completion_claim.claim_id == "formatter-complete"
+    store.checkpoint(
+        "repair-task",
+        message_projection=[],
+        recovery_reason="continued after claim",
+        session_event_cursor=_session_cursor(tmp_path),
+        checkpoint_id="after-continuing",
+    )
+    assert store.replay("repair-task").active_completion_claim is None
+
+
+def test_completion_criteria_are_append_only_and_survive_replay(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+
+    recorded = store.record_completion_criterion(
+        "repair-task",
+        kind=CompletionCriterionKind.FILE_CONTAINS,
+        path="src/formatter.py",
+        expected_text="def format_code",
+        criterion_id="formatter-evidence",
+    )
+    removed = store.remove_completion_criterion(
+        "repair-task",
+        "formatter-evidence",
+        reason="User changed the acceptance condition",
+    )
+    replayed = LongTaskStore.for_repository(tmp_path).replay("repair-task")
+
+    assert recorded.active_completion_criteria[0].expected_text == "def format_code"
+    assert removed.active_completion_criteria == ()
+    assert replayed.active_completion_criteria == ()
+    assert [event.event_type for event in replayed.events][-2:] == [
+        "completion_criterion_recorded",
+        "completion_criterion_removed",
+    ]
 
 
 def test_cancelled_task_never_starts_a_later_side_effect(tmp_path):

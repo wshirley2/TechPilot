@@ -36,8 +36,10 @@ from .extensions import (
     ToolAllowlist,
     ToolRequest,
 )
+from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
 from .long_task_workflow import LongTaskRecoveryRequired, LongTaskWorkflow, LongTaskWorkflowResult
 from .long_tasks import (
+    CompletionCriterionKind,
     EffectDisposition,
     LongTaskAction,
     LongTaskActionStatus,
@@ -51,14 +53,20 @@ from .long_tasks import (
     LongTaskStore,
     LongTaskStoreError,
     TaskCheckpoint,
+    TaskCompletionClaim,
+    TaskCompletionCriterion,
+    TaskCompletionEvidence,
+    TaskCompletionVerification,
     TaskConstraint,
 )
 
 __all__ = [
+    "GOAL_COMPLETION_TOOL_NAME",
     "RUNTIME_ROLE_API_VERSION",
     "ActiveRole",
     "ArtifactRequirement",
     "ChatRuntime",
+    "CompletionCriterionKind",
     "EffectDisposition",
     "EffectJournalEntry",
     "EffectJournalError",
@@ -67,6 +75,8 @@ __all__ = [
     "EffectJournalState",
     "EffectJournalStore",
     "EvaluationInterface",
+    "GoalCompletionProposal",
+    "GoalCompletionTool",
     "LongTaskAction",
     "LongTaskActionStatus",
     "LongTaskBudget",
@@ -99,6 +109,10 @@ __all__ = [
     "SkillSpec",
     "SkillVersion",
     "TaskCheckpoint",
+    "TaskCompletionClaim",
+    "TaskCompletionCriterion",
+    "TaskCompletionEvidence",
+    "TaskCompletionVerification",
     "TaskConstraint",
     "TaskRuntime",
     "TaskRuntimeIdentity",

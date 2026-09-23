@@ -8,15 +8,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from techpilot.engine.agent import ToolExecutionContext
+from techpilot.engine.events import RuntimeEventType
 from techpilot.engine.tool_execution import ToolEffect, ToolExecutionDescription, default_tool_description
-from techpilot.engine.tool_results import ToolStatus, tool_result
+from techpilot.engine.tool_results import ToolStatus, display_tool_status, tool_result
 from techpilot.engine.tools.base import Tool
 
 from .bootstrap import TaskRuntime
 from .effect_journal import EffectJournalStore
+from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
 from .long_tasks import (
+    CompletionCriterionKind,
     EffectDisposition,
     LongTaskBudget,
     LongTaskLease,
@@ -25,6 +29,9 @@ from .long_tasks import (
     LongTaskStatus,
     LongTaskStore,
     TaskCheckpoint,
+    TaskCompletionClaim,
+    TaskCompletionCriterion,
+    TaskCompletionEvidence,
 )
 
 
@@ -67,6 +74,7 @@ class LongTaskWorkflow:
             runtime.repository,
             session_directory=runtime.session_store.directory,
         )
+        self._completion_proposal: GoalCompletionProposal | None = None
 
     def start_or_resume(self, *, reason: str = "continue explicit long Task") -> LongTaskProjection:
         """Create once, or re-evaluate a prior Task before another controlled turn."""
@@ -91,7 +99,10 @@ class LongTaskWorkflow:
         """Compatibility shortcut: run one step and explicitly finish the Task."""
 
         step = self.run_step(user_input)
-        task = self.finish(result=step.response)
+        # This helper preserves the frozen, pre-Goal-Chat evaluator contract.
+        # The product-facing Chat path uses ``finish`` with its default claim
+        # requirement instead.
+        task = self.finish(result=step.response, require_completion_claim=False)
         return LongTaskWorkflowResult(response=step.response, task=task, checkpoint=step.checkpoint)
 
     def run_step(self, user_input: str) -> LongTaskWorkflowResult:
@@ -105,8 +116,13 @@ class LongTaskWorkflow:
             )
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot run: {task.status.value}")
+        prior_session_events = len(self.runtime.session_store.replay(self.runtime.agent.session_id).events)
+        self._completion_proposal = None
         with self.store.acquire_lease(self.task_id):
-            with self.runtime.goal_scope(self._goal_context(task)):
+            with self.runtime.goal_scope(
+                self._goal_context(task),
+                tools=(GoalCompletionTool(self._submit_completion_proposal),),
+            ):
                 response = self.runtime.run_turn(user_input)
             self._require_effect_recovery_clear(task)
             task = self.store.replay(self.task_id)
@@ -121,6 +137,8 @@ class LongTaskWorkflow:
                 recovery_reason="completed controlled Runtime turn",
                 session_event_cursor=session.events[-1].event_id,
             )
+            task = self.store.replay(self.task_id)
+            self._record_completion_claim(self._completion_proposal, session.events[prior_session_events:], checkpoint)
             task = self.store.replay(self.task_id)
         return LongTaskWorkflowResult(response=response, task=task, checkpoint=checkpoint)
 
@@ -138,20 +156,224 @@ class LongTaskWorkflow:
         if task.active_constraints:
             lines.extend(("", "## Confirmed hard constraints"))
             lines.extend(f"- {constraint.text}" for constraint in task.active_constraints)
+        if task.active_completion_criteria:
+            lines.extend(("", "## Runtime completion criteria"))
+            lines.extend(
+                f"- {LongTaskWorkflow._criterion_description(criterion)}"
+                for criterion in task.active_completion_criteria
+            )
+        lines.extend((
+            "",
+            "## Completion proposal protocol",
+            "- When the required outcome is ready, call submit_goal_completion exactly once after this Goal step has real completed Tool evidence.",
+            "- Supply a concise summary and the completed Tool Call IDs that prove it. Do not emit any special completion markup in your user-facing reply.",
+            "- This is only a proposal. It does not complete the Goal; Runtime verifies the referenced raw Session events and the user must still run /goal complete.",
+        ))
         return "\n".join(lines)
 
-    def finish(self, *, result: str = "") -> LongTaskProjection:
+    def finish(self, *, result: str = "", require_completion_claim: bool = True) -> LongTaskProjection:
         """Explicitly mark a fully checkpointed Task complete after its final step."""
 
         task = self.store.replay(self.task_id)
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot finish: {task.status.value}")
+        if require_completion_claim:
+            claim = task.active_completion_claim
+            if claim is None:
+                raise LongTaskStateError(
+                    "Long Task requires a fresh, Runtime-verified completion claim before finishing"
+                )
+            if not task.active_completion_criteria:
+                raise LongTaskStateError("Long Task requires at least one Runtime completion criterion before finishing")
+            verification_results = self._verify_completion_criteria(task, claim)
+            verified = self.store.record_completion_verification(
+                self.task_id,
+                claim_id=claim.claim_id,
+                checkpoint_id=claim.checkpoint_id,
+                results=verification_results,
+            )
+            failed = [detail for _criterion_id, passed, detail in verification_results if not passed]
+            if failed:
+                raise LongTaskStateError(f"Goal completion criteria failed: {'; '.join(failed)}")
+            task = verified
+            result = result or claim.summary
         return self.store.succeed(self.task_id, result=result)
 
     def record_constraint(self, text: str) -> LongTaskProjection:
         """Persist a user-confirmed hard rule for all later Goal steps."""
 
         return self.store.record_constraint(self.task_id, text)
+
+    def record_completion_criterion(
+        self,
+        kind: CompletionCriterionKind,
+        *,
+        path: str | None = None,
+        expected_text: str | None = None,
+        command: str | None = None,
+    ) -> LongTaskProjection:
+        return self.store.record_completion_criterion(
+            self.task_id,
+            kind=kind,
+            path=path,
+            expected_text=expected_text,
+            command=command,
+        )
+
+    def _record_completion_claim(
+        self,
+        proposal: GoalCompletionProposal | None,
+        session_events: list[object],
+        checkpoint: TaskCheckpoint,
+    ) -> None:
+        """Accept only a strict model proposal backed by this step's raw events."""
+
+        if proposal is None:
+            return
+        completed_events = [
+            event for event in session_events
+            if getattr(event, "event_type", None) == RuntimeEventType.TOOL_COMPLETED.value
+        ]
+        proposal_events = [
+            event for event in completed_events
+            if isinstance(getattr(event, "payload", None), dict)
+            and event.payload.get("tool_name") == GOAL_COMPLETION_TOOL_NAME
+        ]
+        if len(proposal_events) != 1 or not completed_events or completed_events[-1] is not proposal_events[0]:
+            return
+        evidence_by_call: dict[str, TaskCompletionEvidence] = {}
+        for event in completed_events:
+            tool_call_id = getattr(event, "tool_call_id", None)
+            event_id = getattr(event, "event_id", None)
+            payload = getattr(event, "payload", None)
+            if not isinstance(tool_call_id, str) or not isinstance(event_id, str) or not isinstance(payload, dict):
+                continue
+            status = display_tool_status(str(payload.get("result", "")), payload.get("tool_status"))
+            if status != ToolStatus.COMPLETED.value or payload.get("interrupted") is True:
+                continue
+            tool_name = payload.get("tool_name")
+            if not isinstance(tool_name, str) or not tool_name or tool_name == GOAL_COMPLETION_TOOL_NAME:
+                continue
+            evidence_by_call[tool_call_id] = TaskCompletionEvidence(
+                tool_call_id=tool_call_id,
+                session_event_id=event_id,
+                tool_name=tool_name,
+                tool_status=status,
+            )
+        try:
+            evidence = tuple(evidence_by_call[call_id] for call_id in proposal.evidence_tool_call_ids)
+        except KeyError:
+            return
+        self.store.record_completion_claim(
+            self.task_id,
+            summary=proposal.summary,
+            checkpoint_id=checkpoint.checkpoint_id,
+            session_event_cursor=checkpoint.session_event_cursor or "",
+            evidence=evidence,
+        )
+
+    def _submit_completion_proposal(self, proposal: GoalCompletionProposal) -> None:
+        if self._completion_proposal is not None:
+            raise ValueError("only one completion proposal is allowed per Goal step")
+        self._completion_proposal = proposal
+
+    def _verify_completion_criteria(
+        self,
+        task: LongTaskProjection,
+        claim: TaskCompletionClaim,
+    ) -> tuple[tuple[str, bool, str], ...]:
+        events = {
+            event.event_id: event
+            for event in self.runtime.session_store.replay(self.runtime.agent.session_id).events
+        }
+        results: list[tuple[str, bool, str]] = []
+        for criterion in task.active_completion_criteria:
+            if criterion.kind is CompletionCriterionKind.FILE_EXISTS:
+                passed, detail = self._verify_file_exists(criterion)
+            elif criterion.kind is CompletionCriterionKind.FILE_CONTAINS:
+                passed, detail = self._verify_file_contains(criterion)
+            else:
+                passed, detail = self._verify_test_command(criterion, claim, events)
+            results.append((criterion.criterion_id, passed, detail))
+        return tuple(results)
+
+    def _verify_file_exists(self, criterion: TaskCompletionCriterion) -> tuple[bool, str]:
+        path = self._criterion_path(criterion)
+        if path is None:
+            return False, f"{criterion.criterion_id}: invalid repository path"
+        return (
+            (True, f"{criterion.criterion_id}: file exists: {criterion.path}")
+            if path.is_file()
+            else (False, f"{criterion.criterion_id}: missing file: {criterion.path}")
+        )
+
+    def _verify_file_contains(self, criterion: TaskCompletionCriterion) -> tuple[bool, str]:
+        path = self._criterion_path(criterion)
+        if path is None or criterion.expected_text is None:
+            return False, f"{criterion.criterion_id}: invalid file content criterion"
+        try:
+            if not path.is_file():
+                return False, f"{criterion.criterion_id}: missing file: {criterion.path}"
+            if path.stat().st_size > 2_000_000:
+                return False, f"{criterion.criterion_id}: file is too large to verify safely: {criterion.path}"
+            contents = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            return False, f"{criterion.criterion_id}: could not read {criterion.path}: {error}"
+        return (
+            (True, f"{criterion.criterion_id}: expected text found in {criterion.path}")
+            if criterion.expected_text in contents
+            else (False, f"{criterion.criterion_id}: expected text not found in {criterion.path}")
+        )
+
+    def _verify_test_command(
+        self,
+        criterion: TaskCompletionCriterion,
+        claim: TaskCompletionClaim,
+        events: dict[str, object],
+    ) -> tuple[bool, str]:
+        if not criterion.command:
+            return False, f"{criterion.criterion_id}: missing expected test command"
+        for evidence in claim.evidence:
+            event = events.get(evidence.session_event_id)
+            payload = getattr(event, "payload", None)
+            if not isinstance(payload, dict) or payload.get("tool_name") != "bash":
+                continue
+            if display_tool_status(str(payload.get("result", "")), payload.get("tool_status")) != ToolStatus.COMPLETED.value:
+                continue
+            facts = payload.get("result_facts")
+            if not isinstance(facts, dict) or facts.get("exit_code") != 0:
+                continue
+            if facts.get("timed_out") is not False or facts.get("truncated") is not False:
+                continue
+            request = next(
+                (
+                    candidate for candidate in events.values()
+                    if getattr(candidate, "tool_call_id", None) == evidence.tool_call_id
+                    and getattr(candidate, "event_type", None) == RuntimeEventType.TOOL_REQUESTED.value
+                ),
+                None,
+            )
+            request_payload = getattr(request, "payload", None)
+            arguments = request_payload.get("arguments") if isinstance(request_payload, dict) else None
+            command = arguments.get("command") if isinstance(arguments, dict) else None
+            if isinstance(command, str) and " ".join(command.split()) == criterion.command:
+                return True, f"{criterion.criterion_id}: cited test command exited 0"
+        return False, f"{criterion.criterion_id}: no cited successful execution of {criterion.command!r}"
+
+    def _criterion_path(self, criterion: TaskCompletionCriterion) -> Path | None:
+        if not criterion.path:
+            return None
+        repository = self.runtime.repository.resolve()
+        candidate = (repository / criterion.path).resolve()
+        return candidate if candidate == repository or repository in candidate.parents else None
+
+    @staticmethod
+    def _criterion_description(criterion: TaskCompletionCriterion) -> str:
+        if criterion.kind is CompletionCriterionKind.FILE_EXISTS:
+            return f"{criterion.criterion_id}: file exists at {criterion.path}"
+        if criterion.kind is CompletionCriterionKind.FILE_CONTAINS:
+            return f"{criterion.criterion_id}: file {criterion.path} contains the confirmed text"
+        return f"{criterion.criterion_id}: exact test command exits 0: {criterion.command}"
 
     def _require_effect_recovery_clear(self, task: LongTaskProjection) -> None:
         """Project shared recovery facts into the Goal lifecycle, without copying them."""

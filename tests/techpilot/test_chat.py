@@ -23,6 +23,7 @@ from techpilot.engine.tool_execution import ToolEffect
 from techpilot.engine.tools.glob_tool import GlobTool
 from techpilot.engine.tools.grep import GrepTool
 from techpilot.runtime import (
+    GOAL_COMPLETION_TOOL_NAME,
     ActiveRole,
     ChatRuntime,
     EffectJournalState,
@@ -74,10 +75,21 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     output = StringIO()
     console = Console(file=output, force_terminal=False, color_system=None)
     repository = copy_benchmark(tmp_path / "repository")
-    provider = FakeProvider([LLMResponse(content="first Goal step"), LLMResponse(content="second Goal step")])
+    provider = FakeProvider([
+        LLMResponse(content="first Goal step"),
+        LLMResponse(tool_calls=[ToolCall("completion-evidence", "glob", {"pattern": "**/*.py"})]),
+        LLMResponse(tool_calls=[ToolCall(
+            "completion-proposal",
+            GOAL_COMPLETION_TOOL_NAME,
+            {"summary": "project sources inspected", "evidence_tool_call_ids": ["completion-evidence"]},
+        )]),
+        LLMResponse(content="second Goal step"),
+    ])
     runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
     inputs = iter([
         "/goal inspect the project in two steps",
+        "/goal criterion file-exists src/cli_data_tool/cli.py",
+        "/goal criteria",
         "continue the Goal",
         "/goal status",
         "/goal complete",
@@ -96,6 +108,28 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     assert "Goal started:" in rendered
     assert "Goal completed:" in rendered
     assert "second Goal step" in rendered
+    assert "Goal completion criteria" in rendered
+
+
+def test_chat_goal_complete_requires_a_verified_completion_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    runtime = make_runtime(
+        copy_benchmark(tmp_path / "repository"),
+        FakeProvider([LLMResponse(content="Goal step without evidence")]),
+        console,
+        session_directory=tmp_path / "sessions",
+    )
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("inspect the project")
+
+    chat._goal("complete")
+
+    assert chat._goal_workflow is not None
+    rendered = output.getvalue()
+    assert "requires a fresh, Runtime-verified" in rendered
+    assert "completion claim before finishing" in rendered
 
 
 def test_chat_goal_constraint_is_durable_and_visible_to_later_goal_step(tmp_path, monkeypatch):
@@ -190,7 +224,11 @@ def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, mo
         first_console,
         session_directory=session_directory,
     )
-    first_inputs = iter(["/goal inspect the project", "/exit"])
+    first_inputs = iter([
+        "/goal inspect the project",
+        "/goal criterion file-exists src/cli_data_tool/cli.py",
+        "/exit",
+    ])
     assert ChatSession(first, console=first_console, input_fn=lambda _prompt: next(first_inputs)).run() == 0
     task_directory = next((repository / ".techpilot" / "tasks").glob("goal-*"))
 
@@ -198,7 +236,15 @@ def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, mo
     console = Console(file=output, force_terminal=False, color_system=None)
     resumed = make_runtime(
         repository,
-        FakeProvider([LLMResponse(content="recovered Goal step")]),
+        FakeProvider([
+            LLMResponse(tool_calls=[ToolCall("recovery-evidence", "glob", {"pattern": "**/*.py"})]),
+            LLMResponse(tool_calls=[ToolCall(
+                "recovery-proposal",
+                GOAL_COMPLETION_TOOL_NAME,
+                {"summary": "recovered sources inspected", "evidence_tool_call_ids": ["recovery-evidence"]},
+            )]),
+            LLMResponse(content="recovered Goal step"),
+        ]),
         console,
         session_directory=session_directory,
         resume_session_id=first.agent.session_id,

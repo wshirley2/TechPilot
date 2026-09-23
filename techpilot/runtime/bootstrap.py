@@ -207,7 +207,7 @@ class TaskRuntime:
             self._restore_role_snapshot(previous)
 
     @contextmanager
-    def goal_scope(self, context: str) -> Iterator[None]:
+    def goal_scope(self, context: str, *, tools: tuple[Tool, ...] = ()) -> Iterator[None]:
         """Temporarily expose durable Goal facts on every provider request.
 
         Goal facts are intentionally system context rather than a historical
@@ -218,12 +218,21 @@ class TaskRuntime:
         if not context.strip():
             raise ValueError("Goal context cannot be empty")
         previous = self.goal_context
+        previous_tools = tuple(self.tools)
+        scoped_tools = list(previous_tools)
+        for tool in tools:
+            if all(existing.name != tool.name for existing in scoped_tools):
+                scoped_tools.append(tool)
         self.goal_context = context
-        self._refresh_system_context()
         try:
+            self.agent.update_tools(scoped_tools)
+            self.tools = scoped_tools
+            self._refresh_system_context()
             yield
         finally:
             self.goal_context = previous
+            self.agent.update_tools(list(previous_tools))
+            self.tools = list(previous_tools)
             self._refresh_system_context()
 
     def _role_snapshot(self) -> _RoleRuntimeSnapshot:

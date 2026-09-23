@@ -55,6 +55,12 @@ class LongTaskActionStatus(str, Enum):
     FAILED = "failed"
 
 
+class CompletionCriterionKind(str, Enum):
+    FILE_EXISTS = "file_exists"
+    FILE_CONTAINS = "file_contains"
+    TEST_COMMAND = "test_command"
+
+
 class EffectDisposition(str, Enum):
     """The only safe choices for a side effect during normal run or recovery."""
 
@@ -155,6 +161,52 @@ class TaskConstraint:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskCompletionEvidence:
+    """A compact reference to a Runtime-observed fact used for Goal completion."""
+
+    tool_call_id: str
+    session_event_id: str
+    tool_name: str
+    tool_status: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCompletionClaim:
+    """A model proposal, verified against raw Session facts but not self-executing."""
+
+    claim_id: str
+    summary: str
+    checkpoint_id: str
+    session_event_cursor: str
+    evidence: tuple[TaskCompletionEvidence, ...]
+    source: str = "model"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCompletionCriterion:
+    """One user-confirmed, Runtime-verifiable condition for Goal success."""
+
+    criterion_id: str
+    kind: CompletionCriterionKind
+    path: str | None = None
+    expected_text: str | None = None
+    command: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCompletionVerification:
+    """Durable result of checking all active conditions before a terminal transition."""
+
+    claim_id: str
+    checkpoint_id: str
+    results: tuple[tuple[str, bool, str], ...]
+
+    @property
+    def passed(self) -> bool:
+        return bool(self.results) and all(result[1] for result in self.results)
+
+
+@dataclass(frozen=True, slots=True)
 class TaskCheckpoint:
     """A recovery index over Task facts, never a replacement for them."""
 
@@ -182,6 +234,9 @@ class LongTaskProjection:
     events: list[LongTaskEvent] = field(default_factory=list)
     actions: dict[str, LongTaskAction] = field(default_factory=dict)
     constraints: dict[str, TaskConstraint] = field(default_factory=dict)
+    completion_claims: list[TaskCompletionClaim] = field(default_factory=list)
+    completion_criteria: dict[str, TaskCompletionCriterion] = field(default_factory=dict)
+    completion_verifications: list[TaskCompletionVerification] = field(default_factory=list)
     checkpoints: list[TaskCheckpoint] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     recovery_blockers: list[str] = field(default_factory=list)
@@ -205,6 +260,29 @@ class LongTaskProjection:
     @property
     def active_constraints(self) -> tuple[TaskConstraint, ...]:
         return tuple(self.constraints[constraint_id] for constraint_id in sorted(self.constraints))
+
+    @property
+    def active_completion_claim(self) -> TaskCompletionClaim | None:
+        """Return a claim only while it still describes the newest checkpoint."""
+
+        if not self.completion_claims or not self.checkpoints:
+            return None
+        latest = self.completion_claims[-1]
+        checkpoint = self.checkpoints[-1]
+        if (
+            latest.checkpoint_id != checkpoint.checkpoint_id
+            or latest.session_event_cursor != checkpoint.session_event_cursor
+        ):
+            return None
+        return latest
+
+    @property
+    def active_completion_criteria(self) -> tuple[TaskCompletionCriterion, ...]:
+        return tuple(self.completion_criteria[criterion_id] for criterion_id in sorted(self.completion_criteria))
+
+    @property
+    def last_completion_verification(self) -> TaskCompletionVerification | None:
+        return self.completion_verifications[-1] if self.completion_verifications else None
 
 
 @dataclass
@@ -411,6 +489,176 @@ class LongTaskStore:
             task_id=projection.task_id,
             event_type="constraint_removed",
             payload={"constraint_id": safe_id, "reason": reason.strip()},
+        ))
+        return self.replay(projection.task_id)
+
+    def record_completion_claim(
+        self,
+        task_id: str,
+        *,
+        summary: str,
+        checkpoint_id: str,
+        session_event_cursor: str,
+        evidence: tuple[TaskCompletionEvidence, ...],
+        source: str = "model",
+        claim_id: str | None = None,
+    ) -> LongTaskProjection:
+        """Persist a completion proposal that is anchored to Runtime evidence.
+
+        A later Goal step creates a newer checkpoint, so this claim naturally
+        expires rather than silently describing a changed work state.
+        """
+
+        projection = self.replay(task_id)
+        self._require_running(projection)
+        normalized_summary = summary.strip()
+        if not normalized_summary:
+            raise ValueError("Completion claim summary cannot be empty")
+        if len(normalized_summary) > 2_000:
+            raise ValueError("Completion claim summary is too long")
+        if not projection.checkpoints:
+            raise LongTaskStateError("Completion claim requires a durable checkpoint")
+        checkpoint = projection.checkpoints[-1]
+        if checkpoint.checkpoint_id != self._normalize_id(checkpoint_id, "checkpoint id"):
+            raise LongTaskStateError("Completion claim must reference the latest checkpoint")
+        if checkpoint.session_event_cursor != session_event_cursor:
+            raise LongTaskStateError("Completion claim Session cursor does not match the latest checkpoint")
+        if not evidence:
+            raise ValueError("Completion claim requires at least one verified Tool result")
+        normalized_source = source.strip()
+        if not normalized_source:
+            raise ValueError("Completion claim source cannot be empty")
+        serialized_evidence: list[dict[str, str]] = []
+        seen_calls: set[str] = set()
+        for item in evidence:
+            if not isinstance(item, TaskCompletionEvidence):
+                raise TypeError("Completion claim evidence must contain TaskCompletionEvidence values")
+            tool_call_id = self._normalize_id(item.tool_call_id, "tool call id")
+            if tool_call_id in seen_calls:
+                raise ValueError("Completion claim evidence Tool Calls must be unique")
+            seen_calls.add(tool_call_id)
+            session_event_id = self._normalize_id(item.session_event_id, "Session event id")
+            tool_name = item.tool_name.strip()
+            tool_status = item.tool_status.strip()
+            if not tool_name or tool_status != "completed":
+                raise ValueError("Completion claim evidence must reference completed Tool Calls")
+            serialized_evidence.append({
+                "tool_call_id": tool_call_id,
+                "session_event_id": session_event_id,
+                "tool_name": tool_name,
+                "tool_status": tool_status,
+            })
+        safe_claim_id = self._normalize_id(claim_id or uuid4().hex, "completion claim id")
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="completion_claimed",
+            payload={
+                "claim_id": safe_claim_id,
+                "summary": normalized_summary,
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "session_event_cursor": session_event_cursor,
+                "evidence": serialized_evidence,
+                "source": normalized_source,
+            },
+        ))
+        return self.replay(projection.task_id)
+
+    def record_completion_criterion(
+        self,
+        task_id: str,
+        *,
+        kind: CompletionCriterionKind,
+        path: str | None = None,
+        expected_text: str | None = None,
+        command: str | None = None,
+        criterion_id: str | None = None,
+    ) -> LongTaskProjection:
+        """Append a user-selected condition that Runtime can later verify."""
+
+        projection = self.replay(task_id)
+        self._require_not_terminal(projection)
+        normalized_kind = CompletionCriterionKind(kind)
+        normalized_path = _normalize_completion_path(path)
+        normalized_expected = expected_text.strip() if isinstance(expected_text, str) else None
+        normalized_command = _normalize_completion_command(command)
+        if normalized_kind is CompletionCriterionKind.TEST_COMMAND:
+            if normalized_path is not None or normalized_expected is not None or normalized_command is None:
+                raise ValueError("test_command completion criterion requires only an exact command")
+        elif normalized_kind is CompletionCriterionKind.FILE_EXISTS:
+            if normalized_path is None or normalized_expected is not None or normalized_command is not None:
+                raise ValueError("file_exists completion criterion requires only a repository-relative path")
+        elif normalized_kind is CompletionCriterionKind.FILE_CONTAINS:
+            if normalized_path is None or not normalized_expected or normalized_command is not None:
+                raise ValueError("file_contains completion criterion requires a path and expected text")
+            if len(normalized_expected) > 2_000:
+                raise ValueError("Completion criterion expected text is too long")
+        safe_id = self._normalize_id(criterion_id or uuid4().hex, "completion criterion id")
+        if safe_id in projection.completion_criteria:
+            raise LongTaskStateError(f"Completion criterion id already exists: {safe_id}")
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="completion_criterion_recorded",
+            payload={
+                "criterion_id": safe_id,
+                "kind": normalized_kind.value,
+                "path": normalized_path,
+                "expected_text": normalized_expected,
+                "command": normalized_command,
+            },
+        ))
+        return self.replay(projection.task_id)
+
+    def remove_completion_criterion(
+        self,
+        task_id: str,
+        criterion_id: str,
+        *,
+        reason: str,
+    ) -> LongTaskProjection:
+        projection = self.replay(task_id)
+        self._require_not_terminal(projection)
+        safe_id = self._normalize_id(criterion_id, "completion criterion id")
+        if safe_id not in projection.completion_criteria:
+            raise LongTaskStateError(f"Unknown completion criterion: {safe_id}")
+        if not reason.strip():
+            raise ValueError("Completion criterion removal reason cannot be empty")
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="completion_criterion_removed",
+            payload={"criterion_id": safe_id, "reason": reason.strip()},
+        ))
+        return self.replay(projection.task_id)
+
+    def record_completion_verification(
+        self,
+        task_id: str,
+        *,
+        claim_id: str,
+        checkpoint_id: str,
+        results: tuple[tuple[str, bool, str], ...],
+    ) -> LongTaskProjection:
+        """Record checked facts before accepting or rejecting Goal completion."""
+
+        projection = self.replay(task_id)
+        self._require_running(projection)
+        claim = projection.active_completion_claim
+        if claim is None or claim.claim_id != claim_id:
+            raise LongTaskStateError("Completion verification requires the active completion claim")
+        if claim.checkpoint_id != checkpoint_id:
+            raise LongTaskStateError("Completion verification checkpoint does not match the active claim")
+        expected_ids = {criterion.criterion_id for criterion in projection.active_completion_criteria}
+        received_ids = {criterion_id for criterion_id, _passed, _detail in results}
+        if not results or received_ids != expected_ids or len(received_ids) != len(results):
+            raise ValueError("Completion verification must report every active criterion exactly once")
+        serialized: list[dict[str, object]] = []
+        for criterion_id, passed, detail in results:
+            if not isinstance(passed, bool) or not isinstance(detail, str) or not detail.strip():
+                raise TypeError("Invalid completion verification result")
+            serialized.append({"criterion_id": criterion_id, "passed": passed, "detail": detail.strip()[:2_000]})
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="completion_verified",
+            payload={"claim_id": claim_id, "checkpoint_id": checkpoint_id, "results": serialized},
         ))
         return self.replay(projection.task_id)
 
@@ -679,6 +927,79 @@ class LongTaskStore:
             if constraint_id not in projection.constraints:
                 raise LongTaskStateError(f"Unknown constraint: {constraint_id}")
             del projection.constraints[constraint_id]
+        elif event.event_type == "completion_claimed":
+            evidence = payload.get("evidence")
+            if not isinstance(evidence, list) or not evidence:
+                raise TypeError("Completion claim evidence must be a non-empty list")
+            claim_evidence: list[TaskCompletionEvidence] = []
+            seen_calls: set[str] = set()
+            for item in evidence:
+                if not isinstance(item, dict):
+                    raise TypeError("Completion claim evidence item must be an object")
+                tool_call_id = _required_string(item, "tool_call_id")
+                if tool_call_id in seen_calls:
+                    raise ValueError("Completion claim evidence Tool Calls must be unique")
+                seen_calls.add(tool_call_id)
+                tool_status = _required_string(item, "tool_status")
+                if tool_status != "completed":
+                    raise ValueError("Completion claim evidence must be completed")
+                claim_evidence.append(TaskCompletionEvidence(
+                    tool_call_id=tool_call_id,
+                    session_event_id=_required_string(item, "session_event_id"),
+                    tool_name=_required_string(item, "tool_name"),
+                    tool_status=tool_status,
+                ))
+            projection.completion_claims.append(TaskCompletionClaim(
+                claim_id=_required_string(payload, "claim_id"),
+                summary=_required_string(payload, "summary"),
+                checkpoint_id=_required_string(payload, "checkpoint_id"),
+                session_event_cursor=_required_string(payload, "session_event_cursor"),
+                evidence=tuple(claim_evidence),
+                source=_required_string(payload, "source"),
+            ))
+        elif event.event_type == "completion_criterion_recorded":
+            criterion_id = _required_string(payload, "criterion_id")
+            if criterion_id in projection.completion_criteria:
+                raise LongTaskStateError(f"Completion criterion id already exists: {criterion_id}")
+            kind = CompletionCriterionKind(_required_string(payload, "kind"))
+            path = _normalize_completion_path(payload.get("path"))
+            expected_text = payload.get("expected_text")
+            if expected_text is not None and not isinstance(expected_text, str):
+                raise TypeError("Completion criterion expected text must be a string or null")
+            command = _normalize_completion_command(payload.get("command"))
+            projection.completion_criteria[criterion_id] = TaskCompletionCriterion(
+                criterion_id=criterion_id,
+                kind=kind,
+                path=path,
+                expected_text=expected_text,
+                command=command,
+            )
+        elif event.event_type == "completion_criterion_removed":
+            criterion_id = _required_string(payload, "criterion_id")
+            if criterion_id not in projection.completion_criteria:
+                raise LongTaskStateError(f"Unknown completion criterion: {criterion_id}")
+            del projection.completion_criteria[criterion_id]
+        elif event.event_type == "completion_verified":
+            results = payload.get("results")
+            if not isinstance(results, list) or not results:
+                raise TypeError("Completion verification results must be a non-empty list")
+            verification_results: list[tuple[str, bool, str]] = []
+            for item in results:
+                if not isinstance(item, dict):
+                    raise TypeError("Completion verification result must be an object")
+                passed = item.get("passed")
+                if not isinstance(passed, bool):
+                    raise TypeError("Completion verification passed must be a boolean")
+                verification_results.append((
+                    _required_string(item, "criterion_id"),
+                    passed,
+                    _required_string(item, "detail"),
+                ))
+            projection.completion_verifications.append(TaskCompletionVerification(
+                claim_id=_required_string(payload, "claim_id"),
+                checkpoint_id=_required_string(payload, "checkpoint_id"),
+                results=tuple(verification_results),
+            ))
         elif event.event_type == "effect_started":
             self._replace_action(projection, _required_string(payload, "action_id"), LongTaskActionStatus.STARTED)
         elif event.event_type == "effect_completed" or event.event_type == "action_completed":
@@ -818,6 +1139,30 @@ class LongTaskStore:
 
 def _is_message_projection(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+
+def _normalize_completion_path(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("Completion criterion path must be a string or null")
+    normalized = value.strip().replace("\\", "/")
+    if not normalized or Path(normalized).is_absolute() or any(part == ".." for part in Path(normalized).parts):
+        raise ValueError("Completion criterion path must stay inside the repository")
+    return normalized
+
+
+def _normalize_completion_command(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("Completion criterion command must be a string or null")
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise ValueError("Completion criterion command cannot be empty")
+    if len(normalized) > 4_000:
+        raise ValueError("Completion criterion command is too long")
+    return normalized
 
 
 def _required_string(value: dict[str, Any], key: str) -> str:
