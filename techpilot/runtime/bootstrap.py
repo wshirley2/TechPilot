@@ -319,7 +319,9 @@ class TaskRuntime:
         if self.session_store is None:
             raise RuntimeError("Event-based Session storage is not configured")
         projection = self.session_store.replay(session_id)
-        if projection.repository_root is not None and projection.repository_root != self.repository:
+        if projection.repository_root is None:
+            raise ValueError("Session has no valid creation identity")
+        if projection.repository_root != self.repository:
             raise ValueError("Session belongs to a different repository")
         if projection.mode != self.identity.mode.value:
             raise ValueError("Session belongs to a different Runtime mode")
@@ -443,7 +445,9 @@ class RuntimeBootstrap:
         resume_projection = None
         if inputs.resume_session_id:
             resume_projection = session_store.replay(inputs.resume_session_id)
-            if resume_projection.repository_root is not None and resume_projection.repository_root != repository:
+            if resume_projection.repository_root is None:
+                raise ValueError("Session has no valid creation identity")
+            if resume_projection.repository_root != repository:
                 raise ValueError("Session belongs to a different repository")
             if resume_projection.mode != mode.value:
                 raise ValueError("Session belongs to a different Runtime mode")

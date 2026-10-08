@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from techpilot.engine.agent import Agent
 from techpilot.engine.events import CallbackEventSink, RuntimeEvent, RuntimeEventType
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.runtime_control import CancellationToken, RuntimeLimits
 from techpilot.engine.tools.base import Tool
+from techpilot.runtime.bootstrap import RuntimeBootstrap, RuntimeBootstrapInput
 from techpilot.runtime.contracts import RuntimeResultScope, RuntimeResultStatus, TaskRuntimeResult
 from techpilot.runtime.sessions import SessionEvent, SessionEventSink, SessionStore
 
@@ -104,7 +109,7 @@ def test_session_replay_rebuilds_valid_tool_history_and_ignores_partial_tail(tmp
     assert projection.warnings == ["Ignored incomplete trailing Session event"]
 
 
-def test_session_replay_excludes_orphan_tool_result_from_model_history_after_middle_corruption(tmp_path):
+def test_session_replay_excludes_orphan_tool_result_from_model_history_after_middle_corruption(tmp_path, monkeypatch):
     store = SessionStore(tmp_path / "sessions")
     store.create("session-gap", repository_root=tmp_path, model="fake-model")
     store.append_runtime(_event(RuntimeEventType.TURN_STARTED, "session-gap", payload={"user_input": "inspect README"}))
@@ -143,11 +148,163 @@ def test_session_replay_excludes_orphan_tool_result_from_model_history_after_mid
         {"role": "assistant", "content": "inspection complete"},
     ]
 
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
     llm = FakeLLM([LLMResponse(content="continued safely")])
-    agent = Agent(llm=llm, tools=[])
-    agent.messages = projection.model_messages
-    assert agent.chat("continue") == "continued safely"
+    runtime = RuntimeBootstrap(provider_factory=lambda _config: llm).build(RuntimeBootstrapInput(
+        repository=tmp_path,
+        event_sink=CallbackEventSink(lambda _event: None),
+        session_directory=store.directory,
+        resume_session_id="session-gap",
+        tools=[],
+    ))
+    assert runtime.agent.session_id == "session-gap"
+    assert runtime.run_turn("continue") == "continued safely"
     assert all(message["role"] != "tool" for message in llm.requests[0]["messages"])
+
+
+@pytest.mark.parametrize(("field", "replacement", "warning_fragment"), [
+    ("session_id", "another-session", "belongs to"),
+    ("event_id", None, "requires a durable event_id"),
+    ("event_id", "duplicate", "Duplicate Session event_id"),
+    ("round_index", "1", "round_index must be a non-negative integer"),
+    ("turn_id", None, "Tool event requires turn_id and tool_call_id"),
+    ("tool_call_id", None, "Tool event requires turn_id and tool_call_id"),
+    ("tool_call_id", 17, "tool_call_id must be a non-empty string or null"),
+    ("payload", {"tool_name": 17, "arguments": {}}, "Tool request requires a tool_name"),
+    ("payload", {"tool_name": "read_file", "arguments": "bad"}, "Tool request arguments must be an object"),
+])
+def test_session_replay_skips_invalid_tool_request_identity_without_rewriting_events(
+    tmp_path, field, replacement, warning_fragment,
+):
+    store = SessionStore(tmp_path / "sessions")
+    store.create("session-identity", repository_root=tmp_path, model="fake-model")
+    store.append_runtime(_event(
+        RuntimeEventType.TURN_STARTED,
+        "session-identity",
+        payload={"user_input": "inspect README"},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_REQUESTED,
+        "session-identity",
+        tool_call_id="read-identity",
+        payload={"tool_name": "read_file", "arguments": {"file_path": "README.md"}},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_COMPLETED,
+        "session-identity",
+        tool_call_id="read-identity",
+        payload={"tool_name": "read_file", "result": "README contents"},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TURN_COMPLETED,
+        "session-identity",
+        payload={"content": "inspection finished"},
+    ))
+    path = store.path_for("session-identity")
+    lines = path.read_bytes().splitlines(keepends=True)
+    request = json.loads(lines[2])
+    if replacement is None and field == "event_id":
+        request.pop(field)
+    elif replacement == "duplicate":
+        request[field] = json.loads(lines[0])["event_id"]
+    else:
+        request[field] = replacement
+    lines[2] = (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+    original = b"".join(lines)
+    path.write_bytes(original)
+
+    projection = store.replay("session-identity")
+
+    assert path.read_bytes() == original
+    assert len(projection.events) == 4
+    assert any(warning_fragment in warning for warning in projection.warnings)
+    assert any("Excluded orphan tool result 'read-identity'" in warning for warning in projection.warnings)
+    assert projection.model_messages == [
+        {"role": "user", "content": "inspect README"},
+        {"role": "assistant", "content": "inspection finished"},
+    ]
+
+
+def test_session_replay_accepts_legacy_runtime_event_without_schema_version(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    store.create("legacy-session", repository_root=tmp_path, model="fake-model")
+    legacy_event = _event(
+        RuntimeEventType.TURN_STARTED,
+        "legacy-session",
+        payload={"user_input": "legacy input"},
+    ).to_dict()
+    with store.path_for("legacy-session").open("ab") as stream:
+        stream.write((json.dumps(legacy_event) + "\n").encode("utf-8"))
+
+    projection = store.replay("legacy-session")
+
+    assert projection.warnings == []
+    assert projection.events[-1].schema_version == 1
+    assert projection.model_messages == [{"role": "user", "content": "legacy input"}]
+
+
+@pytest.mark.parametrize(("field", "replacement", "warning_fragment"), [
+    ("session_id", "different-session", "belongs to"),
+    ("repository_root", "", "requires an absolute repository_root"),
+    ("repository_root", ".", "requires an absolute repository_root"),
+])
+def test_runtime_refuses_to_resume_session_without_valid_creation_identity(
+    tmp_path, monkeypatch, field, replacement, warning_fragment,
+):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    store = SessionStore(tmp_path / "sessions")
+    store.create("missing-anchor", repository_root=tmp_path, model="fake-model")
+    store.append_runtime(_event(
+        RuntimeEventType.TURN_STARTED,
+        "missing-anchor",
+        payload={"user_input": "surviving message"},
+    ))
+    path = store.path_for("missing-anchor")
+    lines = path.read_bytes().splitlines(keepends=True)
+    created = json.loads(lines[0])
+    if field == "repository_root":
+        created["payload"][field] = replacement
+    else:
+        created[field] = replacement
+    lines[0] = (json.dumps(created) + "\n").encode("utf-8")
+    path.write_bytes(b"".join(lines))
+
+    projection = store.replay("missing-anchor")
+    assert projection.repository_root is None
+    assert projection.model_messages == [{"role": "user", "content": "surviving message"}]
+    assert any(warning_fragment in warning for warning in projection.warnings)
+
+    bootstrap = RuntimeBootstrap(provider_factory=lambda _config: FakeLLM([]))
+    runtime = bootstrap.build(RuntimeBootstrapInput(
+        repository=tmp_path,
+        event_sink=CallbackEventSink(lambda _event: None),
+        session_directory=store.directory,
+        tools=[],
+    ))
+    with pytest.raises(ValueError, match="no valid creation identity"):
+        runtime.resume_session("missing-anchor")
+    with pytest.raises(ValueError, match="no valid creation identity"):
+        bootstrap.build(RuntimeBootstrapInput(
+            repository=tmp_path,
+            event_sink=CallbackEventSink(lambda _event: None),
+            session_directory=store.directory,
+            resume_session_id="missing-anchor",
+            tools=[],
+        ))
+
+
+def test_session_replay_does_not_accept_later_creation_as_identity(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    store.create("late-anchor", repository_root=tmp_path, model="fake-model")
+    path = store.path_for("late-anchor")
+    original = path.read_bytes()
+    path.write_bytes(b"{invalid first record}\n" + original)
+
+    projection = store.replay("late-anchor")
+
+    assert projection.repository_root is None
+    assert len(projection.warnings) == 2
+    assert any("first record" in warning for warning in projection.warnings)
 
 
 def test_session_replay_uses_compression_checkpoint_after_a_middle_gap(tmp_path):

@@ -57,30 +57,63 @@ class SessionEvent:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> SessionEvent:
+        if not isinstance(value, dict):
+            raise TypeError("Session event must be an object")
         version = value.get("schema_version", 0)
+        if type(version) is not int:
+            raise TypeError("Session event schema version must be an integer")
         if version == 0:
             # C1 RuntimeEvent JSON did not carry an explicit schema version.
             # It is losslessly readable as the first C4 event version.
             version = SESSION_SCHEMA_VERSION
         if version != SESSION_SCHEMA_VERSION:
             raise ValueError(f"Unsupported Session event schema version: {version}")
-        payload = value.get("payload", {})
+        payload = value.get("payload")
         if not isinstance(payload, dict):
             raise TypeError("Session event payload must be an object")
         event_type = value.get("event_type")
         session_id = value.get("session_id")
-        if not isinstance(event_type, str) or not isinstance(session_id, str):
+        if not isinstance(event_type, str) or not event_type.strip() or not isinstance(session_id, str) or not session_id.strip():
             raise TypeError("Session event requires event_type and session_id")
+        event_id = value.get("event_id")
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise TypeError("Session event requires a durable event_id")
+        created_at = value.get("created_at")
+        if not isinstance(created_at, str) or not created_at.strip():
+            raise TypeError("Session event requires created_at")
+        turn_id = value.get("turn_id")
+        if turn_id is not None and (not isinstance(turn_id, str) or not turn_id.strip()):
+            raise TypeError("Session event turn_id must be a non-empty string or null")
+        round_index = value.get("round_index", 0)
+        if type(round_index) is not int or round_index < 0:
+            raise TypeError("Session event round_index must be a non-negative integer")
+        tool_call_id = value.get("tool_call_id")
+        if tool_call_id is not None and (not isinstance(tool_call_id, str) or not tool_call_id.strip()):
+            raise TypeError("Session event tool_call_id must be a non-empty string or null")
+        if (
+            event_type in {RuntimeEventType.TOOL_REQUESTED.value, RuntimeEventType.TOOL_COMPLETED.value}
+            and (turn_id is None or tool_call_id is None)
+        ):
+            raise TypeError("Tool event requires turn_id and tool_call_id")
+        if event_type == RuntimeEventType.TOOL_REQUESTED.value:
+            if not isinstance(payload.get("tool_name"), str) or not payload["tool_name"].strip():
+                raise TypeError("Tool request requires a tool_name")
+            if not isinstance(payload.get("arguments", {}), dict):
+                raise TypeError("Tool request arguments must be an object")
+        if event_type == "session_created":
+            root = payload.get("repository_root")
+            if not isinstance(root, str) or not root.strip() or not Path(root).is_absolute():
+                raise TypeError("Session creation requires an absolute repository_root")
         return cls(
             event_type=event_type,
             session_id=session_id,
             payload=payload,
-            turn_id=value.get("turn_id"),
-            round_index=int(value.get("round_index", 0)),
-            tool_call_id=value.get("tool_call_id"),
+            turn_id=turn_id,
+            round_index=round_index,
+            tool_call_id=tool_call_id,
             schema_version=version,
-            event_id=str(value.get("event_id") or uuid4().hex),
-            created_at=str(value.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            event_id=event_id,
+            created_at=created_at,
         )
 
 
@@ -401,6 +434,7 @@ class SessionStore:
             raise SessionStoreError(f"Could not read Session events from {path}") from error
         events: list[SessionEvent] = []
         warnings: list[str] = []
+        seen_event_ids: set[str] = set()
         lines = raw.splitlines(keepends=True)
         for index, line in enumerate(lines, start=1):
             is_last = index == len(lines)
@@ -409,7 +443,15 @@ class SessionStore:
                 break
             try:
                 value = json.loads(line.decode("utf-8"))
-                events.append(SessionEvent.from_dict(value))
+                event = SessionEvent.from_dict(value)
+                if event.session_id != path.stem:
+                    raise ValueError(f"Session event belongs to {event.session_id!r}, expected {path.stem!r}")
+                if event.event_type == "session_created" and index != 1:
+                    raise ValueError("Session creation event must be the first record")
+                if event.event_id in seen_event_ids:
+                    raise ValueError(f"Duplicate Session event_id: {event.event_id!r}")
+                seen_event_ids.add(event.event_id)
+                events.append(event)
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
                 warnings.append(f"Ignored invalid Session event on line {index}: {error}")
         return events, warnings
