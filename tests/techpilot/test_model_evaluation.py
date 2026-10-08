@@ -419,7 +419,9 @@ def test_model_runner_keeps_evaluator_artifacts_outside_workspace_and_scores_a_s
     assert not (tmp_path / "artifacts" / ".model-evaluation.lock").exists()
 
 
-def test_model_runner_refuses_an_active_output_lease_before_starting_a_provider_call(tmp_path: Path) -> None:
+def test_model_runner_refuses_an_active_output_lease_before_starting_a_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     card = ModelTaskCard(
         id="locked-card",
         suite=MODEL_CODING_DEV_V0_SUITE,
@@ -439,6 +441,10 @@ def test_model_runner_refuses_an_active_output_lease_before_starting_a_provider_
     }), encoding="utf-8")
     provider = FixedProvider([LLMResponse(content="green")])
     runner = ModelEvaluationRunner(RuntimeBootstrap(provider_factory=lambda _config: provider))
+    monkeypatch.setattr(
+        "techpilot.evaluation.model_tasks.os.kill",
+        lambda *_args: pytest.fail("the current process must not be probed with os.kill"),
+    )
 
     with pytest.raises(ModelEvaluationOutputLockedError, match="already active"):
         runner.run((card,), manifest=_manifest((card,)), output_directory=output)

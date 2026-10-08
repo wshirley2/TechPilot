@@ -1570,6 +1570,8 @@ def _evaluation_output_lease_is_active(owner: Mapping[str, Any]) -> bool:
 
     if owner["host"] != socket.gethostname():
         return True
+    if owner["pid"] == os.getpid():
+        return True
     try:
         os.kill(owner["pid"], 0)
     except ProcessLookupError:
