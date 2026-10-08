@@ -23,11 +23,13 @@ class EchoTool(Tool):
 class FakeLLM:
     def __init__(self, responses):
         self.responses = iter(responses)
+        self.requests = []
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.estimated_cost = None
 
     def chat(self, messages, tools=None, on_token=None):
+        self.requests.append({"messages": messages, "tools": tools})
         response = next(self.responses)
         self.total_prompt_tokens += response.prompt_tokens
         self.total_completion_tokens += response.completion_tokens
@@ -65,7 +67,11 @@ def test_session_replay_rebuilds_valid_tool_history_and_ignores_partial_tail(tmp
     store.append_runtime(_event(
         RuntimeEventType.TOOL_REQUESTED,
         tool_call_id="read-1",
-        payload={"tool_name": "read_file", "arguments": {"file_path": "README.md"}, "assistant_content": ""},
+        payload={
+            "tool_name": "read_file",
+            "arguments": {"file_path": "README.md"},
+            "assistant_content": "Reading the README.",
+        },
     ))
     store.append_runtime(_event(
         RuntimeEventType.TOOL_COMPLETED,
@@ -84,9 +90,11 @@ def test_session_replay_rebuilds_valid_tool_history_and_ignores_partial_tail(tmp
     projection = store.replay("session-1")
 
     assert [message["role"] for message in projection.messages] == ["user", "assistant", "tool", "assistant"]
+    assert projection.messages[1]["content"] == "Reading the README."
     assert projection.messages[1]["tool_calls"][0]["id"] == "read-1"
     assert projection.messages[2] == {"role": "tool", "tool_call_id": "read-1", "content": "contents"}
     assert projection.messages[-1]["content"] == "README inspected"
+    assert projection.model_messages == projection.messages
     assert projection.total_tokens == 5
     assert projection.last_result == TaskRuntimeResult(
         scope=RuntimeResultScope.TURN,
@@ -94,6 +102,112 @@ def test_session_replay_rebuilds_valid_tool_history_and_ignores_partial_tail(tmp
         response="README inspected",
     )
     assert projection.warnings == ["Ignored incomplete trailing Session event"]
+
+
+def test_session_replay_excludes_orphan_tool_result_from_model_history_after_middle_corruption(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    store.create("session-gap", repository_root=tmp_path, model="fake-model")
+    store.append_runtime(_event(RuntimeEventType.TURN_STARTED, "session-gap", payload={"user_input": "inspect README"}))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_REQUESTED,
+        "session-gap",
+        tool_call_id="lost-request",
+        payload={"tool_name": "read_file", "arguments": {"file_path": "README.md"}, "assistant_content": ""},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_COMPLETED,
+        "session-gap",
+        tool_call_id="lost-request",
+        payload={"tool_name": "read_file", "result": "README contents", "interrupted": False},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TURN_COMPLETED,
+        "session-gap",
+        payload={"content": "inspection complete"},
+    ))
+
+    path = store.path_for("session-gap")
+    lines = path.read_bytes().splitlines(keepends=True)
+    request_index = next(index for index, line in enumerate(lines) if b'"tool_call_id":"lost-request"' in line)
+    lines[request_index] = b'{"event":"corrupt middle record"\n'
+    path.write_bytes(b"".join(lines))
+
+    projection = store.replay("session-gap")
+
+    assert len(projection.events) == 4
+    assert any("Ignored invalid Session event on line" in warning for warning in projection.warnings)
+    assert any("Excluded orphan tool result 'lost-request'" in warning for warning in projection.warnings)
+    assert {message["role"] for message in projection.messages} == {"user", "tool", "assistant"}
+    assert projection.model_messages == [
+        {"role": "user", "content": "inspect README"},
+        {"role": "assistant", "content": "inspection complete"},
+    ]
+
+    llm = FakeLLM([LLMResponse(content="continued safely")])
+    agent = Agent(llm=llm, tools=[])
+    agent.messages = projection.model_messages
+    assert agent.chat("continue") == "continued safely"
+    assert all(message["role"] != "tool" for message in llm.requests[0]["messages"])
+
+
+def test_session_replay_uses_compression_checkpoint_after_a_middle_gap(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    store.create("session-checkpoint", repository_root=tmp_path, model="fake-model")
+    store.append_runtime(_event(RuntimeEventType.TURN_STARTED, "session-checkpoint", payload={"user_input": "first"}))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_REQUESTED,
+        "session-checkpoint",
+        tool_call_id="lost-request",
+        payload={"tool_name": "read_file", "arguments": {"file_path": "README.md"}, "assistant_content": ""},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_COMPLETED,
+        "session-checkpoint",
+        tool_call_id="lost-request",
+        payload={"tool_name": "read_file", "result": "old contents", "interrupted": False},
+    ))
+    store.append(SessionEvent(
+        event_type=RuntimeEventType.CONTEXT_COMPRESSED.value,
+        session_id="session-checkpoint",
+        payload={"message_projection": [{"role": "user", "content": "[summary] verified history"}]},
+    ))
+    store.append_runtime(_event(RuntimeEventType.TURN_STARTED, "session-checkpoint", payload={"user_input": "read current README"}))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_REQUESTED,
+        "session-checkpoint",
+        tool_call_id="read-current",
+        payload={"tool_name": "read_file", "arguments": {"file_path": "README.md"}, "assistant_content": ""},
+    ))
+    store.append_runtime(_event(
+        RuntimeEventType.TOOL_COMPLETED,
+        "session-checkpoint",
+        tool_call_id="read-current",
+        payload={"tool_name": "read_file", "result": "current contents", "interrupted": False},
+    ))
+
+    path = store.path_for("session-checkpoint")
+    lines = path.read_bytes().splitlines(keepends=True)
+    request_index = next(index for index, line in enumerate(lines) if b'"tool_call_id":"lost-request"' in line)
+    lines[request_index] = b'{"event":"corrupt middle record"\n'
+    path.write_bytes(b"".join(lines))
+
+    projection = store.replay("session-checkpoint")
+
+    assert any("Excluded orphan tool result 'lost-request'" in warning for warning in projection.warnings)
+    assert projection.model_messages == [
+        {"role": "user", "content": "[summary] verified history"},
+        {"role": "user", "content": "read current README"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "read-current",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"file_path": "README.md"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "read-current", "content": "current contents"},
+    ]
 
 
 def test_session_keeps_raw_facts_when_context_projection_is_compressed(tmp_path):

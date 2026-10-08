@@ -191,10 +191,13 @@ class SessionStore:
         projection.warnings.extend(warnings)
         pending_calls: dict[tuple[str | None, int], list[dict[str, Any]]] = {}
         emitted_tool_messages: set[tuple[str | None, int]] = set()
-        compressed_projection: list[dict[str, Any]] | None = None
+        model_messages: list[dict[str, Any]] = []
+        model_pending_calls: dict[tuple[str | None, int], dict[str, dict[str, Any]]] = {}
+        model_call_order: dict[tuple[str | None, int], list[str]] = {}
+        model_completed_calls: dict[tuple[str | None, int], dict[str, str]] = {}
+        model_assistant_content: dict[tuple[str | None, int], str | None] = {}
 
         for event in events:
-            message_count_before = len(projection.messages)
             payload = event.payload
             terminal_result = TaskRuntimeResult.from_terminal_event(event.event_type, payload)
             if terminal_result is not None:
@@ -226,6 +229,7 @@ class SessionStore:
                 user_input = payload.get("user_input")
                 if isinstance(user_input, str):
                     projection.messages.append({"role": "user", "content": user_input})
+                    model_messages.append({"role": "user", "content": user_input})
             elif event.event_type == RuntimeEventType.PROVIDER_STARTED.value:
                 projection.provider_calls += 1
             elif event.event_type == RuntimeEventType.TOOL_REQUESTED.value:
@@ -239,6 +243,30 @@ class SessionStore:
                     },
                     "content": payload.get("assistant_content") or None,
                 })
+                if not isinstance(event.tool_call_id, str) or not event.tool_call_id:
+                    projection.warnings.append("Excluded invalid tool request from model history")
+                else:
+                    calls = model_pending_calls.setdefault(key, {})
+                    order = model_call_order.setdefault(key, [])
+                    assistant_content = payload.get("assistant_content")
+                    if key not in model_assistant_content or model_assistant_content[key] is None:
+                        model_assistant_content[key] = (
+                            assistant_content if isinstance(assistant_content, str) and assistant_content else None
+                        )
+                    if event.tool_call_id in calls:
+                        projection.warnings.append(
+                            f"Excluded duplicate tool request {event.tool_call_id!r} from model history"
+                        )
+                    else:
+                        calls[event.tool_call_id] = {
+                            "id": event.tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": payload.get("tool_name", "unknown"),
+                                "arguments": json.dumps(payload.get("arguments", {}), ensure_ascii=False),
+                            },
+                        }
+                        order.append(event.tool_call_id)
             elif event.event_type == RuntimeEventType.EXECUTION_CONTROL_ASSESSED.value:
                 if payload.get("required_control") == "isolate":
                     projection.pending_isolation_requests.append({
@@ -284,10 +312,40 @@ class SessionStore:
                     "tool_call_id": event.tool_call_id,
                     "content": str(payload.get("result", "")),
                 })
+                model_calls = model_pending_calls.get(key, {})
+                if not isinstance(event.tool_call_id, str) or event.tool_call_id not in model_calls:
+                    projection.warnings.append(
+                        f"Excluded orphan tool result {event.tool_call_id!r} from model history"
+                    )
+                else:
+                    completed = model_completed_calls.setdefault(key, {})
+                    if event.tool_call_id in completed:
+                        projection.warnings.append(
+                            f"Excluded duplicate tool result {event.tool_call_id!r} from model history"
+                        )
+                    else:
+                        completed[event.tool_call_id] = str(payload.get("result", ""))
+                        order = model_call_order[key]
+                        if all(call_id in completed for call_id in order):
+                            model_messages.append({
+                                "role": "assistant",
+                                "content": model_assistant_content[key],
+                                "tool_calls": [copy.deepcopy(model_calls[call_id]) for call_id in order],
+                            })
+                            model_messages.extend({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": completed[call_id],
+                            } for call_id in order)
+                            del model_pending_calls[key]
+                            del model_call_order[key]
+                            del model_completed_calls[key]
+                            del model_assistant_content[key]
             elif event.event_type == RuntimeEventType.TURN_COMPLETED.value:
                 content = payload.get("content")
                 if isinstance(content, str):
                     projection.messages.append({"role": "assistant", "content": content})
+                    model_messages.append({"role": "assistant", "content": content})
                 projection.prompt_tokens += _as_non_negative_int(payload.get("prompt_tokens"))
                 projection.completion_tokens += _as_non_negative_int(payload.get("completion_tokens"))
             elif event.event_type == RuntimeEventType.TURN_INTERRUPTED.value:
@@ -298,23 +356,27 @@ class SessionStore:
                 projection.status = "limit_reached"
             elif event.event_type == RuntimeEventType.CONTEXT_COMPRESSED.value:
                 candidate = payload.get("message_projection")
-                if _is_message_list(candidate):
-                    compressed_projection = copy.deepcopy(candidate)
+                if _is_provider_message_list(candidate):
+                    # A valid compression projection is a trusted checkpoint:
+                    # it replaces the prior model view even if earlier JSONL
+                    # events contained an unreadable gap. Later events still
+                    # need their own request/result pairing before they join it.
+                    model_messages = copy.deepcopy(candidate)
+                    model_pending_calls.clear()
+                    model_call_order.clear()
+                    model_completed_calls.clear()
+                    model_assistant_content.clear()
+                else:
+                    projection.warnings.append("Ignored invalid context compression projection")
 
-            # A compression event is a checkpoint for the model-visible
-            # projection, not the end of the Session.  Continue rebuilding
-            # messages produced after that checkpoint so a resumed Agent sees
-            # the later context as well as the compressed history.
-            if (
-                compressed_projection is not None
-                and event.event_type != RuntimeEventType.CONTEXT_COMPRESSED.value
-                and len(projection.messages) > message_count_before
-            ):
-                compressed_projection.extend(
-                    copy.deepcopy(projection.messages[message_count_before:])
+        for key, order in model_call_order.items():
+            unresolved = [call_id for call_id in order if call_id not in model_completed_calls.get(key, {})]
+            if unresolved:
+                projection.warnings.append(
+                    "Excluded incomplete tool round from model history: "
+                    f"turn={key[0]!r}, round={key[1]}, pending={unresolved!r}"
                 )
-
-        projection.model_messages = compressed_projection or copy.deepcopy(projection.messages)
+        projection.model_messages = model_messages
         return projection
 
     def list(self) -> list[SessionProjection]:
@@ -422,5 +484,40 @@ def _as_non_negative_int(value: object) -> int:
     return value if isinstance(value, int) and value >= 0 else 0
 
 
-def _is_message_list(value: object) -> bool:
-    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+def _is_provider_message_list(value: object) -> bool:
+    """Accept only snapshots that can be sent back to a tool-calling Provider."""
+
+    if not isinstance(value, list):
+        return False
+    pending_tool_calls: set[str] = set()
+    for message in value:
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            return False
+        role = message["role"]
+        if pending_tool_calls:
+            if role != "tool":
+                return False
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or tool_call_id not in pending_tool_calls:
+                return False
+            pending_tool_calls.remove(tool_call_id)
+            continue
+        if role == "tool" or role not in {"system", "user", "assistant"}:
+            return False
+        if role != "assistant" or "tool_calls" not in message:
+            continue
+        tool_calls = message["tool_calls"]
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return False
+        call_ids: set[str] = set()
+        for call in tool_calls:
+            if not isinstance(call, dict) or not isinstance(call.get("id"), str) or not call["id"]:
+                return False
+            function = call.get("function")
+            if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+                return False
+            if call["id"] in call_ids:
+                return False
+            call_ids.add(call["id"])
+        pending_tool_calls = call_ids
+    return not pending_tool_calls
