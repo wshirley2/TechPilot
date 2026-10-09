@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from uuid import uuid4
 
-from .goal_plans import GoalPlan
+from techpilot.engine.events import RuntimeEventType
+
+from .goal_plans import GoalPlan, GoalStageAssessment, GoalStageAssessmentStatus
 from .sessions import SessionStore
 
 LONG_TASK_SCHEMA_VERSION = 1
@@ -243,6 +245,7 @@ class LongTaskProjection:
     plans: list[GoalPlan] = field(default_factory=list)
     selected_step_id: str | None = None
     selected_checkpoint_count: int | None = None
+    stage_assessments: list[GoalStageAssessment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     recovery_blockers: list[str] = field(default_factory=list)
 
@@ -296,15 +299,44 @@ class LongTaskProjection:
     @property
     def ready_step_ids(self) -> tuple[str, ...]:
         plan = self.plan
-        if plan is None or self.selected_step_needs_evaluation:
+        if plan is None or (self.selected_step_id is not None and self.selected_checkpoint_count is not None and len(self.checkpoints) > self.selected_checkpoint_count):
             return ()
-        # G1 has no stage evaluator. No dependency may be treated as verified
-        # merely because a Runtime turn produced a checkpoint.
-        return tuple(step.step_id for step in plan.steps if not step.dependencies and step.step_id != self.selected_step_id)
+        verified = set(self.verified_step_ids)
+        return tuple(
+            step.step_id for step in plan.steps
+            if step.step_id not in verified and step.step_id != self.selected_step_id
+            and set(step.dependencies).issubset(verified)
+        )
+
+    @property
+    def verified_step_ids(self) -> tuple[str, ...]:
+        return tuple(
+            assessment.step_id for assessment in self.stage_assessments
+            if assessment.status is GoalStageAssessmentStatus.VERIFIED
+        )
+
+    def assessment_for(self, step_id: str) -> GoalStageAssessment | None:
+        return next((item for item in reversed(self.stage_assessments) if item.step_id == step_id), None)
+
+    @property
+    def selected_step_assessment(self) -> GoalStageAssessment | None:
+        if (
+            self.selected_step_id is None
+            or self.selected_checkpoint_count is None
+            or len(self.checkpoints) <= self.selected_checkpoint_count
+        ):
+            return None
+        assessment = self.assessment_for(self.selected_step_id)
+        return assessment if assessment is not None and assessment.checkpoint_id == self.checkpoints[-1].checkpoint_id else None
 
     @property
     def selected_step_needs_evaluation(self) -> bool:
-        return self.selected_step_id is not None and self.selected_checkpoint_count is not None and len(self.checkpoints) > self.selected_checkpoint_count
+        return (
+            self.selected_step_id is not None
+            and self.selected_checkpoint_count is not None
+            and len(self.checkpoints) > self.selected_checkpoint_count
+            and self.selected_step_assessment is None
+        )
 
 
 @dataclass
@@ -427,6 +459,10 @@ class LongTaskStore:
                 old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
                 if plan.step(projection.selected_step_id) != old_step:
                     raise LongTaskStateError("A revision must retain the selected step unchanged")
+            for verified_id in projection.verified_step_ids:
+                old_step = projection.plan.step(verified_id) if projection.plan else None
+                if plan.step(verified_id) != old_step:
+                    raise LongTaskStateError(f"A revision must retain verified step {verified_id} unchanged")
             self.append(LongTaskEvent(
                 task_id=projection.task_id,
                 event_type="plan_recorded" if next_version == 1 else "plan_revised",
@@ -446,11 +482,27 @@ class LongTaskStore:
             step = plan.step(step_id)
             if step is None:
                 raise LongTaskStateError(f"Unknown Goal plan step: {step_id}")
-            if step.dependencies:
-                raise LongTaskStateError(f"Goal plan step {step_id} is blocked by unverified dependencies: {', '.join(step.dependencies)}")
-            if projection.selected_step_id == step_id:
+            unverified = sorted(set(step.dependencies) - set(projection.verified_step_ids))
+            if unverified:
+                raise LongTaskStateError(f"Goal plan step {step_id} is blocked by unverified dependencies: {', '.join(unverified)}")
+            if step_id in projection.verified_step_ids:
+                raise LongTaskStateError(f"Goal plan step is already verified: {step_id}")
+            if (
+                projection.selected_step_id == step_id
+                and projection.selected_checkpoint_count is not None
+                and len(projection.checkpoints) == projection.selected_checkpoint_count
+            ):
                 return projection
-            if projection.selected_step_needs_evaluation:
+            if (
+                projection.selected_step_id is not None
+                and projection.selected_checkpoint_count is not None
+                and len(projection.checkpoints) > projection.selected_checkpoint_count
+                and not (
+                    projection.selected_step_id == step_id
+                    and projection.selected_step_assessment is not None
+                    and projection.selected_step_assessment.status is GoalStageAssessmentStatus.BLOCKED
+                )
+            ):
                 raise LongTaskStateError("The selected step has a checkpoint and needs evaluation before another stage can be selected")
             self.append(LongTaskEvent(
                 task_id=projection.task_id,
@@ -458,6 +510,27 @@ class LongTaskStore:
                 payload={"plan_version": plan.version, "step_id": step_id},
             ))
             return self.replay(projection.task_id)
+
+    def record_stage_assessment(
+        self,
+        task_id: str,
+        assessment: GoalStageAssessment,
+        *,
+        lease: LongTaskLease,
+    ) -> LongTaskProjection:
+        """Append an independently checked result while holding the Task lease."""
+
+        self._require_active_lease(task_id, lease)
+        projection = self.replay(task_id)
+        self._require_plan_editable(projection)
+        validated = GoalStageAssessment.from_payload(assessment.to_payload())
+        self._validate_stage_assessment(projection, validated)
+        self.append(LongTaskEvent(
+            task_id=projection.task_id,
+            event_type="step_assessed",
+            payload=validated.to_payload(),
+        ))
+        return self.replay(projection.task_id)
 
     def plan_action(
         self,
@@ -957,7 +1030,7 @@ class LongTaskStore:
             if event.task_id != safe_id:
                 projection.warnings.append("Ignored Task event for a different task id")
                 continue
-            if event.event_type in {"plan_recorded", "plan_revised", "step_selected"}:
+            if event.event_type in {"plan_recorded", "plan_revised", "step_selected", "step_assessed"}:
                 try:
                     self._apply_event(projection, event)
                 except (TypeError, ValueError) as error:
@@ -973,6 +1046,13 @@ class LongTaskStore:
         if any(checkpoint.session_event_cursor is None for checkpoint in projection.checkpoints):
             projection.recovery_blockers.append("checkpoint_session_cursor_missing")
             projection.status = LongTaskStatus.RECOVERY_REQUIRED
+        if projection.stage_assessments and not projection.recovery_blockers:
+            try:
+                self._validate_stage_evidence_refs(projection)
+            except (OSError, TypeError, ValueError) as error:
+                projection.warnings.append(f"Invalid Goal stage evidence: {error}")
+                projection.recovery_blockers.append("goal_stage_evidence_invalid")
+                projection.status = LongTaskStatus.RECOVERY_REQUIRED
         return projection
 
     def path_for(self, task_id: str) -> Path:
@@ -1009,6 +1089,10 @@ class LongTaskStore:
                 old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
                 if plan.step(projection.selected_step_id) != old_step:
                     raise LongTaskStateError("Goal plan revision changed the selected step")
+            for verified_id in projection.verified_step_ids:
+                old_step = projection.plan.step(verified_id) if projection.plan else None
+                if plan.step(verified_id) != old_step:
+                    raise LongTaskStateError("Goal plan revision changed a verified step")
             projection.plans.append(plan)
         elif event.event_type == "step_selected":
             self._require_plan_editable(projection)
@@ -1017,12 +1101,31 @@ class LongTaskStore:
                 raise LongTaskStateError("Goal step selection must reference the current plan")
             step_id = _required_string(payload, "step_id")
             step = plan.step(step_id)
-            if step is None or step.dependencies:
+            if step is None or not set(step.dependencies).issubset(set(projection.verified_step_ids)):
                 raise LongTaskStateError("Goal step selection references a missing or blocked stage")
-            if projection.selected_step_needs_evaluation:
+            if step_id in projection.verified_step_ids:
+                raise LongTaskStateError("Goal step selection references an already verified stage")
+            if (
+                projection.selected_step_id is not None
+                and projection.selected_checkpoint_count is not None
+                and len(projection.checkpoints) > projection.selected_checkpoint_count
+                and not (
+                    projection.selected_step_id == step_id
+                    and projection.selected_step_assessment is not None
+                    and projection.selected_step_assessment.status is GoalStageAssessmentStatus.BLOCKED
+                )
+            ):
                 raise LongTaskStateError("Goal step selection bypassed pending evaluation")
             projection.selected_step_id = step_id
             projection.selected_checkpoint_count = len(projection.checkpoints)
+        elif event.event_type == "step_assessed":
+            self._require_plan_editable(projection)
+            assessment = GoalStageAssessment.from_payload(payload)
+            self._validate_stage_assessment(projection, assessment)
+            projection.stage_assessments.append(assessment)
+            if assessment.status is GoalStageAssessmentStatus.VERIFIED:
+                projection.selected_step_id = None
+                projection.selected_checkpoint_count = None
         elif event.event_type == "action_planned":
             action_id = _required_string(payload, "action_id")
             dependencies = payload.get("dependencies", [])
@@ -1226,6 +1329,65 @@ class LongTaskStore:
             raise LongTaskStateError(f"Goal plan cannot change while Task is {projection.status.value}")
         if projection.recovery_blockers or projection.ambiguous_effect_ids:
             raise LongTaskStateError("Goal plan cannot change before recovery is reconciled")
+
+    @staticmethod
+    def _validate_stage_assessment(projection: LongTaskProjection, assessment: GoalStageAssessment) -> None:
+        plan = projection.plan
+        if plan is None or assessment.plan_version != plan.version or assessment.step_id != projection.selected_step_id:
+            raise LongTaskStateError("Goal stage assessment must reference the selected stage and current plan")
+        if not projection.checkpoints or projection.selected_checkpoint_count is None:
+            raise LongTaskStateError("Goal stage assessment requires a selected stage checkpoint")
+        if len(projection.checkpoints) <= projection.selected_checkpoint_count:
+            raise LongTaskStateError("Goal stage assessment requires a checkpoint after stage selection")
+        checkpoint = projection.checkpoints[-1]
+        if assessment.checkpoint_id != checkpoint.checkpoint_id or assessment.session_event_cursor != checkpoint.session_event_cursor:
+            raise LongTaskStateError("Goal stage assessment must reference the latest checkpoint and Session cursor")
+        if assessment.session_event_cursor not in assessment.evidence_event_ids:
+            raise LongTaskStateError("Goal stage assessment must cite its terminal Session event")
+        previous = projection.selected_step_assessment
+        if previous is not None and previous.status is GoalStageAssessmentStatus.VERIFIED:
+            raise LongTaskStateError("A verified Goal stage cannot be reassessed")
+        if assessment.source == "evaluator" and previous is not None:
+            raise LongTaskStateError("A checkpoint may receive only one automatic Goal stage assessment")
+        if assessment.source == "user_review" and (
+            previous is None or previous.status is not GoalStageAssessmentStatus.NEEDS_REVIEW
+            or assessment.status is GoalStageAssessmentStatus.NEEDS_REVIEW
+        ):
+            raise LongTaskStateError("User review may resolve only a stage awaiting review")
+
+    def _validate_stage_evidence_refs(self, projection: LongTaskProjection) -> None:
+        if self.session_store is None or projection.session_id is None or projection.repository_root is None:
+            raise LongTaskStateError("Goal stage evidence requires a durable Session identity")
+        session = self.session_store.replay(projection.session_id)
+        if session.warnings or session.repository_root != projection.repository_root:
+            raise LongTaskStateError("Goal stage evidence Session is incomplete or belongs to another repository")
+        positions = {event.event_id: index for index, event in enumerate(session.events)}
+        if len(positions) != len(session.events):
+            raise LongTaskStateError("Goal stage evidence Session has duplicate event IDs")
+        checkpoints = {checkpoint.checkpoint_id: checkpoint for checkpoint in projection.checkpoints}
+        for assessment in projection.stage_assessments:
+            checkpoint = checkpoints.get(assessment.checkpoint_id)
+            cursor_index = positions.get(assessment.session_event_cursor)
+            if checkpoint is None or checkpoint.session_event_cursor != assessment.session_event_cursor or cursor_index is None:
+                raise LongTaskStateError("Goal stage assessment cites a missing checkpoint or Session cursor")
+            terminal = session.events[cursor_index]
+            if terminal.event_type != RuntimeEventType.TURN_COMPLETED.value or not terminal.turn_id:
+                raise LongTaskStateError("Goal stage assessment cursor is not a completed Runtime turn")
+            cited = []
+            for event_id in assessment.evidence_event_ids:
+                position = positions.get(event_id)
+                if position is None or position > cursor_index:
+                    raise LongTaskStateError("Goal stage assessment cites a missing or later Session event")
+                event = session.events[position]
+                if event_id != assessment.session_event_cursor and event.turn_id != terminal.turn_id:
+                    raise LongTaskStateError("Goal stage assessment cites another Runtime turn")
+                cited.append(event)
+            completed_calls = {
+                event.tool_call_id for event in cited
+                if event.event_type == RuntimeEventType.TOOL_COMPLETED.value and event.tool_call_id
+            }
+            if not set(assessment.tool_call_ids).issubset(completed_calls):
+                raise LongTaskStateError("Goal stage assessment cites a Tool Call without a completed Session event")
 
     def _validate_session_cursor(self, projection: LongTaskProjection, session_event_cursor: str) -> str:
         if self.session_store is None:

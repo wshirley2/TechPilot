@@ -70,8 +70,10 @@ def is_sensitive_path(path: Path) -> bool:
 def is_safe_search_path(path: Path, root: Path) -> bool:
     """Filter native search hits before opening contents or displaying names."""
     try:
+        if not path.exists():
+            return False
         relative = path.relative_to(root)
-        resolved_relative = path.resolve(strict=True).relative_to(root.resolve())
+        resolved_relative = path.resolve().relative_to(root.resolve())
         return not (
             is_sensitive_path(path)
             or should_ignore_repository_path(relative)

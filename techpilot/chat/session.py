@@ -29,6 +29,7 @@ from ..runtime import (
     CompletionCriterionKind,
     EffectJournalState,
     EffectJournalStore,
+    GoalStageAssessmentStatus,
     LongTaskStateError,
     LongTaskStatus,
     LongTaskStore,
@@ -383,6 +384,8 @@ class ChatSession:
             "/goal criterion remove <id>  Retire one completion check",
             "/goal criteria  List Runtime completion checks",
             "/goal plan [show|load <repo-relative-json>|select <step-id>]  Record and inspect a bounded stage plan",
+            "/goal evaluate  Assess the selected checkpoint using durable evidence; does not rerun tools",
+            "/goal review <verified|blocked> <reason>  Resolve a stage awaiting human review",
             "/goal recover <tool-call-id> <completed|not-executed> <reason>  Record an operator-verified effect outcome",
             "/clear   Clear conversation messages",
         ]
@@ -502,6 +505,12 @@ class ChatSession:
         if normalized == "plan":
             self._goal_plan(argument)
             return
+        if normalized == "evaluate" and not separator:
+            self._evaluate_goal_stage()
+            return
+        if normalized == "review":
+            self._review_goal_stage(argument)
+            return
         if normalized == "recover":
             self._recover_goal_effect(argument)
             return
@@ -595,13 +604,23 @@ class ChatSession:
         except (OSError, ValueError) as error:
             self.console.print(f"[red]Could not read Goal status: {error}[/red]")
             return
+        shared_effect_issue = None
+        if task.session_id and workflow.runtime.session_store is not None:
+            try:
+                journal = EffectJournalStore.for_session_directory(workflow.runtime.session_store.directory).replay(task.session_id)
+                if journal.warnings:
+                    shared_effect_issue = "Effect Journal has invalid or incomplete events"
+                elif journal.ambiguous_entries:
+                    shared_effect_issue = "Unresolved Tool effects: " + ", ".join(item.tool_call_id for item in journal.ambiguous_entries)
+            except OSError as error:
+                shared_effect_issue = f"Effect Journal could not be read: {error}"
         table = Table(show_header=False, box=None, padding=(0, 1))
         table.add_column("Field", style="cyan")
         table.add_column("Value")
         table.add_row("Goal ID", task.task_id)
         table.add_row("Status", task.status.value)
         table.add_row("Outcome", task.goal)
-        table.add_row("Hard constraints", str(len(task.active_constraints)))
+        table.add_row("Hard constraints", "; ".join(item.text for item in task.active_constraints) or "none")
         table.add_row("Completion criteria", str(len(task.active_completion_criteria)))
         claim = task.active_completion_claim
         table.add_row("Completion claim", f"ready ({claim.claim_id})" if claim else "not ready")
@@ -611,45 +630,63 @@ class ChatSession:
         table.add_row("Pending actions", str(len(task.pending_action_ids)))
         table.add_row("Completed effects", str(len(task.completed_effect_ids)))
         table.add_row("Checkpoints", str(len(task.checkpoints)))
+        if task.checkpoints:
+            latest_checkpoint = task.checkpoints[-1]
+            table.add_row("Latest checkpoint", latest_checkpoint.checkpoint_id)
+            table.add_row("Session cursor", latest_checkpoint.session_event_cursor or "missing")
         if task.recovery_blockers:
             table.add_row("Recovery blockers", ", ".join(task.recovery_blockers))
         if task.ambiguous_effect_ids:
             table.add_row("Unknown effects", ", ".join(task.ambiguous_effect_ids))
+        if shared_effect_issue:
+            table.add_row("Shared effect blocker", shared_effect_issue)
         plan = task.plan
         if plan is None:
             table.add_row("Stage plan", "unplanned")
             next_action = (
                 "Reconcile Goal recovery before another turn"
-                if task.status is LongTaskStatus.RECOVERY_REQUIRED or task.recovery_blockers or task.ambiguous_effect_ids
+                if task.status is LongTaskStatus.RECOVERY_REQUIRED or task.recovery_blockers or task.ambiguous_effect_ids or shared_effect_issue
                 else "Record a stage plan with /goal plan load <json-file>, or continue the legacy Goal manually"
             )
             table.add_row("Next action", next_action)
         else:
             table.add_row("Stage plan", f"v{plan.version} ({len(plan.steps)} stages)")
-            table.add_row("Verified stages", "0 (stage evaluation begins in G2)")
+            table.add_row("Verified stages", ", ".join(task.verified_step_ids) or "none")
             selected = plan.step(task.selected_step_id) if task.selected_step_id else None
-            table.add_row("Pending stages", str(len(plan.steps) - (1 if selected else 0)))
+            table.add_row("Pending stages", str(len(plan.steps) - len(task.verified_step_ids) - (1 if selected else 0)))
             if selected is None:
                 current = "none selected"
             elif task.selected_step_needs_evaluation:
                 current = f"{selected.step_id} (needs_evaluation)"
+            elif task.selected_step_assessment is not None:
+                current = f"{selected.step_id} ({task.selected_step_assessment.status.value})"
             else:
                 current = f"{selected.step_id} (active)"
             table.add_row("Current stage", current)
             table.add_row("Ready stages", ", ".join(task.ready_step_ids) or "none")
             blocked = [
-                f"{step.step_id} ← {', '.join(step.dependencies)}"
-                for step in plan.steps if step.dependencies
+                f"{step.step_id} ← {', '.join(dependency for dependency in step.dependencies if dependency not in task.verified_step_ids)}"
+                for step in plan.steps if any(dependency not in task.verified_step_ids for dependency in step.dependencies)
             ]
             table.add_row("Blocked dependencies", "; ".join(blocked) or "none")
-            if task.recovery_blockers or task.ambiguous_effect_ids or task.status is LongTaskStatus.RECOVERY_REQUIRED:
+            latest_assessment = task.selected_step_assessment or (task.stage_assessments[-1] if task.stage_assessments else None)
+            if latest_assessment is not None:
+                label = "Stage assessment" if task.selected_step_assessment is latest_assessment else "Latest recorded assessment"
+                table.add_row(label, f"{latest_assessment.step_id}: {latest_assessment.status.value} — {latest_assessment.detail}")
+                table.add_row("Evidence events", ", ".join(latest_assessment.evidence_event_ids))
+                table.add_row("Evidence Tool Calls", ", ".join(latest_assessment.tool_call_ids) or "none")
+            if task.recovery_blockers or task.ambiguous_effect_ids or shared_effect_issue or task.status is LongTaskStatus.RECOVERY_REQUIRED:
                 next_action = "Inspect recovery blockers and reconcile unknown effects before continuing"
             elif task.selected_step_needs_evaluation and selected is not None:
-                next_action = f"Review {selected.evidence} using {selected.check}; do not rerun the turn. Automatic stage evaluation begins in G2"
+                next_action = "Run /goal evaluate to assess the saved checkpoint without rerunning the turn"
+            elif task.selected_step_assessment is not None:
+                next_action = task.selected_step_assessment.next_action
             elif selected is not None:
                 next_action = selected.next_action
             elif task.ready_step_ids:
                 next_action = f"Select a stage with /goal plan select {task.ready_step_ids[0]}"
+            elif len(task.verified_step_ids) == len(plan.steps):
+                next_action = "All stages verified; review final Goal criteria and completion claim"
             else:
                 next_action = "No stage is ready; inspect the dependency contract"
             table.add_row("Next action", next_action)
@@ -677,7 +714,7 @@ class ChatSession:
         if normalized == "load" and argument:
             try:
                 repository = self.runtime.repository.resolve()
-                source = (repository / argument).resolve(strict=True)
+                source = (repository / argument).resolve()
                 if not source.is_relative_to(repository) or not source.is_file():
                     raise ValueError("Goal plan file must be a file inside the repository")
                 if source.stat().st_size > 64_000:
@@ -709,16 +746,50 @@ class ChatSession:
         if len(task.plans) > 1:
             self.console.print("History: " + "; ".join(f"v{item.version}: {item.reason}" for item in task.plans))
         for step in plan.steps:
-            if step.step_id == task.selected_step_id:
+            if step.step_id in task.verified_step_ids:
+                state = "verified"
+            elif step.step_id == task.selected_step_id:
                 state = "needs_evaluation" if task.selected_step_needs_evaluation else "active"
+                if task.selected_step_assessment is not None:
+                    state = task.selected_step_assessment.status.value
             else:
-                state = "blocked" if step.dependencies else "pending (awaiting evaluation)" if task.selected_step_needs_evaluation else "pending (ready)"
+                state = "blocked" if any(dependency not in task.verified_step_ids for dependency in step.dependencies) else "pending (awaiting evaluation)" if task.selected_step_needs_evaluation else "pending (ready)"
             self.console.print(f"[bold]{step.step_id}[/bold] ({state}): {step.goal}")
             self.console.print(f"  Depends on: {', '.join(step.dependencies) or 'none'}")
             self.console.print(f"  Output: {step.expected_output}")
             self.console.print(f"  Scope: {', '.join(step.work_scope)}")
             self.console.print(f"  Evidence: {step.evidence}; check: {step.check}")
             self.console.print(f"  Next: {step.next_action}")
+
+    def _evaluate_goal_stage(self) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        try:
+            _task, assessment = workflow.evaluate_selected_step()
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self.console.print(f"[red]Could not evaluate Goal stage: {error}[/red]")
+            self._show_goal_status()
+            return
+        self.console.print(f"[green]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/green]")
+        self._show_goal_status()
+
+    def _review_goal_stage(self, value: str) -> None:
+        status_text, separator, reason = value.partition(" ")
+        if not separator or not reason.strip():
+            self.console.print("[yellow]Usage: /goal review <verified|blocked> <reason>[/yellow]")
+            return
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        try:
+            status = GoalStageAssessmentStatus(status_text)
+            workflow.review_selected_step(status, reason=reason)
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self.console.print(f"[red]Could not review Goal stage: {error}[/red]")
+            return
+        self.console.print(f"[green]Goal stage review recorded: {status.value}[/green]")
+        self._show_goal_status()
 
     def _record_goal_constraint(self, text: str) -> None:
         if not text:

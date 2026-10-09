@@ -200,7 +200,7 @@ def test_chat_goal_plan_resume_shows_same_version_and_next_action(tmp_path, monk
     assert "Stage plan" in rendered and "v1 (2 stages)" in rendered
     assert "inspect (needs_evaluation)" in rendered
     assert "fix ← inspect" in rendered
-    assert "Review inspect evidence using Review inspect evidence" in rendered
+    assert "Run /goal evaluate to assess the saved checkpoint without rerunning the turn" in rendered
     with pytest.raises(LongTaskStateError, match="needs evaluation"):
         chat._run_user_turn("continue the same stage")
     assert resumed_provider.requests == []

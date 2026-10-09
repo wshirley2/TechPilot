@@ -107,7 +107,17 @@ TUI 会展示流式回答、工具调用、Session 状态和待确认操作。�
 }
 ```
 
-在普通文本 Chat 中运行 `/goal plan load goal-plan.json` 会把计划写入 Goal 的 Task 事件；此后可修改文件并再次执行该命令，形成保留历史的新版计划。运行 `/goal plan show` 查看阶段契约，`/goal plan select inspect` 选择一个无阻塞的阶段，再执行 `/goal start`。恢复原 Session 并运行 `/goal resume <goal-id>` 后，`/goal status` 会显示计划版本、当前阶段、依赖阻塞和下一步。现阶段每个已选阶段最多执行一回合；checkpoint 后显示 `needs_evaluation`，不会自动把阶段判定为完成。阶段证据核验与自动推进属于后续切片。
+在普通文本 Chat 中运行 `/goal plan load goal-plan.json` 会把计划写入 Goal 的 Task 事件；此后可修改文件并再次执行该命令，形成保留历史的新版计划。运行 `/goal plan show` 查看阶段契约，`/goal plan select inspect` 选择一个无阻塞的阶段，再执行 `/goal start`。恢复原 Session 并运行 `/goal resume <goal-id>` 后，`/goal status` 会显示计划版本、当前阶段、依赖阻塞和下一步。
+
+每个已选阶段执行一回合后先留下 checkpoint，状态显示 `needs_evaluation`。运行 `/goal evaluate` 只读取已保存的 Session 工具事件、Effect Journal 和当前文件，不重跑命令。阶段的 `check` 可以是示例中的自然语言（结果为 `needs_review`，需用户运行 `/goal review verified|blocked <原因>`），也可以是以下可确定核验的对象：
+
+```json
+{"kind": "file_exists", "path": "src/fix.py"}
+{"kind": "file_contains", "path": "src/fix.py", "text": "expected text"}
+{"kind": "test_command", "command": "python -m pytest -q"}
+```
+
+把其中一个对象作为阶段的 `check` 值。只有证据与检查条件匹配并通过时才记录 `verified`，后继依赖阶段才会变为可选；无法可靠核验的结果保留阻塞或交给用户判断。Goal 最终完成仍需单独满足用户设定的 `/goal criterion` 和完成声明。
 
 Session 默认保存在目标仓库的 `.techpilot/sessions/` 下；可以用 `--resume` 恢复，也可以用 `--sessions-dir` 指定其他目录。恢复只重建对话，不会重新执行历史工具调用。
 

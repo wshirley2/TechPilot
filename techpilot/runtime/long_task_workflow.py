@@ -19,6 +19,8 @@ from techpilot.engine.tools.base import Tool
 from .bootstrap import TaskRuntime
 from .effect_journal import EffectJournalStore
 from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
+from .goal_evaluation import GoalStageEvidenceError, evaluate_goal_stage
+from .goal_plans import GoalStageAssessment, GoalStageAssessmentStatus
 from .long_tasks import (
     CompletionCriterionKind,
     EffectDisposition,
@@ -218,10 +220,67 @@ class LongTaskWorkflow:
         if task.selected_step_id is None:
             raise LongTaskStateError("Select a ready Goal plan step before running another turn")
         step = task.plan.step(task.selected_step_id)
-        if step is None or step.dependencies:
+        if step is None or not set(step.dependencies).issubset(set(task.verified_step_ids)):
             raise LongTaskStateError("The selected Goal plan step is missing or blocked by dependencies")
         if task.selected_step_needs_evaluation:
             raise LongTaskStateError("The selected Goal plan step has a checkpoint and needs evaluation before another turn")
+        if task.selected_step_assessment is not None:
+            raise LongTaskStateError("The selected Goal plan step is assessed and requires review or replanning before another turn")
+
+    def evaluate_selected_step(self) -> tuple[LongTaskProjection, GoalStageAssessment]:
+        """Read Session/effect facts and files, then append one stage judgment."""
+
+        with self.store.acquire_lease(self.task_id) as lease:
+            task = self.store.replay(self.task_id)
+            self._require_effect_recovery_clear(task)
+            if task.status not in {LongTaskStatus.RUNNING, LongTaskStatus.PAUSED}:
+                raise LongTaskStateError(f"Goal stage cannot be evaluated while Task is {task.status.value}")
+            try:
+                assessment = evaluate_goal_stage(
+                    task,
+                    session_store=self.runtime.session_store,
+                    effect_store=EffectJournalStore.for_session_directory(self.runtime.session_store.directory),
+                )
+            except GoalStageEvidenceError as error:
+                self.store.require_recovery(self.task_id, reason=f"Goal stage evidence needs recovery: {error}")
+                raise LongTaskRecoveryRequired(str(error)) from error
+            updated = self.store.record_stage_assessment(self.task_id, assessment, lease=lease)
+            if updated.recovery_blockers:
+                raise LongTaskRecoveryRequired("Stage assessment evidence could not be replayed safely")
+            return updated, assessment
+
+    def review_selected_step(self, status: GoalStageAssessmentStatus, *, reason: str) -> LongTaskProjection:
+        """Record an explicit human decision only for an assessed needs_review stage."""
+
+        resolution = GoalStageAssessmentStatus(status)
+        if resolution not in {GoalStageAssessmentStatus.VERIFIED, GoalStageAssessmentStatus.BLOCKED}:
+            raise ValueError("Goal stage review must be verified or blocked")
+        note = reason.strip()
+        if not note:
+            raise ValueError("Goal stage review requires a reason")
+        with self.store.acquire_lease(self.task_id) as lease:
+            task = self.store.replay(self.task_id)
+            self._require_effect_recovery_clear(task)
+            previous = task.selected_step_assessment
+            if previous is None or previous.status is not GoalStageAssessmentStatus.NEEDS_REVIEW:
+                raise LongTaskStateError("Only a needs_review Goal stage can receive a user review")
+            assessment = GoalStageAssessment(
+                plan_version=task.plan.version,
+                step_id=previous.step_id,
+                checkpoint_id=previous.checkpoint_id,
+                session_event_cursor=previous.session_event_cursor,
+                status=resolution,
+                evidence_event_ids=previous.evidence_event_ids,
+                tool_call_ids=previous.tool_call_ids,
+                detail=f"User review: {note}",
+                next_action=(
+                    "Select the next ready stage"
+                    if resolution is GoalStageAssessmentStatus.VERIFIED
+                    else f"Resolve the blocker, then use /goal plan select {previous.step_id} to retry"
+                ),
+                source="user_review",
+            )
+            return self.store.record_stage_assessment(self.task_id, assessment, lease=lease)
 
     def finish(self, *, result: str = "", require_completion_claim: bool = True) -> LongTaskProjection:
         """Explicitly mark a fully checkpointed Task complete after its final step."""
@@ -229,6 +288,10 @@ class LongTaskWorkflow:
         task = self.store.replay(self.task_id)
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot finish: {task.status.value}")
+        if task.plan is not None:
+            unverified = [step.step_id for step in task.plan.steps if step.step_id not in task.verified_step_ids]
+            if unverified:
+                raise LongTaskStateError(f"Goal cannot finish with unverified stages: {', '.join(unverified)}")
         if require_completion_claim:
             claim = task.active_completion_claim
             if claim is None:

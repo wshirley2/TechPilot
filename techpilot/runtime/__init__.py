@@ -35,7 +35,7 @@ from .extensions import (
     ToolRequest,
 )
 from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
-from .goal_plans import GoalPlan, GoalStep
+from .goal_plans import GoalPlan, GoalStageAssessment, GoalStageAssessmentStatus, GoalStageCheck, GoalStageCheckKind, GoalStep
 from .long_task_workflow import LongTaskRecoveryRequired, LongTaskWorkflow, LongTaskWorkflowResult
 from .long_tasks import (
     CompletionCriterionKind,
@@ -77,6 +77,10 @@ __all__ = [
     "GoalCompletionProposal",
     "GoalCompletionTool",
     "GoalPlan",
+    "GoalStageAssessment",
+    "GoalStageAssessmentStatus",
+    "GoalStageCheck",
+    "GoalStageCheckKind",
     "GoalStep",
     "LongTaskAction",
     "LongTaskActionStatus",
