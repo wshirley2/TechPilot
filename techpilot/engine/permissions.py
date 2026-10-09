@@ -25,7 +25,7 @@ class PermissionAction(str, Enum):
 
 
 class PermissionEffect(str, Enum):
-    """Observable effect used by both Chat and Managed Run policies."""
+    """Observable effect used by Chat and Goal tool permissions."""
 
     READ = "read"
     WRITE = "write"

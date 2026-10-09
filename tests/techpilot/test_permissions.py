@@ -401,11 +401,3 @@ def test_terminal_permission_prompt_accepts_numbered_session_and_prefix_choices(
 
     assert session.grant_scope is PermissionGrantScope.SESSION
     assert prefix.grant_scope is PermissionGrantScope.PREFIX
-
-
-def test_managed_policy_exposes_the_same_permission_decision_protocol():
-    from techpilot.execution import PolicyDecision, ToolEffect
-
-    decision = PolicyDecision(PermissionAction.DENY, "managed denial", ToolEffect.NETWORK)
-
-    assert decision.to_permission_decision() == PermissionDecision.deny(decision.reason)

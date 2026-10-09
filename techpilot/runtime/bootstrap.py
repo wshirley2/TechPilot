@@ -1,4 +1,4 @@
-"""Central assembly for TechPilot Chat and future Managed Runs."""
+"""Central assembly for TechPilot Chat and durable Goals."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from ..config.user import resolve_runtime_config
 from ..repository import RepositoryProfiler
 from ..repository.profiler import RepositoryProfile
 from .contracts import (
-    RuntimeMode,
     TaskRuntimeIdentity,
     TaskRuntimePaths,
     TaskRuntimeResult,
@@ -50,10 +49,6 @@ class RuntimeBootstrapInput:
     session_directory: Path | None = None
     resume_session_id: str | None = None
     limits: RuntimeLimits | None = None
-    mode: RuntimeMode = RuntimeMode.CHAT
-    task_id: str | None = None
-    run_id: str | None = None
-    source_repository: Path | None = None
     paths: TaskRuntimePaths | None = None
 
 
@@ -93,24 +88,6 @@ class TaskRuntime:
     base_tools: tuple[Tool, ...] = ()
     role_tool_catalog: dict[str, Tool] = field(default_factory=dict)
     recovery_notices: list[str] = field(default_factory=list)
-
-    @property
-    def runtime_mode(self) -> RuntimeMode:
-        return self.identity.mode
-
-    @property
-    def mode(self) -> str:
-        """Compatibility display label retained for existing CLI integrations."""
-
-        return self.identity.mode.display_name
-
-    @property
-    def task_id(self) -> str | None:
-        return self.identity.task_id
-
-    @property
-    def run_id(self) -> str | None:
-        return self.identity.run_id
 
     @property
     def last_result(self) -> TaskRuntimeResult | None:
@@ -285,7 +262,7 @@ class TaskRuntime:
         context = "\n\n".join(
             part for part in (self.base_system_context, role_context, self.goal_context) if part
         )
-        return _with_runtime_identity(context, self.mode, self.config.model)
+        return _with_runtime_identity(context, self.config.model)
 
     def consume_recovery_notices(self) -> list[str]:
         """Return compatibility notices that must be shown after Session recovery."""
@@ -323,16 +300,10 @@ class TaskRuntime:
             raise ValueError("Session has no valid creation identity")
         if projection.repository_root != self.repository:
             raise ValueError("Session belongs to a different repository")
-        if projection.mode != self.identity.mode.value:
-            raise ValueError("Session belongs to a different Runtime mode")
         self.agent.session_id = projection.session_id
         self.agent.messages = projection.model_messages
         self.identity = TaskRuntimeIdentity(
-            mode=self.identity.mode,
             session_id=projection.session_id,
-            task_id=projection.task_id,
-            run_id=projection.run_id,
-            source_repository=(projection.source_repository_root or self.identity.source_repository),
             working_directory=self.repository,
         )
         if projection.model:
@@ -341,18 +312,6 @@ class TaskRuntime:
             # Grants are intentionally process-local. A resumed session always
             # reuses C3's Trusted Diff and fresh approval path.
             self.permission_manager.clear_session_grants()
-        set_task_id = getattr(self.agent.tool_executor, "set_task_id", None)
-        if callable(set_task_id):
-            set_task_id(projection.task_id)
-        legacy_isolations = list(projection.pending_isolation_requests)
-        if legacy_isolations:
-            notice = (
-                f"发现 {len(legacy_isolations)} 个旧版待隔离操作：它们此前未执行，"
-                "当前版本不会自动恢复、执行或改写为源仓库写入。"
-            )
-            self.recovery_notices.append(notice)
-            self.agent.messages.append({"role": "system", "content": notice})
-            projection.warnings.append("旧版待隔离操作已冻结；当前 Chat 不会自动执行。")
         recovered_role_id = _last_active_role_id(projection)
         if recovered_role_id is not None:
             notice = f"发现历史 Role 激活记录（{recovered_role_id}）；当前版本不会自动恢复 Role、工具或历史授权。"
@@ -403,20 +362,14 @@ class RuntimeBootstrap:
         repository = inputs.repository.resolve()
         if not repository.is_dir():
             raise ValueError(f"Repository directory does not exist: {inputs.repository}")
-        mode = RuntimeMode(inputs.mode)
         paths = inputs.paths or TaskRuntimePaths.for_runtime(
-            mode,
             repository,
             inputs.session_directory,
         )
         if inputs.paths is not None and inputs.session_directory is not None:
             raise ValueError("Pass either Runtime paths or a Session directory, not both")
-        if paths.mode is not mode or paths.working_directory != repository:
-            raise ValueError("Runtime paths do not match the requested mode and working directory")
-        source_repository = (inputs.source_repository or repository).resolve()
-        if not source_repository.is_dir():
-            raise ValueError(f"Source repository directory does not exist: {source_repository}")
-        _validate_runtime_scope(mode, inputs.task_id, inputs.run_id)
+        if paths.working_directory != repository:
+            raise ValueError("Runtime paths do not match the requested working directory")
 
         config = resolve_runtime_config(
             model=inputs.model,
@@ -449,8 +402,6 @@ class RuntimeBootstrap:
                 raise ValueError("Session has no valid creation identity")
             if resume_projection.repository_root != repository:
                 raise ValueError("Session belongs to a different repository")
-            if resume_projection.mode != mode.value:
-                raise ValueError("Session belongs to a different Runtime mode")
             if resume_projection.model and not inputs.model:
                 config.model = resume_projection.model
 
@@ -464,7 +415,7 @@ class RuntimeBootstrap:
         base_system_context = "\n\n".join(
             part for part in (repository_context, inputs.system_context) if part
         )
-        system_context = _with_runtime_identity(base_system_context, mode.display_name, config.model)
+        system_context = _with_runtime_identity(base_system_context, config.model)
         permission_manager = None
         tool_executor = inputs.tool_executor
         if tool_executor is None:
@@ -472,7 +423,7 @@ class RuntimeBootstrap:
                 ChatPermissionPolicy(profile.validation_commands if profile else ()),
                 inputs.permission_prompt or DenyPermissionPrompt(),
             )
-            tool_executor = RepositoryToolExecutor(repository, permission_manager, task_id=inputs.task_id)
+            tool_executor = RepositoryToolExecutor(repository, permission_manager)
         session_id = resume_projection.session_id if resume_projection is not None else None
         session_sink = SessionEventSink(session_store, inputs.event_sink)
         agent = Agent(
@@ -494,28 +445,17 @@ class RuntimeBootstrap:
                 agent.session_id,
                 repository_root=repository,
                 model=config.model,
-                mode=mode.value,
-                task_id=inputs.task_id,
-                run_id=inputs.run_id,
-                source_repository_root=source_repository,
             )
         # Session events are conversational history. The Effect Journal is a
-        # separate write-ahead record for non-read Tool effects, so ordinary
-        # Chat and Goal recovery can survive process loss too. Managed Run
-        # keeps its compatibility executor until that deprecated route is
-        # removed rather than silently changing its workspace contract here.
-        if mode is not RuntimeMode.MANAGED_RUN:
-            agent.tool_executor = EffectJournalExecutor(
-                agent.tool_executor,
-                EffectJournalStore.for_session_directory(session_store.directory),
-            )
+        # separate write-ahead record for non-read Tool effects, so Chat and
+        # Goal recovery can survive process loss too.
+        agent.tool_executor = EffectJournalExecutor(
+            agent.tool_executor,
+            EffectJournalStore.for_session_directory(session_store.directory),
+        )
         runtime = TaskRuntime(
             identity=TaskRuntimeIdentity(
-                mode=mode,
                 session_id=agent.session_id,
-                task_id=inputs.task_id,
-                run_id=inputs.run_id,
-                source_repository=source_repository,
                 working_directory=repository,
             ),
             paths=paths,
@@ -576,24 +516,15 @@ def _repository_summary(profile: RepositoryProfile | None, warning: str | None) 
     ])
 
 
-def _with_runtime_identity(base_context: str, mode: str, model: str) -> str:
+def _with_runtime_identity(base_context: str, model: str) -> str:
     """Inject only runtime facts that the Agent may safely explain to the user."""
 
     identity = "\n".join([
         "Runtime identity (authoritative facts):",
         "Product: TechPilot",
-        f"Mode: {mode}",
+        "Mode: Chat with optional durable Goals",
         f"Current model: {model}",
         "For questions about product, mode, or model, answer from these facts without calling tools.",
         "Do not reveal API keys, endpoints, or other provider secrets.",
     ])
     return "\n\n".join(part for part in (base_context, identity) if part)
-
-
-def _validate_runtime_scope(mode: RuntimeMode, task_id: str | None, run_id: str | None) -> None:
-    """Reject incomplete correlation data before creating Session artifacts."""
-
-    if run_id is not None and task_id is None:
-        raise ValueError("A Runtime run id requires a task id")
-    if mode is RuntimeMode.MANAGED_RUN and (task_id is None or run_id is None):
-        raise ValueError("Managed Run Runtime requires task and run ids")

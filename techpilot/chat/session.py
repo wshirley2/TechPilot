@@ -950,24 +950,12 @@ class ChatSession:
             "\n".join([
                 f"Session: {item.session_id}",
                 f"Repository: {item.repository_root or '?'}",
-                f"Source repository: {item.source_repository_root or '?'}",
-                f"Mode: {item.mode}",
-                f"Task: {item.task_id or '-'}",
-                f"Run: {item.run_id or '-'}",
                 f"Model: {item.model or '?'}",
                 f"Status: {item.status}",
                 result_line,
                 f"Events: {len(item.events)}",
                 f"Messages: {len(item.messages)} (model projection: {len(item.model_messages)})",
                 f"Usage: {item.prompt_tokens} prompt + {item.completion_tokens} completion",
-                f"Frozen legacy isolation requests: {len(item.pending_isolation_requests)}",
-                *(
-                    [
-                        f"- {request.get('tool_name', 'tool')}: 未执行；当前 Chat 不会自动恢复或执行"
-                        for request in item.pending_isolation_requests
-                    ]
-                    or ["- none"]
-                ),
                 "Recovery warnings:",
                 warnings,
             ]),
@@ -1377,7 +1365,7 @@ def _session_result_line(session) -> str:
     )
     if blocked:
         return (
-            f"Last result: {result.status.value} ({result.scope.value}; "
+            f"Last result: {result.status.value} ("
             "Tool Call blocked, not executed)"
         )
-    return f"Last result: {result.status.value} ({result.scope.value})"
+    return f"Last result: {result.status.value}"

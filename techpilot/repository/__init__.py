@@ -1,12 +1,9 @@
-"""Repository analysis and context selection."""
+"""Repository analysis for Chat context."""
 
 from .index import RepositoryIndex
 from .profiler import RepositoryProfile, RepositoryProfiler
-from .selector import CandidateFile, ContextSelector
 
 __all__ = [
-    "CandidateFile",
-    "ContextSelector",
     "RepositoryIndex",
     "RepositoryProfile",
     "RepositoryProfiler",

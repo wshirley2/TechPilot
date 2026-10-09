@@ -2,8 +2,6 @@
 
 from .bootstrap import ActiveRole, ChatRuntime, RuntimeBootstrap, RuntimeBootstrapInput, TaskRuntime
 from .contracts import (
-    RuntimeMode,
-    RuntimeResultScope,
     RuntimeResultStatus,
     TaskRuntimeIdentity,
     TaskRuntimePaths,
@@ -101,8 +99,6 @@ __all__ = [
     "RuntimeBootstrap",
     "RuntimeBootstrapInput",
     "RuntimeCompatibility",
-    "RuntimeMode",
-    "RuntimeResultScope",
     "RuntimeResultStatus",
     "SkillPackage",
     "SkillRegistry",

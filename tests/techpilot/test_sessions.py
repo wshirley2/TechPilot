@@ -12,7 +12,7 @@ from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.runtime_control import CancellationToken, RuntimeLimits
 from techpilot.engine.tools.base import Tool
 from techpilot.runtime.bootstrap import RuntimeBootstrap, RuntimeBootstrapInput
-from techpilot.runtime.contracts import RuntimeResultScope, RuntimeResultStatus, TaskRuntimeResult
+from techpilot.runtime.contracts import RuntimeResultStatus, TaskRuntimeResult
 from techpilot.runtime.sessions import SessionEvent, SessionEventSink, SessionStore
 
 
@@ -102,7 +102,6 @@ def test_session_replay_rebuilds_valid_tool_history_and_ignores_partial_tail(tmp
     assert projection.model_messages == projection.messages
     assert projection.total_tokens == 5
     assert projection.last_result == TaskRuntimeResult(
-        scope=RuntimeResultScope.TURN,
         status=RuntimeResultStatus.SUCCEEDED,
         response="README inspected",
     )
@@ -427,30 +426,6 @@ def test_session_replays_messages_after_context_projection_checkpoint(tmp_path):
     ]
 
 
-def test_session_replay_preserves_unified_runtime_identity(tmp_path):
-    source = tmp_path / "source"
-    workspace = tmp_path / "workspace"
-    source.mkdir()
-    workspace.mkdir()
-    store = SessionStore(tmp_path / "sessions")
-
-    projection = store.create(
-        "managed-session",
-        repository_root=workspace,
-        source_repository_root=source,
-        model="fake-model",
-        mode="managed_run",
-        task_id="task-1",
-        run_id="run-1",
-    )
-
-    assert projection.repository_root == workspace.resolve()
-    assert projection.source_repository_root == source.resolve()
-    assert projection.mode == "managed_run"
-    assert projection.task_id == "task-1"
-    assert projection.run_id == "run-1"
-
-
 def test_session_sink_persists_agent_events_and_limits_leave_recoverable_boundary(tmp_path):
     store = SessionStore(tmp_path / "sessions")
     store.create("session-3", repository_root=tmp_path, model="fake-model")
@@ -546,8 +521,7 @@ def test_orchestration_result_overrides_turn_result_without_changing_raw_events(
         "managed-session",
         payload={"content": "agent completed"},
     ))
-    run_result = TaskRuntimeResult(
-        scope=RuntimeResultScope.RUN,
+    turn_result = TaskRuntimeResult(
         status=RuntimeResultStatus.FAILED,
         response="agent completed",
         reason="validation failed",
@@ -555,12 +529,12 @@ def test_orchestration_result_overrides_turn_result_without_changing_raw_events(
     )
     SessionEventSink(store, CallbackEventSink(lambda event: None)).record_result(
         "managed-session",
-        run_result,
+        turn_result,
     )
 
     projection = store.replay("managed-session")
 
-    assert projection.last_result == run_result
+    assert projection.last_result == turn_result
     assert [event.event_type for event in projection.events][-2:] == [
         RuntimeEventType.TURN_COMPLETED.value,
         "runtime_result_recorded",

@@ -9,26 +9,8 @@ from pathlib import Path
 from typing import Any
 
 
-class RuntimeMode(str, Enum):
-    """Supported interaction paths over the same Task Runtime."""
-
-    CHAT = "chat"
-    MANAGED_RUN = "managed_run"
-
-    @property
-    def display_name(self) -> str:
-        return "Chat" if self is RuntimeMode.CHAT else "Managed Run"
-
-
-class RuntimeResultScope(str, Enum):
-    """Execution boundary summarized by one Runtime result."""
-
-    TURN = "turn"
-    RUN = "run"
-
-
 class RuntimeResultStatus(str, Enum):
-    """Terminal outcomes shared by Chat turns and Managed Runs."""
+    """Terminal outcomes for one Chat or Goal turn."""
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -41,93 +23,42 @@ class RuntimeResultStatus(str, Enum):
 class TaskRuntimePaths:
     """Canonical persistence and working-directory boundaries for one Runtime."""
 
-    mode: RuntimeMode
     working_directory: Path
     session_directory: Path
-    run_directory: Path | None = None
 
     def __post_init__(self) -> None:
-        mode = RuntimeMode(self.mode)
         working_directory = self.working_directory.resolve()
         session_directory = self.session_directory.resolve()
-        run_directory = self.run_directory.resolve() if self.run_directory is not None else None
-        if mode is RuntimeMode.CHAT and run_directory is not None:
-            raise ValueError("Chat Runtime cannot have a Managed Run directory")
-        if mode is RuntimeMode.MANAGED_RUN:
-            if run_directory is None:
-                raise ValueError("Managed Run Runtime requires a Run directory")
-            if working_directory != run_directory / "workspace":
-                raise ValueError("Managed Run working directory must be <run>/workspace")
-            if session_directory != run_directory / "sessions":
-                raise ValueError("Managed Run Session directory must be <run>/sessions")
-        object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "working_directory", working_directory)
         object.__setattr__(self, "session_directory", session_directory)
-        object.__setattr__(self, "run_directory", run_directory)
 
     @classmethod
     def for_runtime(
         cls,
-        mode: RuntimeMode,
         working_directory: Path,
         session_directory: Path | None = None,
     ) -> TaskRuntimePaths:
-        """Build the default path layout for Chat or one isolated Managed Run."""
+        """Build the default Session path layout for Chat."""
 
-        runtime_mode = RuntimeMode(mode)
         working = working_directory.resolve()
-        if runtime_mode is RuntimeMode.CHAT:
-            sessions = (
-                session_directory.resolve()
-                if session_directory is not None
-                else working / ".techpilot" / "sessions"
-            )
-            return cls(runtime_mode, working, sessions)
-        run_directory = working.parent
-        sessions = run_directory / "sessions"
-        if session_directory is not None and session_directory.resolve() != sessions:
-            raise ValueError("Managed Run Session directory is fixed at <run>/sessions")
-        return cls(runtime_mode, working, sessions, run_directory)
+        sessions = (
+            session_directory.resolve()
+            if session_directory is not None
+            else working / ".techpilot" / "sessions"
+        )
+        return cls(working, sessions)
 
-    def require_run_directory(self) -> Path:
-        if self.run_directory is None:
-            raise ValueError("This Runtime does not have Managed Run artifacts")
-        return self.run_directory
-
-    @property
-    def run_metadata_path(self) -> Path:
-        return self.require_run_directory() / "run.json"
-
-    @property
-    def events_path(self) -> Path:
-        return self.require_run_directory() / "events.jsonl"
-
-    @property
-    def validation_path(self) -> Path:
-        return self.require_run_directory() / "validation.json"
-
-    @property
-    def patch_path(self) -> Path:
-        return self.require_run_directory() / "changes.patch"
-
-    @property
-    def report_path(self) -> Path:
-        return self.require_run_directory() / "report.md"
-
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, str]:
         return {
-            "mode": self.mode.value,
             "working_directory": str(self.working_directory),
             "session_directory": str(self.session_directory),
-            "run_directory": str(self.run_directory) if self.run_directory is not None else None,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class TaskRuntimeResult:
-    """Immutable terminal result for one turn or one complete managed run."""
+    """Immutable terminal result for one Chat or Goal turn."""
 
-    scope: RuntimeResultScope
     status: RuntimeResultStatus
     response: str = ""
     reason: str | None = None
@@ -137,7 +68,6 @@ class TaskRuntimeResult:
     maximum: int | float | None = None
 
     def __post_init__(self) -> None:
-        scope = RuntimeResultScope(self.scope)
         status = RuntimeResultStatus(self.status)
         if status is RuntimeResultStatus.SUCCEEDED:
             if self.error_type is not None or self.limit is not None:
@@ -152,7 +82,6 @@ class TaskRuntimeResult:
             self.limit is not None or self.actual is not None or self.maximum is not None
         ):
             raise ValueError("Limit facts are only valid for a limit-reached Runtime result")
-        object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "status", status)
 
     @classmethod
@@ -165,19 +94,16 @@ class TaskRuntimeResult:
 
         if event_type == "turn_completed":
             return cls(
-                scope=RuntimeResultScope.TURN,
                 status=RuntimeResultStatus.SUCCEEDED,
                 response=_string(payload.get("content")),
             )
         if event_type == "turn_interrupted":
             return cls(
-                scope=RuntimeResultScope.TURN,
                 status=RuntimeResultStatus.CANCELLED,
                 reason=_string(payload.get("reason")) or "Runtime turn interrupted",
             )
         if event_type == "turn_failed":
             return cls(
-                scope=RuntimeResultScope.TURN,
                 status=RuntimeResultStatus.FAILED,
                 reason=_string(payload.get("error")) or "Runtime turn failed",
                 error_type=_string(payload.get("error_type")) or "RuntimeError",
@@ -185,7 +111,6 @@ class TaskRuntimeResult:
         if event_type == "turn_limit_reached":
             limit = _string(payload.get("limit")) or "tool_rounds"
             return cls(
-                scope=RuntimeResultScope.TURN,
                 status=RuntimeResultStatus.LIMIT_REACHED,
                 response=_string(payload.get("result")),
                 reason=f"Runtime limit reached: {limit}",
@@ -198,7 +123,6 @@ class TaskRuntimeResult:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TaskRuntimeResult:
         return cls(
-            scope=RuntimeResultScope(str(value["scope"])),
             status=RuntimeResultStatus(str(value["status"])),
             response=_string(value.get("response")),
             reason=_optional_string(value.get("reason")),
@@ -210,7 +134,6 @@ class TaskRuntimeResult:
 
     def to_dict(self) -> dict[str, str | int | float | None]:
         return {
-            "scope": self.scope.value,
             "status": self.status.value,
             "response": self.response,
             "reason": self.reason,
@@ -223,54 +146,22 @@ class TaskRuntimeResult:
 
 @dataclass(frozen=True, slots=True)
 class TaskRuntimeIdentity:
-    """Immutable correlation facts for one assembled Task Runtime."""
+    """Immutable identity facts for one Chat Runtime."""
 
-    mode: RuntimeMode
     session_id: str
     working_directory: Path
-    source_repository: Path
-    task_id: str | None = None
-    run_id: str | None = None
 
     def __post_init__(self) -> None:
-        mode = RuntimeMode(self.mode)
         session_id = self.session_id.strip()
-        task_id = self.task_id.strip() if self.task_id is not None else None
-        run_id = self.run_id.strip() if self.run_id is not None else None
         if not session_id:
             raise ValueError("Task Runtime requires a non-empty session id")
-        if self.task_id is not None and not task_id:
-            raise ValueError("Task Runtime task id cannot be empty")
-        if self.run_id is not None and not run_id:
-            raise ValueError("Task Runtime run id cannot be empty")
-        if run_id is not None and task_id is None:
-            raise ValueError("A Runtime run id requires a task id")
-        if mode is RuntimeMode.MANAGED_RUN and run_id is None:
-            raise ValueError("Managed Run Runtime requires task and run ids")
-        object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "session_id", session_id)
-        object.__setattr__(self, "task_id", task_id)
-        object.__setattr__(self, "run_id", run_id)
         object.__setattr__(self, "working_directory", self.working_directory.resolve())
-        object.__setattr__(self, "source_repository", self.source_repository.resolve())
 
-    @property
-    def workspace_path(self) -> Path | None:
-        """Return the isolated workspace when execution is not in the source repository."""
-
-        if self.working_directory == self.source_repository:
-            return None
-        return self.working_directory
-
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, str]:
         return {
-            "mode": self.mode.value,
             "session_id": self.session_id,
-            "task_id": self.task_id,
-            "run_id": self.run_id,
-            "source_repository": str(self.source_repository),
             "working_directory": str(self.working_directory),
-            "workspace_path": str(self.workspace_path) if self.workspace_path else None,
         }
 
 

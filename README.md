@@ -75,6 +75,8 @@ techpilot D:\path\to\your-project
 
 TUI 会展示流式回答、工具调用、Session 状态和待确认操作。写入文件前会先展示 Diff；输入 `1` 允许一次，输入 `2` 在当前会话内允许同类操作，直接回车拒绝。输入 `/help` 查看 Chat 内命令，常用的是 `/status`、`/resume <session-id>` 和 `/exit`。
 
+需要跨多个回合持续推进时，在 Chat 中用 `/goal <目标>` 建立 Goal，先通过 `/goal criterion` 记录可验证的完成条件，再用 `/goal start` 开始。Goal 与普通 Chat 共用工具、权限和 Session；旧的 Plan、Workspace 和 Managed Run 命令已退场。
+
 Session 默认保存在目标仓库的 `.techpilot/sessions/` 下；可以用 `--resume` 恢复，也可以用 `--sessions-dir` 指定其他目录。恢复只重建对话，不会重新执行历史工具调用。
 
 ## 安全边界

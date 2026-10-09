@@ -34,7 +34,6 @@ from techpilot.runtime import (
     RuntimeBootstrapInput,
     TaskRuntime,
 )
-from techpilot.runtime.contracts import RuntimeMode
 from techpilot.runtime.sessions import SessionEvent, SessionStore
 from techpilot.safety.paths import ignored_child_names
 
@@ -643,10 +642,7 @@ def test_runtime_bootstrap_builds_profile_context_and_repository_scoped_agent(tm
     assert runtime.repository == BENCHMARK_ROOT.resolve()
     assert isinstance(runtime, TaskRuntime)
     assert ChatRuntime is TaskRuntime
-    assert runtime.runtime_mode is RuntimeMode.CHAT
-    assert runtime.identity.source_repository == BENCHMARK_ROOT.resolve()
     assert runtime.identity.working_directory == BENCHMARK_ROOT.resolve()
-    assert runtime.identity.workspace_path is None
     assert runtime.profile is not None
     assert runtime.profile.language == "python"
     assert "src/cli_data_tool/cli.py" in runtime.profile.entrypoints
@@ -1174,40 +1170,6 @@ def test_chat_rejection_keeps_high_impact_source_write_unexecuted(tmp_path, monk
     assert len(prompt.requests) == 1
     assert "dependency manifest" in prompt.requests[0].reason
     assert not list(tmp_path.glob("runs/*/workspace"))
-
-
-def test_resuming_legacy_pending_isolation_freezes_it_without_execution(tmp_path, monkeypatch):
-    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
-    session_id = "legacy-isolate"
-    store = SessionStore(tmp_path / "sessions")
-    store.create(session_id, repository_root=tmp_path, model="fake-model")
-    store.append(SessionEvent(
-        event_type="execution_control_assessed",
-        session_id=session_id,
-        turn_id="legacy-turn",
-        tool_call_id="legacy-write",
-        payload={
-            "tool_name": "write_file",
-            "required_control": "isolate",
-            "normalized_summary": {"affected_paths": ["poetry.lock"]},
-            "reasons": [{"code": "lock_file", "message": "Operation modifies a lock file", "evidence": ["paths=poetry.lock"]}],
-        },
-    ))
-    provider = FakeProvider([])
-    output = StringIO()
-    runtime = RuntimeBootstrap(provider_factory=lambda _config: provider).build(RuntimeBootstrapInput(
-        repository=tmp_path,
-        event_sink=TerminalEventSink(Console(file=output, force_terminal=False, color_system=None)),
-        session_directory=store.directory,
-        resume_session_id=session_id,
-    ))
-
-    assert provider.requests == []
-    notices = runtime.consume_recovery_notices()
-    assert len(notices) == 1
-    assert "不会自动恢复、执行或改写为源仓库写入" in notices[0]
-    projection = store.replay(session_id)
-    assert projection.pending_isolation_requests[0]["tool_call_id"] == "legacy-write"
 
 
 def test_chat_commands_and_eof_are_local_and_do_not_call_provider(monkeypatch, tmp_path):

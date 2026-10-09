@@ -1,179 +1,42 @@
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
-from techpilot.advanced.planning import PlanningService
+import pytest
+
 from techpilot.cli import main
 from techpilot.runtime import RuntimeBootstrap
 from techpilot.runtime.sessions import SessionStore
 
-BENCHMARK_ROOT = Path(__file__).parents[2] / "benchmarks" / "cli_data_tool"
+
+def test_help_exposes_chat_and_session_utilities_without_retired_flows(capsys):
+    with pytest.raises(SystemExit) as error:
+        main(["--help"])
+
+    assert error.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "chat" in help_text
+    assert "sessions" in help_text
+    assert "plan" not in help_text
+    assert "workspace" not in help_text
+    assert "profile" not in help_text
 
 
-def test_profile_command_prints_repository_profile(capsys):
-    assert main(["profile", str(BENCHMARK_ROOT)]) == 0
+@pytest.mark.parametrize(("arguments", "message"), [
+    (["run", "approved-plan-v1"], "Managed Run execution was removed"),
+    (["plan", "create"], "Plan and Workspace commands were removed"),
+    (["plans", "list"], "Plan and Workspace commands were removed"),
+    (["workspace", "create"], "Plan and Workspace commands were removed"),
+    (["profile", "."], "standalone profile command was removed"),
+])
+def test_retired_commands_fail_before_execution(arguments, message, capsys):
+    with pytest.raises(SystemExit) as error:
+        main(arguments)
 
-    profile = json.loads(capsys.readouterr().out)
-
-    assert profile["language"] == "python"
-    assert "pyproject.toml" in profile["config_files"]
-    assert "src/cli_data_tool/cli.py" in profile["entrypoints"]
-    assert "tests/test_export.py" in profile["test_files"]
-
-
-def test_profile_command_rejects_missing_repository(capsys):
-    missing = BENCHMARK_ROOT / "missing-repository"
-
-    try:
-        main(["profile", str(missing)])
-    except SystemExit as error:
-        assert error.code == 2
-    else:
-        raise AssertionError("Missing repository should be rejected")
-
-    assert "Repository directory does not exist" in capsys.readouterr().err
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
 
 
-def test_profile_command_can_write_json_file(tmp_path, capsys):
-    output = tmp_path / "repository_profile.json"
-
-    assert main(["profile", str(BENCHMARK_ROOT), "--output", str(output)]) == 0
-
-    profile = json.loads(output.read_text(encoding="utf-8"))
-    assert Path(profile["root"]).resolve() == BENCHMARK_ROOT.resolve()
-    assert "repository_profile.json" in capsys.readouterr().out
-
-
-def test_plan_create_command_prints_a_saved_record_as_json(capsys, tmp_path):
-    assert main(
-        [
-            "plan",
-            "create",
-            str(BENCHMARK_ROOT),
-            "--task",
-            "Add JSON export format and update README",
-            "--acceptance",
-            "Default text output remains unchanged",
-            "--json",
-            "--store-dir",
-            str(tmp_path / "plans"),
-        ]
-    ) == 0
-
-    record = json.loads(capsys.readouterr().out)
-    plan = record["plan"]
-
-    assert plan["summary"] == "Add JSON export format and update README"
-    assert record["status"] == "draft"
-    assert "src/cli_data_tool/cli.py" in plan["read_files"]
-    assert "tests/test_export.py" in plan["modify_files"]
-    assert ["python", "-m", "pytest", "-q"] in plan["validation_commands"]
-    assert "Default text output remains unchanged" in plan["steps"][-1]
-
-
-def test_plan_commands_regenerate_and_approve_by_reference(tmp_path, capsys):
-    store_dir = tmp_path / "plans"
-    arguments = [
-        "plan",
-        "create",
-        str(BENCHMARK_ROOT),
-        "--task",
-        "Add JSON export format",
-        "--name",
-        "json-export",
-        "--store-dir",
-        str(store_dir),
-        "--json",
-    ]
-
-    assert main(arguments) == 0
-    first_record = json.loads(capsys.readouterr().out)
-    assert first_record["reference"] == "json-export-v1"
-
-    assert main(["plan", "show", "json-export-v1", "--store-dir", str(store_dir)]) == 0
-    detail = capsys.readouterr().out
-    assert "Task: Add JSON export format" in detail
-    assert "Files to modify:" in detail
-
-    assert main(
-        [
-            "plan",
-            "regenerate",
-            "json-export-v1",
-            "--store-dir",
-            str(store_dir),
-            "--json",
-        ]
-    ) == 0
-    second_record = json.loads(capsys.readouterr().out)
-    assert second_record["reference"] == "json-export-v2"
-    assert second_record["plan"]["task_id"] == first_record["plan"]["task_id"]
-
-    assert main(["plan", "list", "--store-dir", str(store_dir)]) == 0
-    listing = capsys.readouterr().out
-    assert "REFERENCE" in listing
-    assert "json-export-v2" in listing
-    assert "json-export-v1" in listing
-    assert "task_id" not in listing
-
-    assert main(["plan", "approve", "json-export-v1", "--store-dir", str(store_dir)]) == 0
-    approved = capsys.readouterr().out
-    assert "Plan approved: json-export-v1" in approved
-    assert "Status: approved" in approved
-
-
-def test_plans_alias_and_legacy_create_spelling_remain_available(tmp_path, capsys):
-    assert main(
-        [
-            "plan",
-            str(BENCHMARK_ROOT),
-            "--task",
-            "Add JSON export format",
-            "--json",
-            "--store-dir",
-            str(tmp_path / "plans"),
-        ]
-    ) == 0
-    capsys.readouterr()
-
-    assert main(["plans", "list", "--store-dir", str(tmp_path / "plans")]) == 0
-    assert "REFERENCE" in capsys.readouterr().out
-
-
-def test_plan_chat_command_builds_the_conversational_session(tmp_path, monkeypatch):
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    captured = {}
-
-    class FakePlanChatSession:
-        def __init__(self, selected_repository, **kwargs):
-            captured["repository"] = selected_repository
-            captured["kwargs"] = kwargs
-
-        def run(self):
-            return 7
-
-    monkeypatch.setattr("techpilot.cli.PlanChatSession", FakePlanChatSession)
-
-    result = main([
-        "plan",
-        "chat",
-        str(repository),
-        "--store-dir",
-        str(tmp_path / "plans"),
-        "--runs-dir",
-        str(tmp_path / "runs"),
-        "--max-provider-calls",
-        "3",
-    ])
-
-    assert result == 7
-    assert captured["repository"] == repository
-    assert isinstance(captured["kwargs"]["planning_service"], PlanningService)
-    assert captured["kwargs"]["limits"].max_provider_calls == 3
-
-
-def test_default_chat_entry_does_not_inject_an_embedded_plan_session(tmp_path, monkeypatch):
+def test_default_chat_entry_uses_the_shared_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
     repository = tmp_path / "repository"
     repository.mkdir()
@@ -185,7 +48,7 @@ def test_default_chat_entry_does_not_inject_an_embedded_plan_session(tmp_path, m
     class FakeChatSession:
         def __init__(self, runtime, **kwargs):
             captured["runtime"] = runtime
-            captured["plan_session"] = kwargs.get("plan_session")
+            captured["kwargs"] = kwargs
 
         def run(self):
             return 9
@@ -197,17 +60,13 @@ def test_default_chat_entry_does_not_inject_an_embedded_plan_session(tmp_path, m
     result = main([
         "chat",
         str(repository),
-        "--store-dir",
-        str(tmp_path / "plans"),
-        "--runs-dir",
-        str(tmp_path / "runs"),
         "--max-tool-rounds",
         "4",
     ])
 
     assert result == 9
     assert captured["runtime"].repository == repository.resolve()
-    assert captured["plan_session"] is None
+    assert "plan_session" not in captured["kwargs"]
 
 
 def test_chat_tui_option_uses_the_same_runtime_bootstrap(tmp_path, monkeypatch):

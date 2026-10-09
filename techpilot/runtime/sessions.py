@@ -124,11 +124,7 @@ class SessionProjection:
     session_id: str
     repository_root: Path | None = None
     model: str | None = None
-    mode: str = "chat"
     status: str = "active"
-    task_id: str | None = None
-    run_id: str | None = None
-    source_repository_root: Path | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
     model_messages: list[dict[str, Any]] = field(default_factory=list)
     events: list[SessionEvent] = field(default_factory=list)
@@ -138,8 +134,6 @@ class SessionProjection:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     last_result: TaskRuntimeResult | None = None
-    pending_isolation_requests: list[dict[str, Any]] = field(default_factory=list)
-    review_artifact_paths: list[str] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -163,10 +157,6 @@ class SessionStore:
         *,
         repository_root: Path,
         model: str,
-        mode: str = "chat",
-        task_id: str | None = None,
-        run_id: str | None = None,
-        source_repository_root: Path | None = None,
     ) -> SessionProjection:
         safe_id = self._normalize_session_id(session_id)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -180,10 +170,6 @@ class SessionStore:
                 payload={
                     "repository_root": str(repository_root.resolve()),
                     "model": model,
-                    "mode": mode,
-                    "task_id": task_id,
-                    "run_id": run_id,
-                    "source_repository_root": str((source_repository_root or repository_root).resolve()),
                 },
             )
         )
@@ -239,15 +225,6 @@ class SessionStore:
                 root = payload.get("repository_root")
                 projection.repository_root = Path(root).resolve() if isinstance(root, str) else None
                 projection.model = payload.get("model") if isinstance(payload.get("model"), str) else None
-                projection.mode = payload.get("mode") if isinstance(payload.get("mode"), str) else "chat"
-                projection.task_id = payload.get("task_id") if isinstance(payload.get("task_id"), str) else None
-                projection.run_id = payload.get("run_id") if isinstance(payload.get("run_id"), str) else None
-                source_root = payload.get("source_repository_root")
-                projection.source_repository_root = (
-                    Path(source_root).resolve()
-                    if isinstance(source_root, str)
-                    else projection.repository_root
-                )
             elif event.event_type == "session_resumed":
                 projection.status = "active"
             elif event.event_type == "session_model_changed":
@@ -300,36 +277,6 @@ class SessionStore:
                             },
                         }
                         order.append(event.tool_call_id)
-            elif event.event_type == RuntimeEventType.EXECUTION_CONTROL_ASSESSED.value:
-                if payload.get("required_control") == "isolate":
-                    projection.pending_isolation_requests.append({
-                        "task_id": payload.get("task_id"),
-                        "session_id": event.session_id,
-                        "turn_id": event.turn_id,
-                        "round_index": event.round_index,
-                        "tool_call_id": event.tool_call_id,
-                        "tool_name": payload.get("tool_name"),
-                        "summary": payload.get("normalized_summary"),
-                        "reasons": copy.deepcopy(payload.get("reasons", [])),
-                    })
-            elif event.event_type == "isolation_pending":
-                tool_call_id = payload.get("tool_call_id")
-                for index, request in enumerate(projection.pending_isolation_requests):
-                    if request.get("tool_call_id") == tool_call_id:
-                        projection.pending_isolation_requests[index] = copy.deepcopy(payload)
-                        break
-            elif event.event_type in {"isolation_upgrade_completed", "isolation_cancelled"}:
-                tool_call_id = payload.get("tool_call_id")
-                projection.pending_isolation_requests = [
-                    request
-                    for request in projection.pending_isolation_requests
-                    if request.get("tool_call_id") != tool_call_id
-                ]
-                if event.event_type == "isolation_upgrade_completed":
-                    for key in ("patch", "validation", "report", "events"):
-                        value = payload.get(key)
-                        if isinstance(value, str) and value not in projection.review_artifact_paths:
-                            projection.review_artifact_paths.append(value)
             elif event.event_type == RuntimeEventType.TOOL_COMPLETED.value:
                 key = (event.turn_id, event.round_index)
                 calls = pending_calls.get(key, [])

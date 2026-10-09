@@ -90,11 +90,8 @@ class RepositoryToolExecutor:
         self,
         repository_root: str | Path,
         permission_manager: PermissionManager | None = None,
-        *,
-        task_id: str | None = None,
     ):
         self.repository_root = Path(repository_root).resolve()
-        self.task_id = task_id
         self.permission_manager = permission_manager or PermissionManager(
             ChatPermissionPolicy(),
             DenyPermissionPrompt(),
@@ -112,11 +109,6 @@ class RepositoryToolExecutor:
 
         with self._turn_stop_lock:
             self._turn_stop_message = None
-
-    def set_task_id(self, task_id: str | None) -> None:
-        """Refresh the optional Chat task correlation after Session resume."""
-
-        self.task_id = task_id
 
     def consume_turn_stop_message(self) -> str | None:
         """Return and clear a user-denial request to end the current turn."""
@@ -542,7 +534,6 @@ class RepositoryToolExecutor:
             RuntimeEventType.EXECUTION_CONTROL_ASSESSED,
             tool_call_id=tool_call_id,
             payload={
-                "task_id": self.task_id,
                 "tool_name": request.tool_name,
                 "normalized_summary": _control_summary(request),
                 "required_control": assessment.required_control.value,

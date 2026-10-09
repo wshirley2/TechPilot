@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "techpilot"
 version = "0.1.0"
-description = "A repo-aware CLI coding agent with Chat and Managed Run workflows."
+description = "A repo-aware CLI coding agent with recoverable Chat and Goal workflows."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

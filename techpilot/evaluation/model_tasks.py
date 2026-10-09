@@ -521,7 +521,6 @@ class ModelEvaluationRunner:
                 permission_prompt=_CardPermissionPrompt(card.allowed_paths),
                 session_directory=session_directory,
                 limits=limits,
-                task_id=f"{card.id}-{attempt}",
             ))
             responses: list[str] = []
             for prompt in card.prompts:
