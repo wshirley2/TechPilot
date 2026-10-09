@@ -77,6 +77,38 @@ TUI 会展示流式回答、工具调用、Session 状态和待确认操作。�
 
 需要跨多个回合持续推进时，在 Chat 中用 `/goal <目标>` 建立 Goal，先通过 `/goal criterion` 记录可验证的完成条件，再用 `/goal start` 开始。Goal 与普通 Chat 共用工具、权限和 Session；旧的 Plan、Workspace 和 Managed Run 命令已退场。
 
+若要给 Goal 记录阶段计划，先在目标仓库中保存一个 JSON 文件，例如 `goal-plan.json`：
+
+```json
+{
+  "reason": "首次拆分目标",
+  "steps": [
+    {
+      "id": "inspect",
+      "goal": "定位并说明问题",
+      "dependencies": [],
+      "expected_output": "问题位置和复现说明",
+      "work_scope": ["src/", "README.md"],
+      "evidence": "相关文件位置与复现记录",
+      "check": "人工核对问题能否复现",
+      "next_action": "先阅读相关代码并记录复现步骤"
+    },
+    {
+      "id": "fix",
+      "goal": "修复已定位的问题",
+      "dependencies": ["inspect"],
+      "expected_output": "修复后的代码",
+      "work_scope": ["src/"],
+      "evidence": "代码差异与验证结果",
+      "check": "核对差异和预先约定的验收条件",
+      "next_action": "根据定位结果修改代码"
+    }
+  ]
+}
+```
+
+在普通文本 Chat 中运行 `/goal plan load goal-plan.json` 会把计划写入 Goal 的 Task 事件；此后可修改文件并再次执行该命令，形成保留历史的新版计划。运行 `/goal plan show` 查看阶段契约，`/goal plan select inspect` 选择一个无阻塞的阶段，再执行 `/goal start`。恢复原 Session 并运行 `/goal resume <goal-id>` 后，`/goal status` 会显示计划版本、当前阶段、依赖阻塞和下一步。现阶段每个已选阶段最多执行一回合；checkpoint 后显示 `needs_evaluation`，不会自动把阶段判定为完成。阶段证据核验与自动推进属于后续切片。
+
 Session 默认保存在目标仓库的 `.techpilot/sessions/` 下；可以用 `--resume` 恢复，也可以用 `--sessions-dir` 指定其他目录。恢复只重建对话，不会重新执行历史工具调用。
 
 ## 安全边界

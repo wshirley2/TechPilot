@@ -137,9 +137,15 @@ class LongTaskWorkflow:
             )
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot run: {task.status.value}")
-        prior_session_events = len(self.runtime.session_store.replay(self.runtime.agent.session_id).events)
         self._completion_proposal = None
         with self.store.acquire_lease(self.task_id):
+            task = self.store.replay(self.task_id)
+            self._require_effect_recovery_clear(task)
+            task = self.store.replay(self.task_id)
+            if task.status is not LongTaskStatus.RUNNING:
+                raise LongTaskStateError(f"Long Task cannot run: {task.status.value}")
+            self._require_selected_step_ready(task)
+            prior_session_events = len(self.runtime.session_store.replay(self.runtime.agent.session_id).events)
             with self.runtime.goal_scope(
                 self._goal_context(task),
                 tools=(GoalCompletionTool(self._submit_completion_proposal),),
@@ -183,6 +189,19 @@ class LongTaskWorkflow:
                 f"- {LongTaskWorkflow._criterion_description(criterion)}"
                 for criterion in task.active_completion_criteria
             )
+        if task.plan is not None:
+            lines.extend(("", f"## User-authored stage plan v{task.plan.version}"))
+            step = task.plan.step(task.selected_step_id) if task.selected_step_id else None
+            if step is not None:
+                lines.extend((
+                    f"- Current stage: {step.step_id} — {step.goal}",
+                    f"- Expected output: {step.expected_output}",
+                    f"- Work scope (descriptive, not permission): {', '.join(step.work_scope)}",
+                    f"- Expected evidence: {step.evidence}",
+                    f"- Acceptance check: {step.check}",
+                    f"- Next action: {step.next_action}",
+                    "- Work only on this stage. A checkpoint or your own completion claim does not verify the stage.",
+                ))
         lines.extend((
             "",
             "## Completion proposal protocol",
@@ -191,6 +210,18 @@ class LongTaskWorkflow:
             "- This is only a proposal. It does not complete the Goal; Runtime verifies the referenced raw Session events and the user must still run /goal complete.",
         ))
         return "\n".join(lines)
+
+    @staticmethod
+    def _require_selected_step_ready(task: LongTaskProjection) -> None:
+        if task.plan is None:
+            return
+        if task.selected_step_id is None:
+            raise LongTaskStateError("Select a ready Goal plan step before running another turn")
+        step = task.plan.step(task.selected_step_id)
+        if step is None or step.dependencies:
+            raise LongTaskStateError("The selected Goal plan step is missing or blocked by dependencies")
+        if task.selected_step_needs_evaluation:
+            raise LongTaskStateError("The selected Goal plan step has a checkpoint and needs evaluation before another turn")
 
     def finish(self, *, result: str = "", require_completion_claim: bool = True) -> LongTaskProjection:
         """Explicitly mark a fully checkpointed Task complete after its final step."""

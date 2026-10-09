@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from uuid import uuid4
 
+from .goal_plans import GoalPlan
 from .sessions import SessionStore
 
 LONG_TASK_SCHEMA_VERSION = 1
@@ -239,6 +240,9 @@ class LongTaskProjection:
     completion_criteria: dict[str, TaskCompletionCriterion] = field(default_factory=dict)
     completion_verifications: list[TaskCompletionVerification] = field(default_factory=list)
     checkpoints: list[TaskCheckpoint] = field(default_factory=list)
+    plans: list[GoalPlan] = field(default_factory=list)
+    selected_step_id: str | None = None
+    selected_checkpoint_count: int | None = None
     warnings: list[str] = field(default_factory=list)
     recovery_blockers: list[str] = field(default_factory=list)
 
@@ -284,6 +288,23 @@ class LongTaskProjection:
     @property
     def last_completion_verification(self) -> TaskCompletionVerification | None:
         return self.completion_verifications[-1] if self.completion_verifications else None
+
+    @property
+    def plan(self) -> GoalPlan | None:
+        return self.plans[-1] if self.plans else None
+
+    @property
+    def ready_step_ids(self) -> tuple[str, ...]:
+        plan = self.plan
+        if plan is None or self.selected_step_needs_evaluation:
+            return ()
+        # G1 has no stage evaluator. No dependency may be treated as verified
+        # merely because a Runtime turn produced a checkpoint.
+        return tuple(step.step_id for step in plan.steps if not step.dependencies and step.step_id != self.selected_step_id)
+
+    @property
+    def selected_step_needs_evaluation(self) -> bool:
+        return self.selected_step_id is not None and self.selected_checkpoint_count is not None and len(self.checkpoints) > self.selected_checkpoint_count
 
 
 @dataclass
@@ -377,17 +398,66 @@ class LongTaskStore:
     def start(self, task_id: str, *, reason: str) -> LongTaskProjection:
         """Leave explicit Goal setup only after the user defines an acceptance check."""
 
-        projection = self.replay(task_id)
-        if projection.status is not LongTaskStatus.SETUP:
-            raise LongTaskStateError(f"Only setup Goals can start, got: {projection.status.value}")
-        if not projection.active_completion_criteria:
-            raise LongTaskStateError("Goal setup requires at least one Runtime completion criterion before starting")
-        self.append(LongTaskEvent(
-            task_id=projection.task_id,
-            event_type="task_started",
-            payload={"reason": reason.strip() or "started after acceptance setup"},
-        ))
-        return self.replay(projection.task_id)
+        with self.acquire_lease(task_id):
+            projection = self.replay(task_id)
+            if projection.status is not LongTaskStatus.SETUP:
+                raise LongTaskStateError(f"Only setup Goals can start, got: {projection.status.value}")
+            if not projection.active_completion_criteria:
+                raise LongTaskStateError("Goal setup requires at least one Runtime completion criterion before starting")
+            if projection.plan is not None and projection.selected_step_id is None:
+                raise LongTaskStateError("Select a ready Goal plan step before starting")
+            self.append(LongTaskEvent(
+                task_id=projection.task_id,
+                event_type="task_started",
+                payload={"reason": reason.strip() or "started after acceptance setup"},
+            ))
+            return self.replay(projection.task_id)
+
+    def record_goal_plan(self, task_id: str, document: dict[str, Any]) -> LongTaskProjection:
+        """Persist a user-authored plan or revision under the Task lease."""
+
+        with self.acquire_lease(task_id):
+            projection = self.replay(task_id)
+            self._require_plan_editable(projection)
+            if not isinstance(document, dict) or set(document) != {"reason", "steps"}:
+                raise ValueError("Goal plan document requires reason and steps")
+            next_version = len(projection.plans) + 1
+            plan = GoalPlan.from_payload({**document, "version": next_version})
+            if projection.selected_step_id is not None:
+                old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
+                if plan.step(projection.selected_step_id) != old_step:
+                    raise LongTaskStateError("A revision must retain the selected step unchanged")
+            self.append(LongTaskEvent(
+                task_id=projection.task_id,
+                event_type="plan_recorded" if next_version == 1 else "plan_revised",
+                payload=plan.to_payload(),
+            ))
+            return self.replay(projection.task_id)
+
+    def select_goal_step(self, task_id: str, step_id: str) -> LongTaskProjection:
+        """Explicitly choose one ready stage; selection never executes it."""
+
+        with self.acquire_lease(task_id):
+            projection = self.replay(task_id)
+            self._require_plan_editable(projection)
+            plan = projection.plan
+            if plan is None:
+                raise LongTaskStateError("Goal has no recorded stage plan")
+            step = plan.step(step_id)
+            if step is None:
+                raise LongTaskStateError(f"Unknown Goal plan step: {step_id}")
+            if step.dependencies:
+                raise LongTaskStateError(f"Goal plan step {step_id} is blocked by unverified dependencies: {', '.join(step.dependencies)}")
+            if projection.selected_step_id == step_id:
+                return projection
+            if projection.selected_step_needs_evaluation:
+                raise LongTaskStateError("The selected step has a checkpoint and needs evaluation before another stage can be selected")
+            self.append(LongTaskEvent(
+                task_id=projection.task_id,
+                event_type="step_selected",
+                payload={"plan_version": plan.version, "step_id": step_id},
+            ))
+            return self.replay(projection.task_id)
 
     def plan_action(
         self,
@@ -887,7 +957,16 @@ class LongTaskStore:
             if event.task_id != safe_id:
                 projection.warnings.append("Ignored Task event for a different task id")
                 continue
-            self._apply_event(projection, event)
+            if event.event_type in {"plan_recorded", "plan_revised", "step_selected"}:
+                try:
+                    self._apply_event(projection, event)
+                except (TypeError, ValueError) as error:
+                    projection.warnings.append(f"Invalid Goal plan event: {error}")
+                    projection.recovery_blockers.append("goal_plan_event_invalid")
+                    projection.status = LongTaskStatus.RECOVERY_REQUIRED
+                    break
+            else:
+                self._apply_event(projection, event)
         if any(warning.startswith("Ignored invalid long Task event") for warning in warnings):
             projection.recovery_blockers.append("event_log_invalid")
             projection.status = LongTaskStatus.RECOVERY_REQUIRED
@@ -919,6 +998,31 @@ class LongTaskStore:
             projection.budget = LongTaskBudget.from_dict(budget)
             initial_status = payload.get("initial_status", LongTaskStatus.RUNNING.value)
             projection.status = LongTaskStatus(initial_status)
+        elif event.event_type in {"plan_recorded", "plan_revised"}:
+            self._require_plan_editable(projection)
+            plan = GoalPlan.from_payload(payload)
+            expected_version = len(projection.plans) + 1
+            expected_type = "plan_recorded" if expected_version == 1 else "plan_revised"
+            if event.event_type != expected_type or plan.version != expected_version:
+                raise LongTaskStateError("Goal plan versions must be sequential")
+            if projection.selected_step_id is not None:
+                old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
+                if plan.step(projection.selected_step_id) != old_step:
+                    raise LongTaskStateError("Goal plan revision changed the selected step")
+            projection.plans.append(plan)
+        elif event.event_type == "step_selected":
+            self._require_plan_editable(projection)
+            plan = projection.plan
+            if plan is None or _required_int(payload, "plan_version") != plan.version:
+                raise LongTaskStateError("Goal step selection must reference the current plan")
+            step_id = _required_string(payload, "step_id")
+            step = plan.step(step_id)
+            if step is None or step.dependencies:
+                raise LongTaskStateError("Goal step selection references a missing or blocked stage")
+            if projection.selected_step_needs_evaluation:
+                raise LongTaskStateError("Goal step selection bypassed pending evaluation")
+            projection.selected_step_id = step_id
+            projection.selected_checkpoint_count = len(projection.checkpoints)
         elif event.event_type == "action_planned":
             action_id = _required_string(payload, "action_id")
             dependencies = payload.get("dependencies", [])
@@ -1115,6 +1219,13 @@ class LongTaskStore:
     def _require_not_terminal(projection: LongTaskProjection) -> None:
         if projection.status in {LongTaskStatus.CANCELLED, LongTaskStatus.SUCCEEDED, LongTaskStatus.FAILED}:
             raise LongTaskStateError(f"Task is terminal: {projection.status.value}")
+
+    @staticmethod
+    def _require_plan_editable(projection: LongTaskProjection) -> None:
+        if projection.status not in {LongTaskStatus.SETUP, LongTaskStatus.RUNNING, LongTaskStatus.PAUSED}:
+            raise LongTaskStateError(f"Goal plan cannot change while Task is {projection.status.value}")
+        if projection.recovery_blockers or projection.ambiguous_effect_ids:
+            raise LongTaskStateError("Goal plan cannot change before recovery is reconciled")
 
     def _validate_session_cursor(self, projection: LongTaskProjection, session_event_cursor: str) -> str:
         if self.session_store is None:

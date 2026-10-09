@@ -382,6 +382,7 @@ class ChatSession:
             "/goal criterion <file-exists|file-contains|test-command> ...  Add a Runtime completion check",
             "/goal criterion remove <id>  Retire one completion check",
             "/goal criteria  List Runtime completion checks",
+            "/goal plan [show|load <repo-relative-json>|select <step-id>]  Record and inspect a bounded stage plan",
             "/goal recover <tool-call-id> <completed|not-executed> <reason>  Record an operator-verified effect outcome",
             "/clear   Clear conversation messages",
         ]
@@ -498,6 +499,9 @@ class ChatSession:
         if normalized == "criteria" and not separator:
             self._show_goal_criteria()
             return
+        if normalized == "plan":
+            self._goal_plan(argument)
+            return
         if normalized == "recover":
             self._recover_goal_effect(argument)
             return
@@ -607,7 +611,114 @@ class ChatSession:
         table.add_row("Pending actions", str(len(task.pending_action_ids)))
         table.add_row("Completed effects", str(len(task.completed_effect_ids)))
         table.add_row("Checkpoints", str(len(task.checkpoints)))
+        if task.recovery_blockers:
+            table.add_row("Recovery blockers", ", ".join(task.recovery_blockers))
+        if task.ambiguous_effect_ids:
+            table.add_row("Unknown effects", ", ".join(task.ambiguous_effect_ids))
+        plan = task.plan
+        if plan is None:
+            table.add_row("Stage plan", "unplanned")
+            next_action = (
+                "Reconcile Goal recovery before another turn"
+                if task.status is LongTaskStatus.RECOVERY_REQUIRED or task.recovery_blockers or task.ambiguous_effect_ids
+                else "Record a stage plan with /goal plan load <json-file>, or continue the legacy Goal manually"
+            )
+            table.add_row("Next action", next_action)
+        else:
+            table.add_row("Stage plan", f"v{plan.version} ({len(plan.steps)} stages)")
+            table.add_row("Verified stages", "0 (stage evaluation begins in G2)")
+            selected = plan.step(task.selected_step_id) if task.selected_step_id else None
+            table.add_row("Pending stages", str(len(plan.steps) - (1 if selected else 0)))
+            if selected is None:
+                current = "none selected"
+            elif task.selected_step_needs_evaluation:
+                current = f"{selected.step_id} (needs_evaluation)"
+            else:
+                current = f"{selected.step_id} (active)"
+            table.add_row("Current stage", current)
+            table.add_row("Ready stages", ", ".join(task.ready_step_ids) or "none")
+            blocked = [
+                f"{step.step_id} ← {', '.join(step.dependencies)}"
+                for step in plan.steps if step.dependencies
+            ]
+            table.add_row("Blocked dependencies", "; ".join(blocked) or "none")
+            if task.recovery_blockers or task.ambiguous_effect_ids or task.status is LongTaskStatus.RECOVERY_REQUIRED:
+                next_action = "Inspect recovery blockers and reconcile unknown effects before continuing"
+            elif task.selected_step_needs_evaluation and selected is not None:
+                next_action = f"Review {selected.evidence} using {selected.check}; do not rerun the turn. Automatic stage evaluation begins in G2"
+            elif selected is not None:
+                next_action = selected.next_action
+            elif task.ready_step_ids:
+                next_action = f"Select a stage with /goal plan select {task.ready_step_ids[0]}"
+            else:
+                next_action = "No stage is ready; inspect the dependency contract"
+            table.add_row("Next action", next_action)
         self.console.print(table)
+
+    def _goal_plan(self, value: str) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        command, separator, argument = value.partition(" ")
+        normalized = command.lower()
+        argument = argument.strip()
+        if not value or (normalized == "show" and not separator):
+            self._show_goal_plan()
+            return
+        if normalized == "select" and argument:
+            try:
+                task = workflow.store.select_goal_step(workflow.task_id, argument)
+            except (OSError, LongTaskStateError, TypeError, ValueError) as error:
+                self.console.print(f"[red]Could not select Goal stage: {error}[/red]")
+                return
+            self.console.print(f"[green]Selected Goal stage: {task.selected_step_id}[/green]")
+            self._show_goal_status()
+            return
+        if normalized == "load" and argument:
+            try:
+                repository = self.runtime.repository.resolve()
+                source = (repository / argument).resolve(strict=True)
+                if not source.is_relative_to(repository) or not source.is_file():
+                    raise ValueError("Goal plan file must be a file inside the repository")
+                if source.stat().st_size > 64_000:
+                    raise ValueError("Goal plan file is too large")
+                document = json.loads(source.read_text(encoding="utf-8"))
+                task = workflow.store.record_goal_plan(workflow.task_id, document)
+            except (OSError, LongTaskStateError, TypeError, ValueError) as error:
+                self.console.print(f"[red]Could not load Goal plan: {error}[/red]")
+                return
+            self.console.print(f"[green]Recorded Goal stage plan v{task.plan.version}[/green]")
+            self._show_goal_status()
+            return
+        self.console.print("[yellow]Usage: /goal plan [show|load <repo-relative-json>|select <step-id>][/yellow]")
+
+    def _show_goal_plan(self) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        try:
+            task = workflow.store.replay(workflow.task_id)
+        except (OSError, ValueError) as error:
+            self.console.print(f"[red]Could not read Goal plan: {error}[/red]")
+            return
+        plan = task.plan
+        if plan is None:
+            self.console.print("[dim]Goal is unplanned. Use /goal plan load <repo-relative-json>.[/dim]")
+            return
+        self.console.print(f"[cyan]Goal stage plan v{plan.version}[/cyan] — {plan.reason}")
+        if len(task.plans) > 1:
+            self.console.print("History: " + "; ".join(f"v{item.version}: {item.reason}" for item in task.plans))
+        for step in plan.steps:
+            if step.step_id == task.selected_step_id:
+                state = "needs_evaluation" if task.selected_step_needs_evaluation else "active"
+            else:
+                state = "blocked" if step.dependencies else "pending (awaiting evaluation)" if task.selected_step_needs_evaluation else "pending (ready)"
+            self.console.print(f"[bold]{step.step_id}[/bold] ({state}): {step.goal}")
+            self.console.print(f"  Depends on: {', '.join(step.dependencies) or 'none'}")
+            self.console.print(f"  Output: {step.expected_output}")
+            self.console.print(f"  Scope: {', '.join(step.work_scope)}")
+            self.console.print(f"  Evidence: {step.evidence}; check: {step.check}")
+            self.console.print(f"  Next: {step.next_action}")
 
     def _record_goal_constraint(self, text: str) -> None:
         if not text:

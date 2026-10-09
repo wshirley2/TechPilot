@@ -35,6 +35,7 @@ from .extensions import (
     ToolRequest,
 )
 from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
+from .goal_plans import GoalPlan, GoalStep
 from .long_task_workflow import LongTaskRecoveryRequired, LongTaskWorkflow, LongTaskWorkflowResult
 from .long_tasks import (
     CompletionCriterionKind,
@@ -75,6 +76,8 @@ __all__ = [
     "EvaluationInterface",
     "GoalCompletionProposal",
     "GoalCompletionTool",
+    "GoalPlan",
+    "GoalStep",
     "LongTaskAction",
     "LongTaskActionStatus",
     "LongTaskBudget",
