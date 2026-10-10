@@ -365,6 +365,7 @@ def test_unproven_control_outcome_keeps_effect_started(tmp_path, case):
         effect=ToolEffect.WRITE,
     )
     if case == "request_after_start":
+        assert store.replay("session-1").entries["write-1"].request_event_id is None
         sessions.append(request)
     if case not in {"missing", "before_start"}:
         sessions.append(control)
@@ -373,6 +374,42 @@ def test_unproven_control_outcome_keeps_effect_started(tmp_path, case):
 
     assert store.verify_non_execution("session-1", "write-1") is None
     assert store.replay("session-1").entries["write-1"].state is EffectJournalState.STARTED
+
+
+def test_legacy_started_effect_without_request_marker_stays_unknown(tmp_path):
+    sessions = SessionStore(tmp_path / "sessions")
+    sessions.create("session-1", repository_root=tmp_path, model="fake")
+    request = SessionEvent(
+        event_type=RuntimeEventType.TOOL_REQUESTED.value,
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_call_id="write-1",
+        payload={"tool_name": "marker_write", "arguments": {"value": "one"}},
+    )
+    sessions.append(request)
+    store = EffectJournalStore.for_session_directory(sessions.directory)
+    store._append({
+        "schema_version": 2,
+        "event_type": "effect_started",
+        "session_id": "session-1",
+        "tool_call_id": "write-1",
+        "tool_name": "marker_write",
+        "arguments": {"value": "one"},
+        "effect": "write",
+        "created_at": request.created_at,
+    })
+    sessions.append(SessionEvent(
+        event_type=RuntimeEventType.EXECUTION_CONTROL_ASSESSED.value,
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_call_id="write-1",
+        payload={"tool_name": "marker_write", "required_control": "block"},
+    ))
+
+    assert store.verify_non_execution("session-1", "write-1") is None
+    entry = store.replay("session-1").entries["write-1"]
+    assert entry.request_event_id is None
+    assert entry.state is EffectJournalState.STARTED
 
 
 def test_forged_verification_event_cannot_unlock_an_effect(tmp_path):

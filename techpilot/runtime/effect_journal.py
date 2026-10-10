@@ -101,6 +101,7 @@ class EffectJournalEntry:
     result: str | None = None
     tool_status: ToolStatus | None = None
     started_at: str = ""
+    request_event_id: str | None = None
     completed_at: str | None = None
     reconciliation_reason: str | None = None
     verification: EffectVerification | None = None
@@ -181,6 +182,9 @@ class EffectJournalStore:
                 raise ValueError("Tool Call ID is already bound to a different effect")
             return existing
         created_at = datetime.now(timezone.utc).isoformat()
+        request_event_id = self._durable_request_event_id(
+            safe_session, safe_call, tool_name, arguments,
+        )
         entry = EffectJournalEntry(
             session_id=safe_session,
             tool_call_id=safe_call,
@@ -188,6 +192,7 @@ class EffectJournalStore:
             arguments=dict(arguments),
             effect=ToolEffect(effect),
             started_at=created_at,
+            request_event_id=request_event_id,
         )
         self._append({
             "schema_version": _SCHEMA_VERSION,
@@ -197,6 +202,7 @@ class EffectJournalStore:
             "tool_name": tool_name,
             "arguments": dict(arguments),
             "effect": entry.effect.value,
+            "request_event_id": request_event_id,
             "created_at": created_at,
         })
         return entry
@@ -231,6 +237,7 @@ class EffectJournalStore:
             result=str(outcome),
             tool_status=outcome.status,
             started_at=entry.started_at,
+            request_event_id=entry.request_event_id,
             completed_at=completed_at,
         )
 
@@ -270,6 +277,7 @@ class EffectJournalStore:
                 result=str(result),
                 tool_status=result.status,
                 started_at=entry.started_at,
+                request_event_id=entry.request_event_id,
                 completed_at=completed_at,
                 verification=verification,
             )
@@ -365,7 +373,35 @@ class EffectJournalStore:
             },
         }
 
+    def _durable_request_event_id(
+        self, session_id: str, tool_call_id: str, tool_name: str, arguments: dict[str, Any],
+    ) -> str | None:
+        """Capture a request already persisted before effect_started is appended."""
+
+        try:
+            session = self.session_store.replay(session_id)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return None
+        if any(
+            not warning.startswith("Excluded incomplete tool round from model history:")
+            for warning in session.warnings
+        ):
+            return None
+        requests = [
+            event for event in session.events
+            if event.event_type == RuntimeEventType.TOOL_REQUESTED.value
+            and event.tool_call_id == tool_call_id
+        ]
+        if len(requests) != 1 or (
+            requests[0].payload.get("tool_name") != tool_name
+            or requests[0].payload.get("arguments") != dict(arguments)
+        ):
+            return None
+        return requests[0].event_id
+
     def _control_block_verification(self, entry: EffectJournalEntry) -> EffectVerification | None:
+        if entry.request_event_id is None:
+            return None
         try:
             session = self.session_store.replay(entry.session_id)
         except (OSError, TypeError, ValueError):
@@ -395,6 +431,7 @@ class EffectJournalStore:
         control_index, control = controls[0]
         if (
             request_index >= control_index
+            or request.event_id != entry.request_event_id
             or request.turn_id != control.turn_id
             or request.round_index != control.round_index
             or request.payload.get("tool_name") != entry.tool_name
@@ -510,6 +547,11 @@ class EffectJournalStore:
             effect = value.get("effect")
             if not isinstance(tool_name, str) or not isinstance(arguments, dict) or not isinstance(effect, str):
                 raise TypeError("Invalid effect_started event")
+            request_event_id = value.get("request_event_id")
+            if request_event_id is not None and (
+                not isinstance(request_event_id, str) or not request_event_id.strip()
+            ):
+                raise TypeError("Invalid effect_started request_event_id")
             projection.entries[tool_call_id] = EffectJournalEntry(
                 session_id=projection.session_id,
                 tool_call_id=tool_call_id,
@@ -517,6 +559,7 @@ class EffectJournalStore:
                 arguments=dict(arguments),
                 effect=ToolEffect(effect),
                 started_at=str(value.get("created_at", "")),
+                request_event_id=request_event_id,
             )
             return
         event_type = value.get("event_type")
@@ -581,6 +624,7 @@ class EffectJournalStore:
             result=result,
             tool_status=terminal_status,
             started_at=prior.started_at,
+            request_event_id=prior.request_event_id,
             completed_at=str(value.get("created_at", "")),
             reconciliation_reason=reconciliation_reason,
             verification=verification,

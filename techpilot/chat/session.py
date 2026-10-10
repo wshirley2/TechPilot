@@ -451,9 +451,17 @@ class ChatSession:
                 return "Goal 有一项待确认修订。回复「确认」使它生效，或回复「取消」放弃；此时不会执行工作工具。"
             accepted = choice in {"确认", "同意", "可以", "confirm", "yes"}
             task = workflow.store.resolve_goal_change(workflow.task_id, accept=accepted)
+            planning_note = ""
+            if accepted and pending["kind"] != "plan_replace":
+                try:
+                    _task, planning_note = workflow.replan_if_triggered()
+                except (OSError, LongTaskStateError, ValueError) as error:
+                    planning_note = f"重规划暂未完成：{error}"
             self._show_goal_status()
             return (
-                f"Goal 修订已生效：{pending['summary']}。请继续说明下一步工作。"
+                f"Goal 修订已生效：{pending['summary']}。"
+                + (f"{planning_note}。" if planning_note else "")
+                + "请继续说明下一步工作。"
                 if accepted else "Goal 修订已取消；原约束不变。请继续说明下一步工作。"
             )
         pending_input = task.pending_goal_input
@@ -632,8 +640,14 @@ class ChatSession:
                 task, assessment = workflow.evaluate_selected_step()
                 self.console.print(f"[dim]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/dim]")
                 if assessment.status.value != "verified":
+                    task, planning_note = workflow.replan_if_triggered()
+                    if planning_note:
+                        self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
                     self._show_goal_status()
                     return latest_response
+            task, planning_note = workflow.replan_if_triggered()
+            if planning_note:
+                self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
             completion = self._settle_goal_completion(workflow, task)
             if completion != "pending":
                 return latest_response
@@ -657,7 +671,16 @@ class ChatSession:
             if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
                 task, assessment = workflow.evaluate_selected_step()
                 self.console.print(f"[dim]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/dim]")
+                task, planning_note = workflow.replan_if_triggered()
+                if planning_note:
+                    self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
                 if assessment.status.value != "verified":
+                    self._show_goal_status()
+                    return latest_response
+            elif task.plan is None:
+                task, planning_note = workflow.replan_if_triggered()
+                if planning_note:
+                    self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
                     self._show_goal_status()
                     return latest_response
             completion = self._settle_goal_completion(workflow, task)
@@ -853,6 +876,14 @@ class ChatSession:
             table.add_row("Pending change", self._describe_goal_change(task))
         if task.pending_goal_input is not None:
             table.add_row("Pending input", "Needs read-only classification (retry or cancel)")
+        planning = next((
+            event for event in reversed(task.events)
+            if event.event_type in {"plan_auto_revised", "plan_replan_skipped"}
+        ), None)
+        if planning is not None:
+            table.add_row("Last planning outcome", planning.payload["summary"])
+        if task.next_replan_trigger is not None:
+            table.add_row("Pending planning trigger", task.next_replan_trigger.event_type)
         claim = task.active_completion_claim
         table.add_row("Completion claim", f"ready ({claim.claim_id})" if claim else "not ready")
         verification = task.last_completion_verification
@@ -899,6 +930,15 @@ class ChatSession:
             blocker_type = "stage_check_blocked"
             blocker_detail = task.selected_step_assessment.detail
             blocker_next_action = task.selected_step_assessment.next_action
+            latest_plan_event = next((
+                event for event in reversed(task.events)
+                if event.event_type in {"plan_auto_revised", "plan_revised", "plan_recorded", "step_assessed"}
+            ), None)
+            if latest_plan_event is not None and latest_plan_event.event_type == "plan_auto_revised":
+                blocker_next_action = (
+                    f"Continue in ordinary Chat to retry revised stage {task.selected_step_id}; "
+                    "the previous failed attempt will not be rerun automatically"
+                )
         if blocker_type:
             table.add_row("Blocker type", blocker_type)
             table.add_row("Blocker detail", blocker_detail or "No verified outcome")

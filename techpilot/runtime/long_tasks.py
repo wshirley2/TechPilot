@@ -21,6 +21,7 @@ from typing import Any, BinaryIO
 from uuid import uuid4
 
 from techpilot.engine.events import RuntimeEventType
+from techpilot.engine.tool_results import display_tool_status
 
 from .goal_plans import GoalPlan, GoalStageAssessment, GoalStageAssessmentStatus
 from .sessions import SessionStore
@@ -236,6 +237,7 @@ class LongTaskProjection:
     status: LongTaskStatus = LongTaskStatus.RUNNING
     budget: LongTaskBudget = field(default_factory=LongTaskBudget)
     events: list[LongTaskEvent] = field(default_factory=list)
+    applied_event_count: int = 0
     actions: dict[str, LongTaskAction] = field(default_factory=dict)
     constraints: dict[str, TaskConstraint] = field(default_factory=dict)
     completion_claims: list[TaskCompletionClaim] = field(default_factory=list)
@@ -306,6 +308,28 @@ class LongTaskProjection:
     @property
     def plan(self) -> GoalPlan | None:
         return self.plans[-1] if self.plans else None
+
+    @property
+    def next_replan_trigger(self) -> LongTaskEvent | None:
+        """Return only the newest unhandled planning boundary."""
+
+        proposals = {
+            event.payload.get("change_id"): event.payload.get("kind")
+            for event in self.events[:self.applied_event_count]
+            if event.event_type == "goal_change_proposed"
+        }
+        for event in reversed(self.events[:self.applied_event_count]):
+            if event.event_type in {"plan_auto_revised", "plan_replan_skipped", "plan_recorded", "plan_revised"}:
+                return None
+            if event.event_type == "goal_change_accepted":
+                kind = proposals.get(event.payload.get("change_id"))
+                if kind == "plan_replace":
+                    return None
+                if kind in {"constraint_add", "constraint_remove", "criterion_add", "criterion_remove"}:
+                    return event
+            if event.event_type in {"step_assessed", "plan_replan_requested"}:
+                return event
+        return None
 
     @property
     def ready_step_ids(self) -> tuple[str, ...]:
@@ -489,6 +513,145 @@ class LongTaskStore:
                 payload=plan.to_payload(),
             ))
             return self.replay(projection.task_id)
+
+    def record_model_replan(
+        self, task_id: str, *, trigger_event_id: str, action: str,
+        summary: str, plan: dict[str, Any] | None, lease: LongTaskLease,
+    ) -> LongTaskProjection:
+        """Commit one Host-checked planning outcome under the Task lease."""
+
+        from .goal_replanning import GoalReplanTool
+
+        self._require_active_lease(task_id, lease)
+        projection = self.replay(task_id)
+        self._require_running(projection)
+        self._require_plan_editable(projection)
+        if projection.plan is not None and len(projection.verified_step_ids) == len(projection.plan.steps):
+            raise LongTaskStateError("A fully verified Goal plan cannot be automatically expanded")
+        if projection.pending_goal_input is not None or projection.pending_goal_change is not None:
+            raise LongTaskStateError("Goal input must be resolved before automatic replanning")
+        trigger = projection.next_replan_trigger
+        if trigger is None or trigger.event_id != trigger_event_id:
+            raise LongTaskStateError("Goal replanning trigger is stale or already handled")
+        decision = GoalReplanTool.validate(action, summary, plan)
+        payload: dict[str, Any] = {
+            "trigger_event_id": trigger_event_id, "summary": decision.summary,
+        }
+        if decision.action == "replace":
+            assert decision.plan is not None
+            candidate = GoalPlan.from_payload({
+                **decision.plan, "version": len(projection.plans) + 1,
+            })
+            if projection.plan is not None and candidate.steps == projection.plan.steps:
+                event_type = "plan_replan_skipped"
+                payload["action"] = "keep"
+                payload["summary"] = "Proposed stages are unchanged. " + decision.summary
+            else:
+                event_type = "plan_auto_revised"
+                payload["plan"] = candidate.to_payload()
+        else:
+            event_type = "plan_replan_skipped"
+            payload["action"] = decision.action
+        event = LongTaskEvent(task_id=projection.task_id, event_type=event_type, payload=payload)
+        self._apply_event(copy.deepcopy(projection), event)
+        self.append(event)
+        return self.replay(projection.task_id)
+
+    def request_replan_for_failed_turn(
+        self, task_id: str, *, checkpoint_id: str, lease: LongTaskLease,
+    ) -> LongTaskProjection:
+        """Mark a failed unplanned turn as a planning boundary, without retrying it."""
+
+        self._require_active_lease(task_id, lease)
+        projection = self.replay(task_id)
+        self._require_running(projection)
+        self._require_plan_editable(projection)
+        if projection.plan is not None or projection.pending_goal_input or projection.pending_goal_change:
+            return projection
+        if not projection.checkpoints or projection.checkpoints[-1].checkpoint_id != checkpoint_id:
+            raise LongTaskStateError("Goal replan request must cite the latest checkpoint")
+        history = projection.events[:projection.applied_event_count]
+        checkpoint_index = next((
+            index for index in range(len(history) - 1, -1, -1)
+            if history[index].event_type == "checkpoint_recorded"
+            and history[index].payload.get("checkpoint_id") == checkpoint_id
+        ), -1)
+        if checkpoint_index < 0 or any(
+            event.event_type in {
+                "goal_change_accepted", "plan_auto_revised", "plan_replan_skipped",
+                "plan_recorded", "plan_revised",
+            }
+            for event in history[checkpoint_index + 1:]
+        ):
+            return projection
+        if any(
+            event.event_type == "plan_replan_requested" and event.payload.get("checkpoint_id") == checkpoint_id
+            for event in history
+        ):
+            return projection
+        failed = self._failed_checkpoint_tool_calls(projection, checkpoint_id)
+        if not failed:
+            return projection
+        event = LongTaskEvent(
+            task_id=projection.task_id, event_type="plan_replan_requested",
+            payload={"checkpoint_id": checkpoint_id, "tool_call_ids": list(failed)},
+        )
+        self._apply_event(copy.deepcopy(projection), event)
+        self.append(event)
+        return self.replay(projection.task_id)
+
+    def _failed_checkpoint_tool_calls(
+        self, projection: LongTaskProjection, checkpoint_id: str,
+    ) -> tuple[str, ...]:
+        if self.session_store is None or projection.session_id is None:
+            raise LongTaskStateError("Goal replan requires a durable Session")
+        checkpoint = projection.checkpoints[-1]
+        if checkpoint.checkpoint_id != checkpoint_id or checkpoint.session_event_cursor is None:
+            raise LongTaskStateError("Goal replan checkpoint identity is invalid")
+        session = self.session_store.replay(projection.session_id)
+        if session.warnings or session.repository_root != projection.repository_root:
+            raise LongTaskStateError("Goal replan Session evidence is incomplete")
+        terminal_index = next((
+            index for index, event in enumerate(session.events)
+            if event.event_id == checkpoint.session_event_cursor
+        ), -1)
+        terminal = session.events[terminal_index] if terminal_index >= 0 else None
+        if terminal is None or terminal.event_type != RuntimeEventType.TURN_COMPLETED.value or not terminal.turn_id:
+            raise LongTaskStateError("Goal replan checkpoint is not a completed turn")
+        if len({event.event_id for event in session.events}) != len(session.events):
+            raise LongTaskStateError("Goal replan Session has duplicate event IDs")
+        turn_events = [
+            event for event in session.events[:terminal_index] if event.turn_id == terminal.turn_id
+        ]
+        requests: dict[str, tuple[int, str]] = {}
+        completions: set[str] = set()
+        failed_calls: list[str] = []
+        for index, event in enumerate(turn_events):
+            call_id = event.tool_call_id
+            if event.event_type == RuntimeEventType.TOOL_REQUESTED.value and call_id:
+                if call_id in requests:
+                    raise LongTaskStateError("Goal replan Session has duplicate Tool requests")
+                requests[call_id] = (index, str(event.payload.get("tool_name", "")))
+            elif event.event_type == RuntimeEventType.TOOL_COMPLETED.value and call_id:
+                request = requests.get(call_id)
+                if call_id in completions or request is None or request[0] >= index:
+                    raise LongTaskStateError("Goal replan Session has an unpaired Tool result")
+                if request[1] != event.payload.get("tool_name"):
+                    raise LongTaskStateError("Goal replan Tool request/result identity differs")
+                completions.add(call_id)
+                if request[1] != "submit_goal_completion" and (
+                    event.payload.get("interrupted") is True
+                    or display_tool_status(
+                        str(event.payload.get("result", "")), event.payload.get("tool_status"),
+                    ) != "completed"
+                ):
+                    failed_calls.append(call_id)
+        if set(requests) != completions:
+            raise LongTaskStateError("Goal replan Session has an unfinished Tool request")
+        failed = tuple(failed_calls)
+        if len(failed) > 32 or len(set(failed)) != len(failed):
+            raise LongTaskStateError("Goal replan failed-tool evidence is invalid")
+        return failed
 
     def select_goal_step(self, task_id: str, step_id: str) -> LongTaskProjection:
         """Explicitly choose one ready stage; selection never executes it."""
@@ -1203,12 +1366,15 @@ class LongTaskStore:
             raise FileNotFoundError(f"Long Task {safe_id!r} does not exist")
         events, warnings = self._read_events(path)
         projection = LongTaskProjection(task_id=safe_id, events=events, warnings=warnings)
-        for event in events:
+        for index, event in enumerate(events):
             if event.task_id != safe_id:
                 projection.warnings.append("Ignored Task event for a different task id")
                 continue
+            projection.applied_event_count = index
             if event.event_type in {
-                "plan_recorded", "plan_revised", "step_selected", "step_assessed",
+                "plan_recorded", "plan_revised", "plan_auto_revised", "plan_replan_skipped",
+                "plan_replan_requested",
+                "step_selected", "step_assessed",
                 "goal_change_proposed", "goal_change_accepted", "goal_change_rejected",
                 "goal_input_started", "goal_input_resolved",
             }:
@@ -1225,6 +1391,7 @@ class LongTaskStore:
                     break
             else:
                 self._apply_event(projection, event)
+            projection.applied_event_count = index + 1
         if any(warning.startswith("Ignored invalid long Task event") for warning in warnings):
             projection.recovery_blockers.append("event_log_invalid")
             projection.status = LongTaskStatus.RECOVERY_REQUIRED
@@ -1263,6 +1430,48 @@ class LongTaskStore:
             projection.budget = LongTaskBudget.from_dict(budget)
             initial_status = payload.get("initial_status", LongTaskStatus.RUNNING.value)
             projection.status = LongTaskStatus(initial_status)
+        elif event.event_type in {"plan_auto_revised", "plan_replan_skipped"}:
+            self._require_plan_editable(projection)
+            if projection.plan is not None and len(projection.verified_step_ids) == len(projection.plan.steps):
+                raise LongTaskStateError("A fully verified Goal plan cannot be automatically replanned")
+            if set(payload) != ({"trigger_event_id", "summary", "plan"} if event.event_type == "plan_auto_revised"
+                                else {"trigger_event_id", "summary", "action"}):
+                raise LongTaskStateError("Goal replan event has invalid fields")
+            trigger = projection.next_replan_trigger
+            if trigger is None or trigger.event_id != _required_string(payload, "trigger_event_id"):
+                raise LongTaskStateError("Goal replan event has no current trigger")
+            summary = _required_string(payload, "summary")
+            if len(summary) > 600:
+                raise LongTaskStateError("Goal replan summary is too long")
+            if event.event_type == "plan_auto_revised":
+                from .goal_replanning import GoalReplanTool
+
+                document = payload["plan"]
+                if not isinstance(document, dict) or set(document) != {"version", "reason", "steps"}:
+                    raise LongTaskStateError("Automatic Goal plan document is invalid")
+                GoalReplanTool.validate(
+                    "replace", summary,
+                    {"reason": document["reason"], "steps": document["steps"]},
+                )
+                next_type = "plan_recorded" if projection.plan is None else "plan_revised"
+                self._apply_event(projection, LongTaskEvent(
+                    task_id=projection.task_id, event_type=next_type, payload=document,
+                ))
+            elif payload["action"] not in {"keep", "unavailable"}:
+                raise LongTaskStateError("Goal replan skip action is invalid")
+        elif event.event_type == "plan_replan_requested":
+            self._require_plan_editable(projection)
+            if projection.plan is not None or set(payload) != {"checkpoint_id", "tool_call_ids"}:
+                raise LongTaskStateError("Goal replan request is invalid")
+            checkpoint_id = _required_string(payload, "checkpoint_id")
+            failed = self._failed_checkpoint_tool_calls(projection, checkpoint_id)
+            if not failed or payload["tool_call_ids"] != list(failed):
+                raise LongTaskStateError("Goal replan request has no verified failed Tool evidence")
+            if any(
+                prior.event_type == "plan_replan_requested" and prior.payload.get("checkpoint_id") == checkpoint_id
+                for prior in projection.events[:projection.applied_event_count]
+            ):
+                raise LongTaskStateError("Goal replan request repeats a checkpoint")
         elif event.event_type in {"plan_recorded", "plan_revised"}:
             self._require_plan_editable(projection)
             plan = GoalPlan.from_payload(payload)

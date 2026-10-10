@@ -176,7 +176,12 @@ def test_running_goal_change_requires_confirmation_and_survives_resume(tmp_path,
         "bash", "write_file", "edit_file",
     })
 
-    resumed_provider = FakeProvider([])
+    resumed_provider = FakeProvider([
+        LLMResponse(tool_calls=[ToolCall("keep-after-rule", "propose_goal_replan", {
+            "action": "keep", "summary": "The current work order still fits", "plan": None,
+        })]),
+        LLMResponse(content="Plan unchanged"),
+    ])
     resumed_runtime = make_runtime(
         repository, resumed_provider, console, session_directory=tmp_path / "sessions",
         resume_session_id=runtime.agent.session_id,
@@ -189,7 +194,10 @@ def test_running_goal_change_requires_confirmation_and_survives_resume(tmp_path,
     assert [item.text for item in workflow.store.replay(workflow.task_id).active_constraints] == [
         "Only modify calculator.py",
     ]
-    assert resumed_provider.requests == []
+    assert len(resumed_provider.requests) == 2
+    planning_tools = {tool["function"]["name"] for tool in resumed_provider.requests[0]["tools"]}
+    assert "propose_goal_replan" in planning_tools
+    assert planning_tools.isdisjoint({"bash", "write_file", "edit_file"})
 
 
 def test_unclassified_goal_input_blocks_resume_until_cancelled(tmp_path, monkeypatch):
@@ -383,7 +391,16 @@ os._exit(0)
 
     output = StringIO()
     console = Console(file=output, force_terminal=False, color_system=None)
-    provider = FakeProvider([LLMResponse(content="continued without another write")])
+    responses = [LLMResponse(content="continued without another write")]
+    if crash_boundary == "change_accepted":
+        responses = [
+            LLMResponse(tool_calls=[ToolCall("keep-after-crash", "propose_goal_replan", {
+                "action": "keep", "summary": "The confirmed rule does not change the plan", "plan": None,
+            })]),
+            LLMResponse(content="Plan unchanged"),
+            *responses,
+        ]
+    provider = FakeProvider(responses)
     runtime = make_runtime(
         tmp_path, provider, console, session_directory=tmp_path / "sessions",
         resume_session_id=session_id,
@@ -406,8 +423,12 @@ os._exit(0)
         assert task.pending_goal_input is None
         assert task.pending_goal_change is None
         assert [item.text for item in task.active_constraints] == ["Never edit marker.txt again"]
-        assert len(provider.requests) == 1
+        assert len(provider.requests) == 3
         assert "Never edit marker.txt again" in provider.requests[0]["messages"][0]["content"]
+        planning_tools = {tool["function"]["name"] for tool in provider.requests[0]["tools"]}
+        assert "propose_goal_replan" in planning_tools
+        assert planning_tools.isdisjoint({"bash", "write_file", "edit_file"})
+        assert "Never edit marker.txt again" in provider.requests[2]["messages"][0]["content"]
 
     if crash_boundary != "change_accepted":
         assert provider.requests == []
@@ -442,6 +463,10 @@ def test_chat_goal_autoselects_and_assesses_confirmed_stages(tmp_path, monkeypat
         LLMResponse(content="约定已提出"),
         LLMResponse(tool_calls=[ToolCall("stage-one", "glob", {"pattern": "**/*.py"})]),
         LLMResponse(content="first stage done"),
+        LLMResponse(tool_calls=[ToolCall("keep-after-first", "propose_goal_replan", {
+            "action": "keep", "summary": "The remaining stage still fits", "plan": None,
+        })]),
+        LLMResponse(content="Plan unchanged"),
         LLMResponse(tool_calls=[ToolCall("stage-two", "glob", {"pattern": "**/*.py"})]),
         LLMResponse(tool_calls=[ToolCall("stage-complete", GOAL_COMPLETION_TOOL_NAME, {
             "summary": "both stages checked", "evidence_tool_call_ids": ["stage-two"],

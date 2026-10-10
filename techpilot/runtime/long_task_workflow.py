@@ -24,6 +24,7 @@ from .goal_change import GOAL_CHANGE_TOOL_NAME, GoalChangeDecision, GoalChangeTo
 from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
 from .goal_evaluation import GoalStageEvidenceError, evaluate_goal_stage
 from .goal_plans import GoalStageAssessment
+from .goal_replanning import GoalReplanDecision, GoalReplanTool
 from .goal_setup import GoalSetupProposal, GoalSetupTool
 from .long_tasks import (
     CompletionCriterionKind,
@@ -83,6 +84,8 @@ class LongTaskWorkflow:
         self._completion_proposal: GoalCompletionProposal | None = None
         self._setup_proposal: GoalSetupProposal | None = None
         self._change_decision: GoalChangeDecision | None = None
+        self._replan_decision: GoalReplanDecision | None = None
+        self._replan_decision_invalid = False
         self._change_decision_invalid = False
 
     def start_or_resume(self, *, reason: str = "continue explicit long Task") -> LongTaskProjection:
@@ -397,6 +400,86 @@ class LongTaskWorkflow:
             if updated.recovery_blockers:
                 raise LongTaskRecoveryRequired("Stage assessment evidence could not be replayed safely")
             return updated, assessment
+
+    def replan_if_triggered(self) -> tuple[LongTaskProjection, str | None]:
+        """Ask for one read-only plan decision at a durable planning boundary."""
+
+        with self.store.acquire_lease(self.task_id) as lease:
+            task = self.store.replay(self.task_id)
+            if task.status is not LongTaskStatus.RUNNING or task.pending_goal_input or task.pending_goal_change:
+                return task, None
+            self._require_effect_recovery_clear(task)
+            task = self.store.replay(self.task_id)
+            if task.status is not LongTaskStatus.RUNNING or task.recovery_blockers or task.selected_step_needs_evaluation:
+                return task, None
+            if task.plan is not None and len(task.verified_step_ids) == len(task.plan.steps):
+                return task, None
+            if task.plan is None and task.checkpoints:
+                task = self.store.request_replan_for_failed_turn(
+                    self.task_id, checkpoint_id=task.checkpoints[-1].checkpoint_id, lease=lease,
+                )
+            trigger = task.next_replan_trigger
+            if trigger is None:
+                return task, None
+            session = self.runtime.session_store.replay(self.runtime.agent.session_id)
+            if session.warnings or session.repository_root != task.repository_root:
+                raise LongTaskRecoveryRequired("Goal replanning requires trustworthy Session evidence")
+            self._replan_decision = None
+            self._replan_decision_invalid = False
+            verified = ", ".join(task.verified_step_ids) or "none"
+            prior = "\n".join(
+                f"- {step.step_id}: {step.goal}; depends on {', '.join(step.dependencies) or 'none'}; "
+                f"check {step.check}"
+                for step in task.plan.steps
+            ) if task.plan is not None else "none"
+            context = "\n".join((
+                self._goal_context(task),
+                "## Read-only Goal replanning",
+                f"Trigger: {trigger.event_type} ({trigger.event_id})",
+                f"Verified stages (must remain unchanged): {verified}",
+                f"Current plan: {prior}",
+                "Inspect repository facts if needed. Do not execute commands or change files.",
+                "Call propose_goal_replan exactly once. Use replace only when new evidence justifies a complete 2–7 stage plan.",
+                "Keep verified stages unchanged. Keep the active stage unchanged unless its check is blocked;",
+                "a blocked stage may be revised but must retain its ID and verified dependencies.",
+                "Use keep if the current plan still fits; use unavailable with the specific missing fact if no sound plan can be formed.",
+                "A proposal cannot change final acceptance criteria, hard constraints, or Tool permissions.",
+            ))
+            read_tools = frozenset({"read_file", "glob", "grep", "now", GoalReplanTool.name})
+            with self.runtime.goal_scope(
+                context,
+                tools=(GoalReplanTool(self._submit_replan_decision),),
+                allowed_tool_names=read_tools,
+            ):
+                response = self.runtime.run_turn(
+                    "Review the latest durable Goal planning boundary and propose one planning outcome."
+                )
+            decision = None if self._replan_decision_invalid else self._replan_decision
+            if decision is None:
+                decision = GoalReplanDecision(
+                    "unavailable", "No valid planning proposal was returned; "
+                    + (response.strip()[:350] or "the model did not identify a concrete next plan"), None,
+                )
+            try:
+                updated = self.store.record_model_replan(
+                    self.task_id, trigger_event_id=trigger.event_id,
+                    action=decision.action, summary=decision.summary,
+                    plan=decision.plan, lease=lease,
+                )
+            except (TypeError, ValueError) as error:
+                updated = self.store.record_model_replan(
+                    self.task_id, trigger_event_id=trigger.event_id,
+                    action="unavailable", summary=f"Proposed revision failed Host validation: {error}"[:500],
+                    plan=None, lease=lease,
+                )
+            outcome = updated.events[-1]
+            return updated, f"{outcome.event_type}: {outcome.payload['summary']}"
+
+    def _submit_replan_decision(self, decision: GoalReplanDecision) -> None:
+        if self._replan_decision is not None:
+            self._replan_decision_invalid = True
+            raise ValueError("only one Goal planning outcome is allowed per turn")
+        self._replan_decision = decision
 
     def finish(self, *, result: str = "", require_completion_claim: bool = True) -> LongTaskProjection:
         """Explicitly mark a fully checkpointed Task complete after its final step."""

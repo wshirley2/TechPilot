@@ -75,49 +75,11 @@ techpilot D:\path\to\your-project
 
 TUI 会展示流式回答、工具调用、Session 状态和待确认操作。写入文件前会先展示 Diff；输入 `1` 允许一次，输入 `2` 在当前会话内允许同类操作，直接回车拒绝。输入 `/help` 查看 Chat 内命令，常用的是 `/status`、`/resume <session-id>` 和 `/exit`。
 
-需要跨多个回合持续推进时，在 Chat 中用 `/goal <目标>` 建立 Goal，先通过 `/goal criterion` 记录可验证的完成条件，再用 `/goal start` 开始。Goal 与普通 Chat 共用工具、权限和 Session；旧的 Plan、Workspace 和 Managed Run 命令已退场。
+需要跨多个回合持续推进时，在 Chat 中输入 `/goal <目标>`。Agent 会先用只读工具调查并提出可检查的验收约定；确认内容符合要求后，在普通聊天中回复「确认」才开始执行。多阶段目标可以在准备时附带结构化阶段计划。Goal 与普通 Chat 共用工具、权限和 Session；旧的 Plan、Workspace 和 Managed Run 命令已退场。
 
-若要给 Goal 记录阶段计划，先在目标仓库中保存一个 JSON 文件，例如 `goal-plan.json`：
+运行中用普通聊天继续工作或提出约束、验收条件和计划修改。用户提出的合同修改会先展示，确认后才生效。每个已选阶段留下 checkpoint 后，Runtime 只读取持久 Session、Effect Journal 和文件进行评估，不会为评估重跑工具。阶段检查支持文件存在、文件包含指定内容，以及本回合已实际执行的精确测试命令。证据不足或结果不明时，Goal 会停在状态卡所示的安全边界。
 
-```json
-{
-  "reason": "首次拆分目标",
-  "steps": [
-    {
-      "id": "inspect",
-      "goal": "定位并说明问题",
-      "dependencies": [],
-      "expected_output": "问题位置和复现说明",
-      "work_scope": ["src/", "README.md"],
-      "evidence": "相关文件位置与复现记录",
-      "check": "人工核对问题能否复现",
-      "next_action": "先阅读相关代码并记录复现步骤"
-    },
-    {
-      "id": "fix",
-      "goal": "修复已定位的问题",
-      "dependencies": ["inspect"],
-      "expected_output": "修复后的代码",
-      "work_scope": ["src/"],
-      "evidence": "代码差异与验证结果",
-      "check": "核对差异和预先约定的验收条件",
-      "next_action": "根据定位结果修改代码"
-    }
-  ]
-}
-```
-
-在普通文本 Chat 中运行 `/goal plan load goal-plan.json` 会把计划写入 Goal 的 Task 事件；此后可修改文件并再次执行该命令，形成保留历史的新版计划。运行 `/goal plan show` 查看阶段契约，`/goal plan select inspect` 选择一个无阻塞的阶段，再执行 `/goal start`。恢复原 Session 并运行 `/goal resume <goal-id>` 后，`/goal status` 会显示计划版本、当前阶段、依赖阻塞和下一步。
-
-每个已选阶段执行一回合后先留下 checkpoint，状态显示 `needs_evaluation`。运行 `/goal evaluate` 只读取已保存的 Session 工具事件、Effect Journal 和当前文件，不重跑命令。阶段的 `check` 可以是示例中的自然语言（结果为 `needs_review`，需用户运行 `/goal review verified|blocked <原因>`），也可以是以下可确定核验的对象：
-
-```json
-{"kind": "file_exists", "path": "src/fix.py"}
-{"kind": "file_contains", "path": "src/fix.py", "text": "expected text"}
-{"kind": "test_command", "command": "python -m pytest -q"}
-```
-
-把其中一个对象作为阶段的 `check` 值。只有证据与检查条件匹配并通过时才记录 `verified`，后继依赖阶段才会变为可选；无法可靠核验的结果保留阻塞或交给用户判断。Goal 最终完成仍需单独满足用户设定的 `/goal criterion` 和完成声明。
+Goal 在阶段评估、确认合同变更，以及无阶段计划的工具失败后，可能触发一次只读规划。模型可以维持现有计划、说明形成计划所缺的事实，或提出包含 2–7 个可检查阶段的替代计划。Host 校验后才保存新版本；已核验阶段及其证据保留，规划不改变最终验收条件或工具权限。输入 `/goal` 查看计划版本、证据、阻塞和下一步；用 `/goal pause` 暂停，恢复原 Session 后用 `/goal resume <goal-id>` 继续，`/goal clear` 结束当前 Goal 并保留历史。
 
 Session 默认保存在目标仓库的 `.techpilot/sessions/` 下；可以用 `--resume` 恢复，也可以用 `--sessions-dir` 指定其他目录。恢复只重建对话，不会重新执行历史工具调用。
 
