@@ -39,8 +39,8 @@ class WriteFileTool(Tool):
             p.write_text(content, encoding="utf-8")
             _changed_files.add(str(p))
             n_lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-            return f"Wrote {n_lines} lines to {file_path}"
+            return ToolResult(f"Wrote {n_lines} lines to {file_path}", ToolStatus.COMPLETED)
         except Exception as e:
             if writing:
                 return ToolResult(f"[effect unknown] Error: {e}; inspect the file before retrying", ToolStatus.EFFECT_UNKNOWN)
-            return f"Error: {e}"
+            return ToolResult(f"Error: {e}", ToolStatus.ERROR)

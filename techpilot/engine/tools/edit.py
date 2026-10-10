@@ -50,24 +50,28 @@ class EditFileTool(Tool):
         try:
             p = Path(file_path).expanduser().resolve()
             if not p.exists():
-                return f"Error: {file_path} not found"
+                return ToolResult(f"Error: {file_path} not found", ToolStatus.ERROR)
 
             try:
                 content = p.read_text(encoding="utf-8")
             except UnicodeDecodeError:
-                return f"Error: {file_path} is not a UTF-8 text file (edit_file only edits text files)"
+                return ToolResult(
+                    f"Error: {file_path} is not a UTF-8 text file (edit_file only edits text files)",
+                    ToolStatus.ERROR,
+                )
             occurrences = content.count(old_string)
 
             if occurrences == 0:
                 preview = content[:500] + ("..." if len(content) > 500 else "")
-                return (
-                    f"Error: old_string not found in {file_path}.\n"
-                    f"File starts with:\n{preview}"
+                return ToolResult(
+                    f"Error: old_string not found in {file_path}.\nFile starts with:\n{preview}",
+                    ToolStatus.ERROR,
                 )
             if occurrences > 1:
-                return (
+                return ToolResult(
                     f"Error: old_string appears {occurrences} times in {file_path}. "
-                    f"Include more surrounding lines to make it unique."
+                    "Include more surrounding lines to make it unique.",
+                    ToolStatus.ERROR,
                 )
 
             new_content = content.replace(old_string, new_string, 1)
@@ -77,11 +81,11 @@ class EditFileTool(Tool):
 
             # generate a unified diff so the user/LLM can see exactly what changed
             diff = _unified_diff(content, new_content, str(p))
-            return f"Edited {file_path}\n{diff}"
+            return ToolResult(f"Edited {file_path}\n{diff}", ToolStatus.COMPLETED)
         except Exception as e:
             if writing:
                 return ToolResult(f"[effect unknown] Error: {e}; inspect the file before retrying", ToolStatus.EFFECT_UNKNOWN)
-            return f"Error: {e}"
+            return ToolResult(f"Error: {e}", ToolStatus.ERROR)
 
 
 def _unified_diff(old: str, new: str, filename: str, context: int = 3) -> str:

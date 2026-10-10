@@ -2,6 +2,7 @@
 
 import urllib.request
 
+from ..tool_results import ToolResult, ToolStatus
 from .base import Tool
 
 
@@ -28,15 +29,15 @@ class FetchUrlTool(Tool):
 
     def execute(self, url: str, timeout: int = 15) -> str:
         if not url.startswith(("http://", "https://")):
-            return "Error: only http and https URLs are supported"
+            return ToolResult("Error: only http and https URLs are supported", ToolStatus.ERROR)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "TechPilot"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read(1_000_000)  # 顶多读 1MB，别让一个巨页撑爆内存
                 text = raw.decode("utf-8", errors="replace")
         except Exception as e:
-            return f"Error fetching {url}: {e}"
+            return ToolResult(f"Error fetching {url}: {e}", ToolStatus.ERROR)
         # 太长就留头尾，跟 bash 输出截断一个套路
         if len(text) > 8000:
             text = text[:6000] + f"\n... (truncated, {len(text)} chars) ...\n" + text[-1000:]
-        return text
+        return ToolResult(text, ToolStatus.COMPLETED)

@@ -1,5 +1,6 @@
 import time
 
+from ..tool_results import ToolResult, ToolStatus
 from .base import Tool
 
 
@@ -12,4 +13,4 @@ class NowTool(Tool):
         "required": [],
     }
     def execute(self) -> str:
-        return time.strftime("%Y-%m-%d %H:%M:%S")
+        return ToolResult(time.strftime("%Y-%m-%d %H:%M:%S"), ToolStatus.COMPLETED)

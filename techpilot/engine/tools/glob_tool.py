@@ -38,7 +38,7 @@ class GlobTool(Tool):
                 return ToolResult("Permission denied glob: sensitive path", ToolStatus.DENIED)
             base = Path(path).expanduser().resolve()
             if not base.is_dir():
-                return f"Error: {path} is not a directory"
+                return ToolResult(f"Error: {path} is not a directory", ToolStatus.ERROR)
 
             hits = [hit for hit in base.glob(pattern) if is_safe_search_path(hit, base)]
             # sort by mtime, newest first
@@ -55,9 +55,9 @@ class GlobTool(Tool):
 
             if total > 100:
                 result += f"\n... ({total} matches, showing first 100)"
-            return ToolResult(result or "No files matched.")
+            return ToolResult(result or "No files matched.", ToolStatus.COMPLETED)
         except Exception as e:
-            return f"Error: {e}"
+            return ToolResult(f"Error: {e}", ToolStatus.ERROR)
 
 
 def _display_path(path: Path, root: Path) -> str:

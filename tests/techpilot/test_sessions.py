@@ -13,7 +13,7 @@ from techpilot.engine.runtime_control import CancellationToken, RuntimeLimits
 from techpilot.engine.tools.base import Tool
 from techpilot.runtime.bootstrap import RuntimeBootstrap, RuntimeBootstrapInput
 from techpilot.runtime.contracts import RuntimeResultStatus, TaskRuntimeResult
-from techpilot.runtime.sessions import SessionEvent, SessionEventSink, SessionStore
+from techpilot.runtime.sessions import SessionEvent, SessionEventSink, SessionStore, SessionStoreError
 
 
 class EchoTool(Tool):
@@ -63,6 +63,28 @@ def test_session_sink_persistence_check_reaches_the_downstream_event_log(tmp_pat
     sink.ensure_persisted()
 
     assert downstream.checked
+
+
+def test_session_sink_forwards_live_event_but_requires_an_explicit_durability_check(tmp_path, monkeypatch):
+    store = SessionStore(tmp_path / "sessions")
+    observed = []
+    sink = SessionEventSink(store, CallbackEventSink(observed.append))
+
+    def fail_to_append(_event) -> None:
+        raise OSError("simulated session write failure")
+
+    monkeypatch.setattr(store, "append_runtime", fail_to_append)
+    event = _event(RuntimeEventType.TOOL_COMPLETED, tool_call_id="read-1", payload={
+        "tool_name": "read_file",
+        "result": "README.md",
+        "interrupted": False,
+    })
+
+    sink.emit(event)
+
+    assert observed == [event]
+    with pytest.raises(SessionStoreError, match="latest turn may not be recoverable"):
+        sink.ensure_persisted()
 
 
 def test_session_replay_rebuilds_valid_tool_history_and_ignores_partial_tail(tmp_path):

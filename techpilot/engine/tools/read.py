@@ -56,9 +56,9 @@ class ReadFileTool(Tool):
                 return ToolResult("Permission denied read_file: sensitive file", ToolStatus.DENIED)
             p = Path(file_path).expanduser().resolve()
             if not p.exists():
-                return f"Error: {file_path} not found"
+                return ToolResult(f"Error: {file_path} not found", ToolStatus.ERROR)
             if not p.is_file():
-                return f"Error: {file_path} is a directory, not a file"
+                return ToolResult(f"Error: {file_path} is a directory, not a file", ToolStatus.ERROR)
 
             raw = p.read_bytes()
             content_hash = hashlib.sha256(raw).hexdigest()
@@ -100,6 +100,7 @@ class ReadFileTool(Tool):
             )
             return ToolResult(
                 result,
+                ToolStatus.COMPLETED,
                 facts=ToolResultFacts(
                     content_hash=content_hash,
                     content_bytes=len(raw),
@@ -112,7 +113,7 @@ class ReadFileTool(Tool):
                 ),
             )
         except Exception as e:
-            return f"Error: {e}"
+            return ToolResult(f"Error: {e}", ToolStatus.ERROR)
 
 
 def _page_footer(

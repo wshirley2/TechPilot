@@ -22,14 +22,12 @@ from rich.text import Text
 
 from techpilot.engine.context import estimate_tokens
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
-from techpilot.engine.tool_results import ToolResult, ToolStatus, display_tool_status
+from techpilot.engine.tool_results import display_tool_status
 from techpilot.engine.tools.edit import _changed_files
 
 from ..runtime import (
-    CompletionCriterionKind,
-    EffectJournalState,
+    GOAL_COMPLETION_TOOL_NAME,
     EffectJournalStore,
-    GoalStageAssessmentStatus,
     LongTaskStateError,
     LongTaskStatus,
     LongTaskStore,
@@ -297,7 +295,7 @@ class ChatSession:
                     self.console.print(Markdown(response))
             except KeyboardInterrupt:
                 if self._goal_workflow is not None:
-                    self.console.print("[yellow]Goal step cancelled. Use /goal status before continuing.[/yellow]")
+                    self.console.print("[yellow]Goal step cancelled. Use /goal to inspect its saved state before continuing.[/yellow]")
                 else:
                     self.console.print("[yellow]Turn cancelled. The chat session is still active.[/yellow]")
             except Exception as error:
@@ -375,18 +373,11 @@ class ChatSession:
             "/tokens  Provider token usage and estimated cost",
             "/compact Compress model context",
             "/model [name]  Show or switch model",
-            "/goal <outcome>  Create a durable Goal setup",
-            "/goal [start|status|pause|resume <id>|complete|clear|cancel]  Manage the active Goal; start requires acceptance checks",
-            "/goal constraint <rule>  Add a confirmed hard constraint to the active Goal",
-            "/goal constraint remove <id>  Retire one confirmed hard constraint",
-            "/goal constraints  List confirmed hard constraints",
-            "/goal criterion <file-exists|file-contains|test-command> ...  Add a Runtime completion check",
-            "/goal criterion remove <id>  Retire one completion check",
-            "/goal criteria  List Runtime completion checks",
-            "/goal plan [show|load <repo-relative-json>|select <step-id>]  Record and inspect a bounded stage plan",
-            "/goal evaluate  Assess the selected checkpoint using durable evidence; does not rerun tools",
-            "/goal review <verified|blocked> <reason>  Resolve a stage awaiting human review",
-            "/goal recover <tool-call-id> <completed|not-executed> <reason>  Record an operator-verified effect outcome",
+            "/goal <outcome>  Create a durable Goal and prepare its acceptance contract",
+            "/goal  Show Goal status, evidence and blockers",
+            "/goal pause  Stop Goal progression without discarding it",
+            "/goal resume [id]  Verify recovery and continue a paused Goal",
+            "/goal clear  End and detach the active Goal; keep its history",
             "/clear   Clear conversation messages",
         ]
         lines.extend([
@@ -434,8 +425,25 @@ class ChatSession:
 
         if self._goal_workflow is None:
             return self.runtime.run_turn(user_input)
-        result = self._goal_workflow.run_step(user_input)
-        return result.response
+        workflow = self._goal_workflow
+        task = workflow.store.replay(workflow.task_id)
+        if task.status is LongTaskStatus.SETUP:
+            if user_input.strip().lower() in {"确认", "同意", "可以", "confirm", "yes"}:
+                proposal = workflow.setup_proposal
+                if proposal is None:
+                    return "当前没有待确认的验收约定；请先说明目标或验收方式。"
+                workflow.accept_setup(proposal)
+                self.console.print(f"[green]Goal started: {workflow.task_id}[/green]")
+                return self._advance_goal(task.goal)
+            response = workflow.prepare_setup(user_input)
+            self._show_setup_proposal()
+            return response
+        if task.status is LongTaskStatus.PAUSED:
+            return "Goal 已暂停；使用 /goal resume 后再继续。"
+        if task.status is LongTaskStatus.RECOVERY_REQUIRED:
+            self._show_goal_status()
+            return "Goal 恢复证据尚不充分，已阻止继续执行。"
+        return self._advance_goal(user_input)
 
     def _goal(self, value: str) -> None:
         """Expose an explicit, Codex-like Goal lifecycle inside ordinary Chat."""
@@ -446,82 +454,38 @@ class ChatSession:
         if not value:
             self._show_goal_status()
             return
-        if normalized == "status" and not separator:
-            self._show_goal_status()
-            return
         if normalized == "pause" and not separator:
             self._pause_active_goal("Paused by user")
             return
         if normalized == "clear" and not separator:
-            if not self._pause_active_goal("Goal cleared from this Chat"):
-                return
-            self._goal_workflow = None
-            self.console.print(
-                "[yellow]Goal 已从当前 Chat 解绑；恢复原 Session 后可用 /goal resume <id> 查看或继续配置。[/yellow]"
-            )
-            return
-        if normalized == "cancel" and not separator:
             workflow = self._require_goal()
             if workflow is None:
                 return
             try:
-                task = workflow.store.cancel(workflow.task_id, reason="Cancelled by user")
+                task = workflow.store.cancel(workflow.task_id, reason="Cleared by user from Chat")
             except (OSError, LongTaskStateError, ValueError) as error:
-                self.console.print(f"[red]Could not cancel Goal: {error}[/red]")
+                self.console.print(f"[red]Could not clear Goal: {error}[/red]")
                 return
             self._goal_workflow = None
-            self.console.print(f"[yellow]Goal cancelled: {task.task_id}[/yellow]")
-            return
-        if normalized == "complete" and not separator:
-            workflow = self._require_goal()
-            if workflow is None:
-                return
-            try:
-                task = workflow.finish(result="Completed by user after verified completion claim")
-            except (OSError, LongTaskStateError, ValueError) as error:
-                self.console.print(f"[red]Could not complete Goal: {error}[/red]")
-                return
-            self._goal_workflow = None
-            self.console.print(f"[green]Goal completed: {task.task_id}[/green]")
-            return
-        if normalized == "start" and not separator:
-            self._start_goal_execution()
+            self.console.print(f"[yellow]Goal cleared: {task.task_id}（历史记录保留）[/yellow]")
             return
         if normalized == "resume":
             self._resume_goal(argument)
             return
-        if normalized == "constraint":
-            self._record_goal_constraint(argument)
+        if normalized in {"status", "start", "complete", "cancel", "constraint", "constraints", "criterion", "criteria", "plan", "evaluate"}:
+            self.console.print(
+                "[yellow]此 Goal 命令已移除。用 /goal 查看状态；新目标在准备阶段以普通聊天确认验收约定。"
+                "运行中的约定修订尚未开放，不能把一句聊天内容当成已保存的硬约束。[/yellow]"
+            )
             return
-        if normalized == "constraints" and not separator:
-            self._show_goal_constraints()
-            return
-        if normalized == "criterion":
-            self._record_goal_criterion(argument)
-            return
-        if normalized == "criteria" and not separator:
-            self._show_goal_criteria()
-            return
-        if normalized == "plan":
-            self._goal_plan(argument)
-            return
-        if normalized == "evaluate" and not separator:
-            self._evaluate_goal_stage()
-            return
-        if normalized == "review":
-            self._review_goal_stage(argument)
-            return
-        if normalized == "recover":
-            self._recover_goal_effect(argument)
+        if normalized in {"review", "recover"}:
+            self.console.print(
+                "[yellow]Goal state cannot be resolved by a user command. "
+                "It remains blocked until Runtime has verifiable evidence; do not rerun an unknown effect.[/yellow]"
+            )
             return
         if self._goal_workflow is not None:
-            task = self._goal_workflow.store.replay(self._goal_workflow.task_id)
-            if task.status is LongTaskStatus.SETUP:
-                self.console.print(
-                    "[yellow]Goal is in setup. Add /goal criterion ... then run /goal start before sending work input.[/yellow]"
-                )
-                return
-            self.console.print("[yellow]已有运行中的 Goal；请先用 /goal status、/goal complete、/goal pause 或 /goal clear。[/yellow]")
+            self.console.print("[yellow]当前 Chat 已有 Goal；用 /goal 查看状态，或先 /goal pause、/goal clear。[/yellow]")
             return
         self._start_goal(value)
 
@@ -535,63 +499,224 @@ class ChatSession:
             self.console.print(f"[red]Could not create Goal setup: {error}[/red]")
             return
         self.console.print(f"[green]Goal setup created: {task.task_id}[/green]")
-        self.console.print("[dim]Add /goal criterion ... and optional /goal constraint ..., then run /goal start.[/dim]")
-        self._show_goal_status()
-
-    def _start_goal_execution(self) -> None:
-        workflow = self._require_goal()
-        if workflow is None:
-            return
         try:
-            task = workflow.start()
-            self.console.print(f"[green]Goal started: {task.task_id}[/green]")
-            response = self._run_user_turn(task.goal)
-        except KeyboardInterrupt:
-            self.console.print("[yellow]Goal step cancelled. Use /goal status before continuing.[/yellow]")
-            return
-        except (OSError, LongTaskStateError, ValueError) as error:
-            self.console.print(f"[red]Goal step failed: {error}[/red]")
-            return
+            response = self._run_user_turn(goal)
+        except Exception as error:
+            self.console.print(f"[yellow]Goal 验收约定尚未形成：{error}[/yellow]")
+        else:
+            sink = self.runtime.agent.event_sink
+            if not getattr(sink, "last_turn_streamed", False) and response:
+                self.console.print(Markdown(response))
         finally:
             self._ensure_session_persisted()
-        sink = self.runtime.agent.event_sink
-        if not getattr(sink, "last_turn_streamed", False) and response:
-            self.console.print(Markdown(response))
+
+    def _show_setup_proposal(self) -> None:
+        workflow = self._goal_workflow
+        proposal = workflow.setup_proposal if workflow is not None else None
+        if proposal is None:
+            self.console.print("[yellow]验收方式尚不明确；请在普通聊天中补充要检查的文件、内容或测试。[/yellow]")
+            return
+        lines = [proposal.summary, "", "验收条件："]
+        for criterion in proposal.criteria:
+            kind = criterion["kind"]
+            detail = criterion.get("command") or criterion.get("path") or ""
+            if kind == "file_contains":
+                detail += f" 包含 {criterion['expected_text']!r}"
+            lines.append(f"- {kind}: {detail}")
+        if proposal.constraints:
+            lines.extend(("", "硬约束：", *(f"- {rule}" for rule in proposal.constraints)))
+        if proposal.plan is not None:
+            lines.extend(("", f"阶段计划：{len(proposal.plan['steps'])} 步"))
+        lines.extend(("", "确认符合你的要求后，回复「确认」开始；否则直接说要修改哪里。"))
+        self.console.print(Panel("\n".join(lines), title="Goal 验收约定（待确认）"))
+
+    def _advance_goal(self, user_input: str) -> str:
+        """Run bounded Goal turns and settle durable checks at each boundary."""
+
+        workflow = self._require_goal()
+        if workflow is None:
+            return ""
+        next_input = user_input
+        latest_response = ""
+        for index in range(4):
+            task = workflow.store.replay(workflow.task_id)
+            if task.status is not LongTaskStatus.RUNNING:
+                self._show_goal_status()
+                return latest_response
+            if task.plan is not None and task.selected_step_needs_evaluation and len(task.verified_step_ids) < len(task.plan.steps):
+                task, assessment = workflow.evaluate_selected_step()
+                self.console.print(f"[dim]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/dim]")
+                if assessment.status.value != "verified":
+                    self._show_goal_status()
+                    return latest_response
+            completion = self._settle_goal_completion(workflow, task)
+            if completion != "pending":
+                return latest_response
+            if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
+                if task.selected_step_assessment is not None and task.selected_step_assessment.status.value == "blocked":
+                    # A new user message may retry a failed, fully known check;
+                    # automatic continuation never retries it without new input.
+                    if index or not user_input:
+                        self._show_goal_status()
+                        return latest_response
+                    task = workflow.store.select_goal_step(workflow.task_id, task.selected_step_id)
+                elif task.selected_step_id is None or task.selected_step_id in task.verified_step_ids:
+                    if not task.ready_step_ids:
+                        self._show_goal_status()
+                        return latest_response
+                    task = workflow.store.select_goal_step(workflow.task_id, task.ready_step_ids[0])
+                next_input = user_input if index == 0 else f"Continue the current Goal stage {task.selected_step_id}."
+            result = workflow.run_step(next_input)
+            latest_response = result.response
+            task = result.task
+            if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
+                task, assessment = workflow.evaluate_selected_step()
+                self.console.print(f"[dim]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/dim]")
+                if assessment.status.value != "verified":
+                    self._show_goal_status()
+                    return latest_response
+            completion = self._settle_goal_completion(workflow, task)
+            if completion != "pending":
+                return latest_response
+            if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
+                next_input = "Continue with the next verified-ready Goal stage."
+                continue
+            if not self._goal_turn_used_tools(result.checkpoint.session_event_cursor):
+                self.console.print("[dim]本轮没有新的工具证据，已停止自动续跑；Goal 保持可继续。[/dim]")
+                return latest_response
+            next_input = "Continue the current Goal using the recorded evidence; stop if no concrete progress is possible."
+        self.console.print("[dim]已到本次有界续跑上限；Goal 已保存，可在普通聊天中继续。[/dim]")
+        return latest_response
+
+    def _settle_goal_completion(self, workflow: LongTaskWorkflow, task) -> str:
+        claim = task.active_completion_claim
+        if claim is None or (task.plan is not None and len(task.verified_step_ids) != len(task.plan.steps)):
+            return "pending"
+        prior = task.last_completion_verification
+        if prior is not None and prior.claim_id == claim.claim_id and not prior.passed:
+            # A failed claim needs new evidence, not another check of the same
+            # checkpoint every time Chat resumes.
+            return "pending"
+        try:
+            finished = workflow.finish()
+        except (OSError, LongTaskStateError, ValueError) as error:
+            self.console.print(f"[yellow]Goal 尚未通过最终验收：{error}[/yellow]")
+            self._show_goal_status()
+            return "blocked"
+        self._goal_workflow = None
+        self.console.print(f"[green]Goal completed: {finished.task_id}[/green]")
+        return "completed"
+
+    def _goal_turn_used_tools(self, cursor: str | None) -> bool:
+        if cursor is None:
+            return False
+        session = self.runtime.session_store.replay(self.runtime.agent.session_id)
+        terminal = next((event for event in session.events if event.event_id == cursor), None)
+        if terminal is None or terminal.event_type != RuntimeEventType.TURN_COMPLETED.value:
+            return False
+        tool_events = [
+            event for event in session.events
+            if event.turn_id == terminal.turn_id
+            and event.event_type == RuntimeEventType.TOOL_COMPLETED.value
+            and event.payload.get("tool_name") != GOAL_COMPLETION_TOOL_NAME
+        ]
+        return bool(tool_events) and all(
+            event.payload.get("interrupted") is not True
+            and display_tool_status(str(event.payload.get("result", "")), event.payload.get("tool_status")) == "completed"
+            for event in tool_events
+        )
 
     def _resume_goal(self, task_id: str) -> None:
-        if not task_id:
-            self.console.print("[yellow]Usage: /goal resume <goal-id>[/yellow]")
-            return
         if self._goal_workflow is not None:
-            self.console.print("[yellow]当前 Chat 已绑定一个 Goal；请先 /goal clear 或完成它。[/yellow]")
-            return
+            current = self._goal_workflow.store.replay(self._goal_workflow.task_id)
+            if task_id and task_id != current.task_id:
+                self.console.print("[yellow]当前 Chat 已绑定另一个 Goal；请先 /goal clear。[/yellow]")
+                return
+            task_id = current.task_id
         store = LongTaskStore.for_repository(
             self.runtime.repository,
             session_directory=self.runtime.session_store.directory,
         )
+        if not task_id:
+            candidates = []
+            for path in store.directory.glob("*/events.jsonl"):
+                try:
+                    candidate = store.replay(path.parent.name)
+                except (OSError, ValueError):
+                    continue
+                if candidate.session_id == self.runtime.agent.session_id and candidate.status in {
+                    LongTaskStatus.SETUP, LongTaskStatus.RUNNING, LongTaskStatus.PAUSED,
+                    LongTaskStatus.RECOVERY_REQUIRED,
+                }:
+                    candidates.append(candidate.task_id)
+            if len(candidates) != 1:
+                detail = ", ".join(sorted(candidates)) or "none"
+                self.console.print(f"[yellow]无法唯一确定可恢复 Goal（{detail}）；请使用 /goal resume <goal-id>。[/yellow]")
+                return
+            task_id = candidates[0]
         try:
             task = store.replay(task_id)
         except (OSError, ValueError) as error:
             self.console.print(f"[red]Could not resume Goal: {error}[/red]")
+            return
+        if task.status in {
+            LongTaskStatus.SUCCEEDED, LongTaskStatus.FAILED,
+            LongTaskStatus.CANCELLED, LongTaskStatus.LIMIT_REACHED,
+        }:
+            self.console.print(f"[yellow]Goal 已结束，不能恢复：{task.task_id} ({task.status.value})[/yellow]")
             return
         if task.session_id != self.runtime.agent.session_id:
             self.console.print(
                 "[yellow]该 Goal 属于另一个 Session；请先 /resume <session-id>，再执行 /goal resume <goal-id>。[/yellow]"
             )
             return
-        workflow = LongTaskWorkflow(
-            self.runtime,
-            task_id=task.task_id,
-            goal=task.goal,
-            budget=task.budget,
+        workflow = self._goal_workflow or LongTaskWorkflow(
+            self.runtime, task_id=task.task_id, goal=task.goal, budget=task.budget,
         )
         try:
-            current = workflow.start_or_resume(reason="Resumed from Chat Goal command")
+            current = workflow.create_for_setup() if task.status is LongTaskStatus.SETUP else workflow.start_or_resume(
+                reason="Resumed from Chat Goal command"
+            )
         except LongTaskStateError as error:
             self.console.print(f"[red]Could not resume Goal: {error}[/red]")
             return
         self._goal_workflow = workflow
-        self.console.print(f"[green]Goal resumed: {current.task_id} ({current.status.value})[/green]")
+        label = "Goal attached" if current.status is LongTaskStatus.RECOVERY_REQUIRED else "Goal resumed"
+        self.console.print(f"[green]{label}: {current.task_id} ({current.status.value})[/green]")
+        if current.status is LongTaskStatus.SETUP:
+            if workflow.setup_proposal is not None:
+                self._show_setup_proposal()
+            else:
+                try:
+                    response = workflow.prepare_setup(current.goal)
+                except Exception as error:
+                    self.console.print(f"[yellow]Goal 验收约定尚未形成：{error}[/yellow]")
+                else:
+                    self._show_setup_proposal()
+                    if response and not getattr(self.runtime.agent.event_sink, "last_turn_streamed", False):
+                        self.console.print(Markdown(response))
+        elif current.status is LongTaskStatus.RUNNING and current.selected_step_needs_evaluation:
+            try:
+                _task, assessment = workflow.evaluate_selected_step()
+                self.console.print(f"[dim]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/dim]")
+            except (OSError, LongTaskStateError, ValueError) as error:
+                self.console.print(f"[yellow]Goal 暂停在评估边界：{error}[/yellow]")
+        if self._goal_workflow is not None:
+            refreshed = workflow.store.replay(workflow.task_id)
+            if refreshed.status is LongTaskStatus.RUNNING:
+                completion = self._settle_goal_completion(workflow, refreshed)
+                if (
+                    completion == "pending"
+                    and not (refreshed.selected_step_assessment is not None
+                             and refreshed.selected_step_assessment.status.value != "verified")
+                ):
+                    try:
+                        response = self._advance_goal("Continue the saved Goal from its verified boundary.")
+                    except (OSError, LongTaskStateError, ValueError) as error:
+                        self.console.print(f"[yellow]Goal 在安全边界停止：{error}[/yellow]")
+                    else:
+                        if response and not getattr(self.runtime.agent.event_sink, "last_turn_streamed", False):
+                            self.console.print(Markdown(response))
         self._show_goal_status()
 
     def _show_goal_status(self) -> None:
@@ -605,15 +730,24 @@ class ChatSession:
             self.console.print(f"[red]Could not read Goal status: {error}[/red]")
             return
         shared_effect_issue = None
+        session_evidence_issue = None
         if task.session_id and workflow.runtime.session_store is not None:
             try:
                 journal = EffectJournalStore.for_session_directory(workflow.runtime.session_store.directory).replay(task.session_id)
                 if journal.warnings:
                     shared_effect_issue = "Effect Journal has invalid or incomplete events"
                 elif journal.ambiguous_entries:
-                    shared_effect_issue = "Unresolved Tool effects: " + ", ".join(item.tool_call_id for item in journal.ambiguous_entries)
+                    shared_effect_issue = "Unresolved Tool effects: " + ", ".join(
+                        f"{item.tool_call_id} ({item.tool_name})" for item in journal.ambiguous_entries
+                    )
             except OSError as error:
                 shared_effect_issue = f"Effect Journal could not be read: {error}"
+            try:
+                session = workflow.runtime.session_store.replay(task.session_id)
+                if session.warnings:
+                    session_evidence_issue = session.warnings[0]
+            except (OSError, ValueError) as error:
+                session_evidence_issue = f"Session could not be read: {error}"
         table = Table(show_header=False, box=None, padding=(0, 1))
         table.add_column("Field", style="cyan")
         table.add_column("Value")
@@ -640,13 +774,45 @@ class ChatSession:
             table.add_row("Unknown effects", ", ".join(task.ambiguous_effect_ids))
         if shared_effect_issue:
             table.add_row("Shared effect blocker", shared_effect_issue)
+        if session_evidence_issue:
+            table.add_row("Session evidence blocker", session_evidence_issue)
+        blocker_type = None
+        blocker_detail = None
+        blocker_next_action = None
+        if shared_effect_issue:
+            blocker_type = "effect_outcome_unknown"
+            blocker_detail = shared_effect_issue
+            blocker_next_action = (
+                "Resume the Goal to check durable Runtime control evidence; "
+                "if no proof exists, this Tool Call remains blocked and must not be rerun"
+            )
+        elif session_evidence_issue or task.active_recovery_code == "session_evidence_invalid":
+            blocker_type = "session_evidence_invalid"
+            blocker_detail = session_evidence_issue or task.active_recovery_reason
+            blocker_next_action = "Restore trustworthy Session evidence before continuing; do not replay the prior turn"
+        elif task.recovery_blockers:
+            blocker_type = "task_evidence_invalid"
+            blocker_detail = ", ".join(task.recovery_blockers)
+            blocker_next_action = "Inspect the durable Task events; Goal cannot advance with invalid evidence"
+        elif task.status is LongTaskStatus.RECOVERY_REQUIRED:
+            blocker_type = task.active_recovery_code or "recovery_required"
+            blocker_detail = task.active_recovery_reason or "Runtime recovery has no verified outcome"
+            blocker_next_action = "Inspect the recorded blocker before continuing; do not rerun an unknown effect"
+        elif task.selected_step_assessment is not None and task.selected_step_assessment.status.value == "blocked":
+            blocker_type = "stage_check_blocked"
+            blocker_detail = task.selected_step_assessment.detail
+            blocker_next_action = task.selected_step_assessment.next_action
+        if blocker_type:
+            table.add_row("Blocker type", blocker_type)
+            table.add_row("Blocker detail", blocker_detail or "No verified outcome")
         plan = task.plan
         if plan is None:
             table.add_row("Stage plan", "unplanned")
             next_action = (
-                "Reconcile Goal recovery before another turn"
-                if task.status is LongTaskStatus.RECOVERY_REQUIRED or task.recovery_blockers or task.ambiguous_effect_ids or shared_effect_issue
-                else "Record a stage plan with /goal plan load <json-file>, or continue the legacy Goal manually"
+                blocker_next_action
+                or (("Confirm the proposed acceptance contract in Chat" if workflow.setup_proposal is not None
+                     else "Describe a verifiable acceptance check in ordinary Chat") if task.status is LongTaskStatus.SETUP
+                    else "Continue in ordinary Chat; Runtime will verify the final evidence")
             )
             table.add_row("Next action", next_action)
         else:
@@ -675,303 +841,22 @@ class ChatSession:
                 table.add_row(label, f"{latest_assessment.step_id}: {latest_assessment.status.value} — {latest_assessment.detail}")
                 table.add_row("Evidence events", ", ".join(latest_assessment.evidence_event_ids))
                 table.add_row("Evidence Tool Calls", ", ".join(latest_assessment.tool_call_ids) or "none")
-            if task.recovery_blockers or task.ambiguous_effect_ids or shared_effect_issue or task.status is LongTaskStatus.RECOVERY_REQUIRED:
-                next_action = "Inspect recovery blockers and reconcile unknown effects before continuing"
+            if blocker_next_action:
+                next_action = blocker_next_action
             elif task.selected_step_needs_evaluation and selected is not None:
-                next_action = "Run /goal evaluate to assess the saved checkpoint without rerunning the turn"
+                next_action = "Resume to assess the saved checkpoint without rerunning the turn"
             elif task.selected_step_assessment is not None:
                 next_action = task.selected_step_assessment.next_action
             elif selected is not None:
                 next_action = selected.next_action
             elif task.ready_step_ids:
-                next_action = f"Select a stage with /goal plan select {task.ready_step_ids[0]}"
+                next_action = f"Continue in ordinary Chat; next ready stage is {task.ready_step_ids[0]}"
             elif len(task.verified_step_ids) == len(plan.steps):
                 next_action = "All stages verified; review final Goal criteria and completion claim"
             else:
                 next_action = "No stage is ready; inspect the dependency contract"
             table.add_row("Next action", next_action)
         self.console.print(table)
-
-    def _goal_plan(self, value: str) -> None:
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        command, separator, argument = value.partition(" ")
-        normalized = command.lower()
-        argument = argument.strip()
-        if not value or (normalized == "show" and not separator):
-            self._show_goal_plan()
-            return
-        if normalized == "select" and argument:
-            try:
-                task = workflow.store.select_goal_step(workflow.task_id, argument)
-            except (OSError, LongTaskStateError, TypeError, ValueError) as error:
-                self.console.print(f"[red]Could not select Goal stage: {error}[/red]")
-                return
-            self.console.print(f"[green]Selected Goal stage: {task.selected_step_id}[/green]")
-            self._show_goal_status()
-            return
-        if normalized == "load" and argument:
-            try:
-                repository = self.runtime.repository.resolve()
-                source = (repository / argument).resolve()
-                if not source.is_relative_to(repository) or not source.is_file():
-                    raise ValueError("Goal plan file must be a file inside the repository")
-                if source.stat().st_size > 64_000:
-                    raise ValueError("Goal plan file is too large")
-                document = json.loads(source.read_text(encoding="utf-8"))
-                task = workflow.store.record_goal_plan(workflow.task_id, document)
-            except (OSError, LongTaskStateError, TypeError, ValueError) as error:
-                self.console.print(f"[red]Could not load Goal plan: {error}[/red]")
-                return
-            self.console.print(f"[green]Recorded Goal stage plan v{task.plan.version}[/green]")
-            self._show_goal_status()
-            return
-        self.console.print("[yellow]Usage: /goal plan [show|load <repo-relative-json>|select <step-id>][/yellow]")
-
-    def _show_goal_plan(self) -> None:
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        try:
-            task = workflow.store.replay(workflow.task_id)
-        except (OSError, ValueError) as error:
-            self.console.print(f"[red]Could not read Goal plan: {error}[/red]")
-            return
-        plan = task.plan
-        if plan is None:
-            self.console.print("[dim]Goal is unplanned. Use /goal plan load <repo-relative-json>.[/dim]")
-            return
-        self.console.print(f"[cyan]Goal stage plan v{plan.version}[/cyan] — {plan.reason}")
-        if len(task.plans) > 1:
-            self.console.print("History: " + "; ".join(f"v{item.version}: {item.reason}" for item in task.plans))
-        for step in plan.steps:
-            if step.step_id in task.verified_step_ids:
-                state = "verified"
-            elif step.step_id == task.selected_step_id:
-                state = "needs_evaluation" if task.selected_step_needs_evaluation else "active"
-                if task.selected_step_assessment is not None:
-                    state = task.selected_step_assessment.status.value
-            else:
-                state = "blocked" if any(dependency not in task.verified_step_ids for dependency in step.dependencies) else "pending (awaiting evaluation)" if task.selected_step_needs_evaluation else "pending (ready)"
-            self.console.print(f"[bold]{step.step_id}[/bold] ({state}): {step.goal}")
-            self.console.print(f"  Depends on: {', '.join(step.dependencies) or 'none'}")
-            self.console.print(f"  Output: {step.expected_output}")
-            self.console.print(f"  Scope: {', '.join(step.work_scope)}")
-            self.console.print(f"  Evidence: {step.evidence}; check: {step.check}")
-            self.console.print(f"  Next: {step.next_action}")
-
-    def _evaluate_goal_stage(self) -> None:
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        try:
-            _task, assessment = workflow.evaluate_selected_step()
-        except (OSError, LongTaskStateError, ValueError) as error:
-            self.console.print(f"[red]Could not evaluate Goal stage: {error}[/red]")
-            self._show_goal_status()
-            return
-        self.console.print(f"[green]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/green]")
-        self._show_goal_status()
-
-    def _review_goal_stage(self, value: str) -> None:
-        status_text, separator, reason = value.partition(" ")
-        if not separator or not reason.strip():
-            self.console.print("[yellow]Usage: /goal review <verified|blocked> <reason>[/yellow]")
-            return
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        try:
-            status = GoalStageAssessmentStatus(status_text)
-            workflow.review_selected_step(status, reason=reason)
-        except (OSError, LongTaskStateError, ValueError) as error:
-            self.console.print(f"[red]Could not review Goal stage: {error}[/red]")
-            return
-        self.console.print(f"[green]Goal stage review recorded: {status.value}[/green]")
-        self._show_goal_status()
-
-    def _record_goal_constraint(self, text: str) -> None:
-        if not text:
-            self.console.print("[yellow]Usage: /goal constraint <rule>[/yellow]")
-            return
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        action, separator, argument = text.partition(" ")
-        if action.lower() == "remove":
-            if not separator or not argument.strip():
-                self.console.print("[yellow]Usage: /goal constraint remove <id>[/yellow]")
-                return
-            try:
-                workflow.store.remove_constraint(
-                    workflow.task_id,
-                    argument.strip(),
-                    reason="Removed by user from Chat Goal command",
-                )
-            except (OSError, LongTaskStateError, ValueError) as error:
-                self.console.print(f"[red]Could not remove Goal constraint: {error}[/red]")
-                return
-            self.console.print(f"[green]Goal constraint removed: {argument.strip()}[/green]")
-            return
-        try:
-            task = workflow.record_constraint(text)
-        except (OSError, LongTaskStateError, ValueError) as error:
-            self.console.print(f"[red]Could not record Goal constraint: {error}[/red]")
-            return
-        constraint = next((item for item in task.active_constraints if item.text == text.strip()), None)
-        if constraint is None:
-            self.console.print("[yellow]Goal constraint was already recorded.[/yellow]")
-            return
-        self.console.print(f"[green]Goal constraint recorded: {constraint.constraint_id}[/green]")
-
-    def _show_goal_constraints(self) -> None:
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        try:
-            task = workflow.store.replay(workflow.task_id)
-        except (OSError, ValueError) as error:
-            self.console.print(f"[red]Could not read Goal constraints: {error}[/red]")
-            return
-        if not task.active_constraints:
-            self.console.print("[dim]No confirmed hard constraints for this Goal.[/dim]")
-            return
-        table = Table(title="Goal hard constraints", show_header=True)
-        table.add_column("ID", style="cyan")
-        table.add_column("Source")
-        table.add_column("Rule")
-        for constraint in task.active_constraints:
-            table.add_row(constraint.constraint_id, constraint.source, constraint.text)
-        self.console.print(table)
-
-    def _record_goal_criterion(self, text: str) -> None:
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        before_ids = {criterion.criterion_id for criterion in workflow.store.replay(workflow.task_id).active_completion_criteria}
-        action, separator, remainder = text.partition(" ")
-        normalized = action.lower()
-        remainder = remainder.strip()
-        if normalized == "remove":
-            if not remainder:
-                self.console.print("[yellow]Usage: /goal criterion remove <id>[/yellow]")
-                return
-            try:
-                workflow.store.remove_completion_criterion(
-                    workflow.task_id,
-                    remainder,
-                    reason="Removed by user from Chat Goal command",
-                )
-            except (OSError, LongTaskStateError, ValueError) as error:
-                self.console.print(f"[red]Could not remove completion criterion: {error}[/red]")
-                return
-            self.console.print(f"[green]Goal completion criterion removed: {remainder}[/green]")
-            return
-        try:
-            if normalized == "file-exists" and remainder:
-                task = workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path=remainder)
-            elif normalized == "file-contains":
-                path, separator, expected = remainder.partition(" ")
-                if not path or not separator or not expected.strip():
-                    raise ValueError("file-contains requires a path and expected text")
-                task = workflow.record_completion_criterion(
-                    CompletionCriterionKind.FILE_CONTAINS,
-                    path=path,
-                    expected_text=expected.strip(),
-                )
-            elif normalized == "test-command" and remainder:
-                task = workflow.record_completion_criterion(CompletionCriterionKind.TEST_COMMAND, command=remainder)
-            else:
-                self.console.print(
-                    "[yellow]Usage: /goal criterion file-exists <path> | "
-                    "file-contains <path> <text> | test-command <command>[/yellow]"
-                )
-                return
-        except (OSError, LongTaskStateError, ValueError) as error:
-            self.console.print(f"[red]Could not record completion criterion: {error}[/red]")
-            return
-        criterion = next(
-            (item for item in task.active_completion_criteria if item.criterion_id not in before_ids),
-            None,
-        )
-        if criterion is None:
-            self.console.print("[yellow]Goal completion criterion was already recorded.[/yellow]")
-            return
-        self.console.print(f"[green]Goal completion criterion recorded: {criterion.criterion_id}[/green]")
-
-    def _show_goal_criteria(self) -> None:
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        try:
-            task = workflow.store.replay(workflow.task_id)
-        except (OSError, ValueError) as error:
-            self.console.print(f"[red]Could not read Goal completion criteria: {error}[/red]")
-            return
-        if not task.active_completion_criteria:
-            self.console.print("[dim]No Runtime completion criteria. Add one before /goal complete.[/dim]")
-            return
-        table = Table(title="Goal completion criteria", show_header=True)
-        table.add_column("ID", style="cyan")
-        table.add_column("Kind")
-        table.add_column("Check")
-        for criterion in task.active_completion_criteria:
-            if criterion.kind is CompletionCriterionKind.FILE_EXISTS:
-                check = criterion.path or ""
-            elif criterion.kind is CompletionCriterionKind.FILE_CONTAINS:
-                check = f"{criterion.path}: contains {criterion.expected_text!r}"
-            else:
-                check = f"exact command exits 0: {criterion.command}"
-            table.add_row(criterion.criterion_id, criterion.kind.value, check)
-        self.console.print(table)
-
-    def _recover_goal_effect(self, value: str) -> None:
-        """Write a user-confirmed effect fact, then reopen the blocked Goal."""
-
-        workflow = self._require_goal()
-        if workflow is None:
-            return
-        parts = value.split(maxsplit=2)
-        if len(parts) != 3:
-            self.console.print(
-                "[yellow]Usage: /goal recover <tool-call-id> <completed|not-executed> <reason>[/yellow]"
-            )
-            return
-        tool_call_id, disposition, reason = parts
-        normalized = disposition.lower()
-        if normalized == "completed":
-            state = EffectJournalState.FINISHED
-            outcome = ToolResult(f"[reconciled completed] {reason}", ToolStatus.COMPLETED)
-        elif normalized == "not-executed":
-            state = EffectJournalState.NOT_EXECUTED
-            outcome = ToolResult(f"[reconciled not executed] {reason}", ToolStatus.NOT_EXECUTED)
-        else:
-            self.console.print(
-                "[yellow]Effect outcome must be completed or not-executed; it is never inferred from a model reply.[/yellow]"
-            )
-            return
-        journal = EffectJournalStore.for_session_directory(self.runtime.session_store.directory)
-        try:
-            entry = journal.reconcile(
-                self.runtime.agent.session_id,
-                tool_call_id,
-                state=state,
-                result=outcome,
-                reason=reason,
-            )
-            task = workflow.store.replay(workflow.task_id)
-            if task.status is LongTaskStatus.RECOVERY_REQUIRED:
-                task = workflow.store.resume(
-                    workflow.task_id,
-                    reason="Shared Effect Journal reconciled by user from Chat Goal command",
-                )
-        except (OSError, LongTaskStateError, ValueError) as error:
-            self.console.print(f"[red]Could not reconcile Goal effect: {error}[/red]")
-            return
-        self.console.print(
-            f"[green]Goal effect reconciled: {entry.tool_call_id} ({entry.state.value}); Goal {task.status.value}.[/green]"
-        )
 
     def _require_goal(self) -> LongTaskWorkflow | None:
         if self._goal_workflow is None:
@@ -1077,7 +962,9 @@ class ChatSession:
         if store is None:
             self.console.print("[yellow]Event Session storage is unavailable for this runtime.[/yellow]")
             return
-        self._ensure_session_persisted()
+        if not self._ensure_session_persisted():
+            self.console.print("[yellow]Current Session could not be confirmed as saved.[/yellow]")
+            return
         self.console.print(
             f"[green]自动保存已开启。[/green] Session: {self.runtime.agent.session_id}\n"
             f"Events: {store.directory / (self.runtime.agent.session_id + '.jsonl')}"
@@ -1163,7 +1050,7 @@ class ChatSession:
         )
         if self._goal_workflow is not None:
             self._goal_workflow = None
-            self.console.print("[yellow]已解绑旧 Session 的 Goal；如需继续，请使用 /goal resume <goal-id>。[/yellow]")
+            self.console.print("[yellow]已解绑旧 Session 的 Goal；如需继续，请使用 /goal resume。[/yellow]")
         self._show_recovery_notices()
 
     def _details(self, value: str) -> None:
@@ -1262,14 +1149,16 @@ class ChatSession:
             border_style=_detail_border_style(detail.status),
         ))
 
-    def _ensure_session_persisted(self) -> None:
+    def _ensure_session_persisted(self) -> bool:
         ensure = getattr(self.runtime, "ensure_persisted", None)
         if ensure is None:
-            return
+            return True
         try:
             ensure()
         except OSError as error:
             self.console.print(f"[red]Session autosave error: {error}[/red]")
+            return False
+        return True
 
     def _model(self, name: str) -> None:
         if name:

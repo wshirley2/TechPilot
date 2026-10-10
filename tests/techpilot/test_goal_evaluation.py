@@ -10,11 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from techpilot.engine.events import CallbackEventSink
+from techpilot.engine.events import CallbackEventSink, RuntimeEventType
 from techpilot.engine.llm import LLMResponse, ToolCall
 from techpilot.engine.permissions import PermissionDecision
+from techpilot.engine.tool_execution import ToolEffect
 from techpilot.engine.tools import BashTool, WriteFileTool
 from techpilot.runtime import (
+    EffectJournalState,
+    EffectJournalStore,
     GoalStageAssessmentStatus,
     LongTaskRecoveryRequired,
     LongTaskStateError,
@@ -23,6 +26,7 @@ from techpilot.runtime import (
     RuntimeBootstrap,
     RuntimeBootstrapInput,
 )
+from techpilot.runtime.sessions import SessionEvent, SessionStore
 
 
 class FixedProvider:
@@ -169,7 +173,7 @@ def test_failed_file_check_stays_blocked_until_explicit_same_stage_retry(tmp_pat
     assert failed.session_event_cursor in failed.evidence_event_ids
     assert task.ready_step_ids == ()
     assert task.verified_step_ids == ()
-    with pytest.raises(LongTaskStateError, match="requires review or replanning"):
+    with pytest.raises(LongTaskStateError, match="requires replanning"):
         workflow.run_step("unsafe automatic retry")
     with pytest.raises(LongTaskStateError, match="unevaluated checkpoint"):
         workflow.evaluate_selected_step()
@@ -226,7 +230,7 @@ def test_permission_rejection_and_model_claim_cannot_verify_file_stage(tmp_path)
     assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "preexisting\n"
 
 
-def test_natural_language_check_requires_explicit_user_review(tmp_path):
+def test_natural_language_check_blocks_without_user_override(tmp_path):
     runtime = _runtime(tmp_path, FixedProvider([LLMResponse(content="I completed it")]))
     workflow = _planned(
         runtime,
@@ -235,18 +239,28 @@ def test_natural_language_check_requires_explicit_user_review(tmp_path):
     )
     workflow.run_step("inspect")
     task, assessment = workflow.evaluate_selected_step()
-    assert assessment.status is GoalStageAssessmentStatus.NEEDS_REVIEW
+    assert assessment.status is GoalStageAssessmentStatus.BLOCKED
     assert assessment.tool_call_ids == ()
     assert task.ready_step_ids == ()
-    with pytest.raises(LongTaskStateError, match="requires review or replanning"):
+    assert "no structured Runtime verifier" in assessment.detail
+    assert "do not rerun an unknown effect" in assessment.next_action
+    with pytest.raises(LongTaskStateError, match="requires replanning"):
         workflow.run_step("continue without review")
 
-    reviewed = workflow.review_selected_step(GoalStageAssessmentStatus.VERIFIED, reason="I checked the investigation")
-    assert reviewed.verified_step_ids == ("inspect",)
-    assert reviewed.ready_step_ids == ("next",)
-    assert reviewed.stage_assessments[-1].source == "user_review"
-    with pytest.raises(LongTaskStateError, match="Only a needs_review"):
-        workflow.review_selected_step(GoalStageAssessmentStatus.BLOCKED, reason="change mind")
+
+def test_legacy_user_review_assessments_remain_readable_but_cannot_be_newly_written(tmp_path):
+    runtime = _runtime(tmp_path, FixedProvider([LLMResponse(content="I completed it")]))
+    workflow = _planned(runtime, _step("inspect", "Review the investigation"))
+    workflow.run_step("inspect")
+    _task, assessment = workflow.evaluate_selected_step()
+
+    legacy = type(assessment).from_payload({**assessment.to_payload(), "source": "user_review"})
+    assert legacy.source == "user_review"
+    with (
+        workflow.store.acquire_lease(workflow.task_id) as lease,
+        pytest.raises(LongTaskStateError, match="must come from the Runtime evaluator"),
+    ):
+        workflow.store.record_stage_assessment(workflow.task_id, legacy, lease=lease)
 
 
 def test_missing_session_cursor_requires_recovery_without_rerunning_tool(tmp_path):
@@ -267,9 +281,108 @@ def test_missing_session_cursor_requires_recovery_without_rerunning_tool(tmp_pat
     with pytest.raises(LongTaskRecoveryRequired, match="cursor"):
         workflow.evaluate_selected_step()
 
-    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.RECOVERY_REQUIRED
+    recovered = workflow.store.replay(workflow.task_id)
+    assert recovered.status is LongTaskStatus.RECOVERY_REQUIRED
+    assert recovered.active_recovery_code == "session_evidence_invalid"
     assert runtime.agent.tool_executor.calls == tool_calls_before == 1
     assert len(provider.requests) == requests_before
+
+
+@pytest.mark.parametrize("scenario", ["normal", "later_turn", "append_failure", "append_then_error"])
+def test_control_block_proof_completes_session_history_without_rerunning_tool(tmp_path, monkeypatch, scenario):
+    provider = FixedProvider([])
+    runtime = _runtime(tmp_path, provider)
+    workflow = _planned(runtime, _step("inspect", "Review the investigation"))
+    session_id = runtime.agent.session_id
+    arguments = {"file_path": "result.txt", "content": "new\n"}
+    runtime.session_store.append(SessionEvent(
+        event_type=RuntimeEventType.TOOL_REQUESTED.value,
+        session_id=session_id,
+        turn_id="interrupted-turn",
+        tool_call_id="blocked-write",
+        payload={"tool_name": "write_file", "arguments": arguments},
+    ))
+    journal = EffectJournalStore.for_session_directory(runtime.session_store.directory)
+    journal.start(
+        session_id=session_id,
+        tool_call_id="blocked-write",
+        tool_name="write_file",
+        arguments=arguments,
+        effect=ToolEffect.WRITE,
+    )
+    runtime.session_store.append(SessionEvent(
+        event_type=RuntimeEventType.EXECUTION_CONTROL_ASSESSED.value,
+        session_id=session_id,
+        turn_id="interrupted-turn",
+        tool_call_id="blocked-write",
+        payload={"tool_name": "write_file", "required_control": "block"},
+    ))
+    if scenario == "later_turn":
+        runtime.session_store.append(SessionEvent(
+            event_type=RuntimeEventType.TURN_STARTED.value,
+            session_id=session_id,
+            turn_id="later-turn",
+            payload={"user_input": "later request"},
+        ))
+    workflow.store.require_recovery(workflow.task_id, reason="Unknown Tool outcome")
+
+    restarted_runtime = _runtime(tmp_path, provider, session_id=session_id)
+    resumed_workflow = LongTaskWorkflow(restarted_runtime, task_id=workflow.task_id, goal="Complete the fixture")
+    if scenario in {"append_failure", "append_then_error"}:
+        original_append = SessionStore.append
+
+        def fail_recovered_result(store, event):
+            if event.event_type == RuntimeEventType.TOOL_COMPLETED.value and "recovery" in event.payload:
+                if scenario == "append_then_error":
+                    original_append(store, event)
+                raise OSError("simulated Session write failure")
+            return original_append(store, event)
+
+        monkeypatch.setattr(SessionStore, "append", fail_recovered_result)
+    resumed = resumed_workflow.start_or_resume()
+
+    assert journal.replay(session_id).entries["blocked-write"].state is EffectJournalState.NOT_EXECUTED
+    if scenario == "append_then_error":
+        assert resumed.status is LongTaskStatus.RECOVERY_REQUIRED
+        monkeypatch.setattr(SessionStore, "append", original_append)
+        resumed = resumed_workflow.start_or_resume()
+        assert resumed.status is LongTaskStatus.RUNNING
+        assert restarted_runtime.agent.messages == restarted_runtime.session_store.replay(session_id).model_messages
+        assert provider.requests == []
+        assert restarted_runtime.agent.tool_executor.calls == 0
+        return
+    if scenario != "normal":
+        assert resumed.status is LongTaskStatus.RECOVERY_REQUIRED
+        assert resumed.active_recovery_code == "session_evidence_invalid"
+        assert not any(
+            event.event_type == RuntimeEventType.TOOL_COMPLETED.value
+            for event in restarted_runtime.session_store.replay(session_id).events
+        )
+        assert provider.requests == []
+        assert restarted_runtime.agent.tool_executor.calls == 0
+        return
+    assert resumed.status is LongTaskStatus.RUNNING
+    projection = restarted_runtime.session_store.replay(session_id)
+    assert projection.warnings == []
+    assert projection.model_messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "blocked-write",
+        "content": journal.replay(session_id).entries["blocked-write"].result,
+    }
+    assert restarted_runtime.agent.messages == projection.model_messages
+    recovered_events = [
+        event for event in projection.events
+        if event.event_type == RuntimeEventType.TOOL_COMPLETED.value and event.tool_call_id == "blocked-write"
+    ]
+    assert len(recovered_events) == 1
+    assert recovered_events[0].payload["recovery"]["source"] == "effect_journal_verified"
+    resumed_workflow.start_or_resume()
+    assert len([
+        event for event in restarted_runtime.session_store.replay(session_id).events
+        if event.event_type == RuntimeEventType.TOOL_COMPLETED.value and event.tool_call_id == "blocked-write"
+    ]) == 1
+    assert provider.requests == []
+    assert restarted_runtime.agent.tool_executor.calls == 0
 
 
 def test_process_exit_leaves_checkpoint_for_read_only_assessment(tmp_path):

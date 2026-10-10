@@ -45,11 +45,11 @@ class GrepTool(Tool):
         try:
             regex = re.compile(pattern)
         except re.error as e:
-            return f"Invalid regex: {e}"
+            return ToolResult(f"Invalid regex: {e}", ToolStatus.ERROR)
 
         base = Path(path).expanduser().resolve()
         if not base.exists():
-            return f"Error: {path} not found"
+            return ToolResult(f"Error: {path} not found", ToolStatus.ERROR)
 
         if base.is_file():
             files = [base]
@@ -70,9 +70,12 @@ class GrepTool(Tool):
                     matches.append(f"{_display_path(fp, display_root)}:{lineno}: {line.rstrip()}")
                     if len(matches) >= 200:
                         matches.append("... (200 match limit reached)")
-                        return ToolResult("\n".join(matches))
+                        return ToolResult("\n".join(matches), ToolStatus.COMPLETED)
 
-        return ToolResult("\n".join(matches) if matches else "No matches found.")
+        return ToolResult(
+            "\n".join(matches) if matches else "No matches found.",
+            ToolStatus.COMPLETED,
+        )
 
     @staticmethod
     def _walk(root: Path, include: str | None) -> list[Path]:

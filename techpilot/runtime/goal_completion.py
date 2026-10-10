@@ -29,8 +29,8 @@ class GoalCompletionTool(Tool):
 
     name = GOAL_COMPLETION_TOOL_NAME
     description = (
-        "Propose that the current Goal is ready for user confirmation. "
-        "Reference completed Tool Call IDs from this Goal step. This does not complete the Goal."
+        "Propose that the current Goal is ready for Runtime verification. "
+        "Reference completed Tool Call IDs from this Goal step. The proposal alone does not complete the Goal."
     )
     parameters = {
         "type": "object",
@@ -72,6 +72,6 @@ class GoalCompletionTool(Tool):
             return ToolResult(f"Error: completion proposal rejected: {error}", ToolStatus.ERROR)
         return ToolResult(
             "Completion proposal received. Runtime will verify the cited Session evidence after this Goal step; "
-            "the Goal remains running until the user confirms it.",
+            "the Goal remains running unless every acceptance check passes.",
             ToolStatus.COMPLETED,
         )

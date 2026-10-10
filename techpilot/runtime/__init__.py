@@ -14,6 +14,7 @@ from .effect_journal import (
     EffectJournalProjection,
     EffectJournalState,
     EffectJournalStore,
+    EffectVerification,
 )
 from .extensions import (
     RUNTIME_ROLE_API_VERSION,
@@ -73,6 +74,7 @@ __all__ = [
     "EffectJournalProjection",
     "EffectJournalState",
     "EffectJournalStore",
+    "EffectVerification",
     "EvaluationInterface",
     "GoalCompletionProposal",
     "GoalCompletionTool",

@@ -6,6 +6,8 @@ execution and effect recovery stay in the shared Runtime Effect Journal.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +22,8 @@ from .bootstrap import TaskRuntime
 from .effect_journal import EffectJournalStore
 from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
 from .goal_evaluation import GoalStageEvidenceError, evaluate_goal_stage
-from .goal_plans import GoalStageAssessment, GoalStageAssessmentStatus
+from .goal_plans import GoalStageAssessment
+from .goal_setup import GoalSetupProposal, GoalSetupTool
 from .long_tasks import (
     CompletionCriterionKind,
     EffectDisposition,
@@ -38,7 +41,7 @@ from .long_tasks import (
 
 
 class LongTaskRecoveryRequired(LongTaskStateError):
-    """A Goal cannot advance until shared Runtime recovery is reconciled."""
+    """A Goal cannot advance until shared Runtime recovery has a verifiable outcome."""
 
 
 FaultHook = Callable[[str, str], None]
@@ -77,6 +80,7 @@ class LongTaskWorkflow:
             session_directory=runtime.session_store.directory,
         )
         self._completion_proposal: GoalCompletionProposal | None = None
+        self._setup_proposal: GoalSetupProposal | None = None
 
     def start_or_resume(self, *, reason: str = "continue explicit long Task") -> LongTaskProjection:
         """Create once, or re-evaluate a prior Task before another controlled turn."""
@@ -93,6 +97,18 @@ class LongTaskWorkflow:
             )
         if task.repository_root != self.runtime.repository or task.session_id != self.runtime.agent.session_id:
             raise LongTaskStateError("Long Task does not belong to this Runtime Session")
+        if task.status in {
+            LongTaskStatus.SUCCEEDED,
+            LongTaskStatus.FAILED,
+            LongTaskStatus.CANCELLED,
+            LongTaskStatus.LIMIT_REACHED,
+        }:
+            return task
+        try:
+            self._require_effect_recovery_clear(task)
+        except LongTaskRecoveryRequired:
+            return self.store.replay(self.task_id)
+        task = self.store.replay(self.task_id)
         if task.status in {LongTaskStatus.PAUSED, LongTaskStatus.RECOVERY_REQUIRED} or task.ambiguous_effect_ids:
             task = self.store.resume(self.task_id, reason=reason)
         return task
@@ -118,6 +134,77 @@ class LongTaskWorkflow:
     def start(self, *, reason: str = "started from Chat Goal command") -> LongTaskProjection:
         return self.store.start(self.task_id, reason=reason)
 
+    @property
+    def setup_proposal(self) -> GoalSetupProposal | None:
+        return self._setup_proposal
+
+    def prepare_setup(self, user_input: str) -> str:
+        """Investigate an acceptance contract without exposing write Tools."""
+
+        task = self.create_for_setup()
+        if task.status is not LongTaskStatus.SETUP:
+            raise LongTaskStateError(f"Goal setup cannot continue: {task.status.value}")
+        self._setup_proposal = None
+        context = "\n".join((
+            "## Read-only Goal setup",
+            f"Required outcome: {task.goal}",
+            "Investigate only with the available read Tools. No writes or commands are available.",
+            "Propose only checks that actually verify the requested outcome. Do not invent hard constraints.",
+            "If evidence is insufficient, ask a specific clarification question instead of calling propose_goal_setup.",
+            "When the contract is clear, call propose_goal_setup exactly once with 1–12 structured completion checks.",
+            "A short Goal can use plan=null. A multi-stage Goal may include a bounded structured plan.",
+            "The proposal must be confirmed by the user before any Goal execution starts.",
+        ))
+        read_tools = frozenset({"read_file", "glob", "grep", "now", GoalSetupTool.name})
+        with self.runtime.goal_scope(
+            context,
+            tools=(GoalSetupTool(self._submit_setup_proposal),),
+            allowed_tool_names=read_tools,
+        ):
+            return self.runtime.run_turn(user_input)
+
+    def _submit_setup_proposal(self, proposal: GoalSetupProposal) -> None:
+        if self._setup_proposal is not None:
+            raise ValueError("only one Goal setup proposal is allowed per turn")
+        self._setup_proposal = proposal
+
+    def accept_setup(self, proposal: GoalSetupProposal) -> LongTaskProjection:
+        """Persist a user-confirmed contract, then leave SETUP."""
+
+        task = self.store.replay(self.task_id)
+        if task.status is not LongTaskStatus.SETUP:
+            raise LongTaskStateError(f"Goal setup cannot be accepted: {task.status.value}")
+        # Revalidate an ephemeral proposal before the first durable write.
+        proposal = GoalSetupTool._validate(
+            proposal.summary, list(proposal.constraints), list(proposal.criteria), proposal.plan,
+        )
+        for constraint in proposal.constraints:
+            task = self.store.record_constraint(
+                self.task_id, constraint, source="user_confirmed_goal_setup",
+            )
+        for criterion in proposal.criteria:
+            criterion_id = "setup-" + hashlib.sha256(
+                json.dumps(criterion, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:20]
+            if criterion_id in task.completion_criteria:
+                continue
+            task = self.store.record_completion_criterion(
+                self.task_id,
+                kind=CompletionCriterionKind(criterion["kind"]),
+                path=criterion.get("path"),
+                expected_text=criterion.get("expected_text"),
+                command=criterion.get("command"),
+                criterion_id=criterion_id,
+            )
+        if proposal.plan is not None and task.plan is None:
+            task = self.store.record_goal_plan(self.task_id, proposal.plan)
+        if task.plan is not None and task.selected_step_id is None:
+            ready = task.ready_step_ids
+            if not ready:
+                raise LongTaskStateError("Goal plan has no ready first stage")
+            task = self.store.select_goal_step(self.task_id, ready[0])
+        return self.start(reason="User confirmed Goal setup in Chat")
+
     def run_turn(self, user_input: str) -> LongTaskWorkflowResult:
         """Compatibility shortcut: run one step and explicitly finish the Task."""
 
@@ -135,7 +222,7 @@ class LongTaskWorkflow:
         self._require_effect_recovery_clear(task)
         if task.status is LongTaskStatus.RECOVERY_REQUIRED:
             raise LongTaskRecoveryRequired(
-                "Long Task has an interrupted effect; inspect and reconcile it before continuing"
+                "Long Task has an interrupted effect with no verifiable outcome; do not rerun it before continuing"
             )
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot run: {task.status.value}")
@@ -192,8 +279,11 @@ class LongTaskWorkflow:
                 for criterion in task.active_completion_criteria
             )
         if task.plan is not None:
-            lines.extend(("", f"## User-authored stage plan v{task.plan.version}"))
-            step = task.plan.step(task.selected_step_id) if task.selected_step_id else None
+            lines.extend(("", f"## Confirmed stage plan v{task.plan.version}"))
+            all_verified = len(task.verified_step_ids) == len(task.plan.steps)
+            step = task.plan.step(task.selected_step_id) if task.selected_step_id and not all_verified else None
+            if all_verified:
+                lines.append("- All stages are verified; gather only evidence needed for final Goal completion.")
             if step is not None:
                 lines.extend((
                     f"- Current stage: {step.step_id} — {step.goal}",
@@ -209,13 +299,17 @@ class LongTaskWorkflow:
             "## Completion proposal protocol",
             "- When the required outcome is ready, call submit_goal_completion exactly once after this Goal step has real completed Tool evidence.",
             "- Supply a concise summary and the completed Tool Call IDs that prove it. Do not emit any special completion markup in your user-facing reply.",
-            "- This is only a proposal. It does not complete the Goal; Runtime verifies the referenced raw Session events and the user must still run /goal complete.",
+            "- This is only a proposal. Runtime verifies the referenced raw Session events and every acceptance check before completing the Goal.",
         ))
         return "\n".join(lines)
 
     @staticmethod
     def _require_selected_step_ready(task: LongTaskProjection) -> None:
         if task.plan is None:
+            return
+        if len(task.verified_step_ids) == len(task.plan.steps):
+            # The final completion proposal may need one more evidence turn
+            # after all stages have been assessed. This is not a stage retry.
             return
         if task.selected_step_id is None:
             raise LongTaskStateError("Select a ready Goal plan step before running another turn")
@@ -225,7 +319,7 @@ class LongTaskWorkflow:
         if task.selected_step_needs_evaluation:
             raise LongTaskStateError("The selected Goal plan step has a checkpoint and needs evaluation before another turn")
         if task.selected_step_assessment is not None:
-            raise LongTaskStateError("The selected Goal plan step is assessed and requires review or replanning before another turn")
+            raise LongTaskStateError("The selected Goal plan step is assessed and requires replanning before another turn")
 
     def evaluate_selected_step(self) -> tuple[LongTaskProjection, GoalStageAssessment]:
         """Read Session/effect facts and files, then append one stage judgment."""
@@ -242,45 +336,20 @@ class LongTaskWorkflow:
                     effect_store=EffectJournalStore.for_session_directory(self.runtime.session_store.directory),
                 )
             except GoalStageEvidenceError as error:
-                self.store.require_recovery(self.task_id, reason=f"Goal stage evidence needs recovery: {error}")
+                self.store.require_recovery(
+                    self.task_id,
+                    reason=f"Goal stage evidence needs recovery: {error}",
+                    code=(
+                        "shared_effect_journal"
+                        if str(error).startswith("Effect Journal")
+                        else "session_evidence_invalid"
+                    ),
+                )
                 raise LongTaskRecoveryRequired(str(error)) from error
             updated = self.store.record_stage_assessment(self.task_id, assessment, lease=lease)
             if updated.recovery_blockers:
                 raise LongTaskRecoveryRequired("Stage assessment evidence could not be replayed safely")
             return updated, assessment
-
-    def review_selected_step(self, status: GoalStageAssessmentStatus, *, reason: str) -> LongTaskProjection:
-        """Record an explicit human decision only for an assessed needs_review stage."""
-
-        resolution = GoalStageAssessmentStatus(status)
-        if resolution not in {GoalStageAssessmentStatus.VERIFIED, GoalStageAssessmentStatus.BLOCKED}:
-            raise ValueError("Goal stage review must be verified or blocked")
-        note = reason.strip()
-        if not note:
-            raise ValueError("Goal stage review requires a reason")
-        with self.store.acquire_lease(self.task_id) as lease:
-            task = self.store.replay(self.task_id)
-            self._require_effect_recovery_clear(task)
-            previous = task.selected_step_assessment
-            if previous is None or previous.status is not GoalStageAssessmentStatus.NEEDS_REVIEW:
-                raise LongTaskStateError("Only a needs_review Goal stage can receive a user review")
-            assessment = GoalStageAssessment(
-                plan_version=task.plan.version,
-                step_id=previous.step_id,
-                checkpoint_id=previous.checkpoint_id,
-                session_event_cursor=previous.session_event_cursor,
-                status=resolution,
-                evidence_event_ids=previous.evidence_event_ids,
-                tool_call_ids=previous.tool_call_ids,
-                detail=f"User review: {note}",
-                next_action=(
-                    "Select the next ready stage"
-                    if resolution is GoalStageAssessmentStatus.VERIFIED
-                    else f"Resolve the blocker, then use /goal plan select {previous.step_id} to retry"
-                ),
-                source="user_review",
-            )
-            return self.store.record_stage_assessment(self.task_id, assessment, lease=lease)
 
     def finish(self, *, result: str = "", require_completion_claim: bool = True) -> LongTaskProjection:
         """Explicitly mark a fully checkpointed Task complete after its final step."""
@@ -300,17 +369,26 @@ class LongTaskWorkflow:
                 )
             if not task.active_completion_criteria:
                 raise LongTaskStateError("Long Task requires at least one Runtime completion criterion before finishing")
+            prior = task.last_completion_verification
             verification_results = self._verify_completion_criteria(task, claim)
-            verified = self.store.record_completion_verification(
-                self.task_id,
-                claim_id=claim.claim_id,
-                checkpoint_id=claim.checkpoint_id,
-                results=verification_results,
-            )
+            if (
+                prior is not None and prior.claim_id == claim.claim_id and prior.passed
+                and all(passed for _criterion_id, passed, _detail in verification_results)
+            ):
+                # A crash may occur after durable verification but before
+                # task_succeeded. Re-check current facts but do not invent a
+                # second verification event when they still pass.
+                pass
+            else:
+                task = self.store.record_completion_verification(
+                    self.task_id,
+                    claim_id=claim.claim_id,
+                    checkpoint_id=claim.checkpoint_id,
+                    results=verification_results,
+                )
             failed = [detail for _criterion_id, passed, detail in verification_results if not passed]
             if failed:
                 raise LongTaskStateError(f"Goal completion criteria failed: {'; '.join(failed)}")
-            task = verified
             result = result or claim.summary
         return self.store.succeed(self.task_id, result=result)
 
@@ -494,16 +572,56 @@ class LongTaskWorkflow:
         """Project shared recovery facts into the Goal lifecycle, without copying them."""
 
         effects = EffectJournalStore.for_session_directory(self.runtime.session_store.directory)
-        ambiguous = effects.replay(self.runtime.agent.session_id).ambiguous_entries
-        if not ambiguous:
-            return
-        self.store.require_recovery(
-            task.task_id,
-            reason="Shared Effect Journal has an unfinished Tool effect",
-        )
-        raise LongTaskRecoveryRequired(
-            "Shared Effect Journal has an unfinished Tool effect; inspect and reconcile it before continuing"
-        )
+        session_id = self.runtime.agent.session_id
+        try:
+            for entry in effects.replay(session_id).ambiguous_entries:
+                effects.verify_non_execution(session_id, entry.tool_call_id)
+            journal = effects.replay(session_id)
+        except OSError as error:
+            reason = f"Shared Effect Journal could not be verified: {error}"
+            self.store.require_recovery(task.task_id, reason=reason)
+            raise LongTaskRecoveryRequired(reason) from error
+        ambiguous = journal.ambiguous_entries
+        if ambiguous:
+            self.store.require_recovery(
+                task.task_id,
+                reason="Shared Effect Journal has an unfinished Tool effect",
+            )
+            raise LongTaskRecoveryRequired(
+                "Shared Effect Journal has an unfinished Tool effect with no verifiable outcome; do not rerun it"
+            )
+        repaired_session = False
+        try:
+            for entry in journal.entries.values():
+                if entry.verification is not None:
+                    repaired_session = (
+                        effects.complete_verified_session_tool_result(session_id, entry.tool_call_id) is not None
+                        or repaired_session
+                    )
+        except OSError as error:
+            reason = f"Runtime Session verified Tool result could not be saved: {error}"
+            self.store.require_recovery(task.task_id, reason=reason, code="session_evidence_invalid")
+            raise LongTaskRecoveryRequired(reason) from error
+        try:
+            session = self.runtime.session_store.replay(session_id)
+        except (OSError, ValueError) as error:
+            reason = f"Runtime Session evidence could not be read: {error}"
+            self.store.require_recovery(task.task_id, reason=reason, code="session_evidence_invalid")
+            raise LongTaskRecoveryRequired(reason) from error
+        if session.warnings:
+            reason = f"Runtime Session evidence has recovery warnings: {session.warnings[0]}"
+            self.store.require_recovery(task.task_id, reason=reason, code="session_evidence_invalid")
+            raise LongTaskRecoveryRequired(reason)
+        if repaired_session or (
+            task.status is LongTaskStatus.RECOVERY_REQUIRED
+            and any(entry.verification is not None for entry in journal.entries.values())
+        ):
+            try:
+                self.runtime.resume_session(session_id)
+            except (OSError, ValueError) as error:
+                reason = f"Runtime Session model history could not be refreshed: {error}"
+                self.store.require_recovery(task.task_id, reason=reason, code="session_evidence_invalid")
+                raise LongTaskRecoveryRequired(reason) from error
 
 
 class LegacyLongTaskWorkflow(LongTaskWorkflow):
@@ -531,7 +649,7 @@ class LegacyLongTaskWorkflow(LongTaskWorkflow):
         task = self.start_or_resume()
         if task.status is LongTaskStatus.RECOVERY_REQUIRED:
             raise LongTaskRecoveryRequired(
-                "Long Task has an interrupted legacy effect; inspect and reconcile it before continuing"
+                "Long Task has an interrupted legacy effect with no verifiable outcome; do not rerun it"
             )
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot run: {task.status.value}")

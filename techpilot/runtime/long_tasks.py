@@ -2,7 +2,7 @@
 
 This module deliberately does not execute tools or grant permissions.  It records
 the facts a future Task orchestrator needs to decide whether a side effect is
-safe to start, skip, or reconcile after an interruption.  Chat Session events
+safe to start, skip, or block after an interruption.  Chat Session events
 remain the source of truth for the conversation itself.
 """
 
@@ -248,6 +248,8 @@ class LongTaskProjection:
     stage_assessments: list[GoalStageAssessment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     recovery_blockers: list[str] = field(default_factory=list)
+    active_recovery_code: str | None = None
+    active_recovery_reason: str | None = None
 
     @property
     def effects_used(self) -> int:
@@ -524,6 +526,8 @@ class LongTaskStore:
         projection = self.replay(task_id)
         self._require_plan_editable(projection)
         validated = GoalStageAssessment.from_payload(assessment.to_payload())
+        if validated.source != "evaluator":
+            raise LongTaskStateError("New Goal stage assessments must come from the Runtime evaluator")
         self._validate_stage_assessment(projection, validated)
         self.append(LongTaskEvent(
             task_id=projection.task_id,
@@ -887,7 +891,7 @@ class LongTaskStore:
                 task_id=projection.task_id,
                 event_type="task_recovery_required",
                 payload={
-                    "reason": reason or "recovery requires reconciliation",
+                    "reason": reason or "recovery lacks a verifiable outcome",
                     "effect_ids": list(projection.ambiguous_effect_ids),
                     "blockers": list(projection.recovery_blockers),
                 },
@@ -896,18 +900,30 @@ class LongTaskStore:
             self.append(LongTaskEvent(task_id=projection.task_id, event_type="task_resumed", payload={"reason": reason or "resumed"}))
         return self.replay(projection.task_id)
 
-    def require_recovery(self, task_id: str, *, reason: str) -> LongTaskProjection:
+    def require_recovery(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+        code: str = "shared_effect_journal",
+    ) -> LongTaskProjection:
         """Pause Goal progress when an external Runtime recovery fact is unresolved."""
 
         projection = self.replay(task_id)
         self._require_not_terminal(projection)
         if not reason.strip():
             raise ValueError("Recovery reason cannot be empty")
-        if projection.status is not LongTaskStatus.RECOVERY_REQUIRED:
+        if code not in {"shared_effect_journal", "session_evidence_invalid"}:
+            raise ValueError("Unsupported Goal recovery blocker code")
+        if (
+            projection.status is not LongTaskStatus.RECOVERY_REQUIRED
+            or projection.active_recovery_code != code
+            or projection.active_recovery_reason != reason.strip()
+        ):
             self.append(LongTaskEvent(
                 task_id=projection.task_id,
                 event_type="task_recovery_required",
-                payload={"reason": reason.strip(), "effect_ids": [], "blockers": ["shared_effect_journal"]},
+                payload={"reason": reason.strip(), "effect_ids": [], "blockers": [code]},
             ))
         return self.replay(projection.task_id)
 
@@ -990,7 +1006,7 @@ class LongTaskStore:
     def fail_effect(self, task_id: str, action_id: str, *, reason: str) -> LongTaskProjection:
         """Record an explicitly rejected or blocked effect as not executed.
 
-        Unknown execution failures stay ``STARTED`` and require reconciliation;
+        Unknown execution failures stay ``STARTED`` and block further side effects;
         only a policy result proving the effect did not start may use this path.
         """
 
@@ -1248,6 +1264,8 @@ class LongTaskStore:
             projection.status = LongTaskStatus.PAUSED
         elif event.event_type == "task_started" or event.event_type == "task_resumed":
             projection.status = LongTaskStatus.RUNNING
+            projection.active_recovery_code = None
+            projection.active_recovery_reason = None
         elif event.event_type == "task_cancelled":
             projection.status = LongTaskStatus.CANCELLED
         elif event.event_type == "task_succeeded":
@@ -1258,6 +1276,12 @@ class LongTaskStore:
             projection.status = LongTaskStatus.LIMIT_REACHED
         elif event.event_type == "task_recovery_required":
             projection.status = LongTaskStatus.RECOVERY_REQUIRED
+            blockers = payload.get("blockers")
+            projection.active_recovery_code = (
+                blockers[0] if isinstance(blockers, list) and blockers and isinstance(blockers[0], str) else None
+            )
+            reason = payload.get("reason")
+            projection.active_recovery_reason = reason if isinstance(reason, str) else None
         elif event.event_type == "checkpoint_recorded":
             projection.checkpoints.append(TaskCheckpoint(
                 checkpoint_id=_required_string(payload, "checkpoint_id"),
@@ -1328,7 +1352,7 @@ class LongTaskStore:
         if projection.status not in {LongTaskStatus.SETUP, LongTaskStatus.RUNNING, LongTaskStatus.PAUSED}:
             raise LongTaskStateError(f"Goal plan cannot change while Task is {projection.status.value}")
         if projection.recovery_blockers or projection.ambiguous_effect_ids:
-            raise LongTaskStateError("Goal plan cannot change before recovery is reconciled")
+            raise LongTaskStateError("Goal plan cannot change before Runtime recovery has a verifiable outcome")
 
     @staticmethod
     def _validate_stage_assessment(projection: LongTaskProjection, assessment: GoalStageAssessment) -> None:
@@ -1349,11 +1373,6 @@ class LongTaskStore:
             raise LongTaskStateError("A verified Goal stage cannot be reassessed")
         if assessment.source == "evaluator" and previous is not None:
             raise LongTaskStateError("A checkpoint may receive only one automatic Goal stage assessment")
-        if assessment.source == "user_review" and (
-            previous is None or previous.status is not GoalStageAssessmentStatus.NEEDS_REVIEW
-            or assessment.status is GoalStageAssessmentStatus.NEEDS_REVIEW
-        ):
-            raise LongTaskStateError("User review may resolve only a stage awaiting review")
 
     def _validate_stage_evidence_refs(self, projection: LongTaskProjection) -> None:
         if self.session_store is None or projection.session_id is None or projection.repository_root is None:

@@ -9,6 +9,7 @@ The sub-agent runs to completion and returns a text summary.
 """
 
 from .base import Tool
+from ..tool_results import ToolResult, ToolStatus
 
 
 class AgentTool(Tool):
@@ -35,7 +36,10 @@ class AgentTool(Tool):
 
     def execute(self, task: str) -> str:
         if self._parent_agent is None:
-            return "Error: agent tool not initialized (no parent agent)"
+            return ToolResult(
+                "Error: agent tool not initialized (no parent agent)",
+                ToolStatus.ERROR,
+            )
 
         # import here to avoid circular dep
         from ..agent import Agent
@@ -53,6 +57,6 @@ class AgentTool(Tool):
             # trim long results to avoid blowing up parent's context
             if len(result) > 5000:
                 result = result[:4500] + "\n... (sub-agent output truncated)"
-            return f"[Sub-agent completed]\n{result}"
+            return ToolResult(f"[Sub-agent completed]\n{result}", ToolStatus.COMPLETED)
         except Exception as e:
-            return f"Sub-agent error: {e}"
+            return ToolResult(f"Sub-agent error: {e}", ToolStatus.ERROR)

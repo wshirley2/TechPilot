@@ -103,8 +103,8 @@ def evaluate_goal_stage(
     ]
     check = step.check
     if isinstance(check, str):
-        status = GoalStageAssessmentStatus.NEEDS_REVIEW
-        detail = f"Stage check requires human judgment: {check}"
+        status = GoalStageAssessmentStatus.BLOCKED
+        detail = f"Stage check has no structured Runtime verifier: {check}"
         supporting = (successful or completed)[-31:]
     elif check.kind is GoalStageCheckKind.TEST_COMMAND:
         matching = [
@@ -131,8 +131,8 @@ def evaluate_goal_stage(
         failed_tools = [event for event in completed if not _successful_tool(event)]
         if passed and failed_tools:
             supporting = completed[-31:]
-            status = GoalStageAssessmentStatus.NEEDS_REVIEW
-            detail += "; a Tool did not complete successfully, so the file outcome needs human review"
+            status = GoalStageAssessmentStatus.BLOCKED
+            detail += "; a Tool did not complete successfully, so the file outcome cannot prove this stage"
         else:
             status = GoalStageAssessmentStatus.VERIFIED if passed else GoalStageAssessmentStatus.BLOCKED
 
@@ -144,11 +144,12 @@ def evaluate_goal_stage(
             (item.step_id for item in plan.steps if item.step_id not in verified and set(item.dependencies).issubset(verified)),
             None,
         )
-        next_action = f"Select next ready stage: /goal plan select {next_ready}" if next_ready else "Review final Goal criteria and completion claim"
-    elif status is GoalStageAssessmentStatus.NEEDS_REVIEW:
-        next_action = "Review the cited evidence, then use /goal review verified|blocked <reason>"
+        next_action = f"Runtime may select next verified-ready stage: {next_ready}" if next_ready else "Check final Goal criteria and completion claim"
     else:
-        next_action = f"Inspect the failed check and evidence; use /goal plan select {step.step_id} to retry this stage"
+        next_action = (
+            "Resolve the cited Runtime blocker or revise this stage's structured verifier; "
+            "do not rerun an unknown effect"
+        )
     return GoalStageAssessment(
         plan_version=plan.version,
         step_id=step.step_id,

@@ -26,10 +26,12 @@ from techpilot.runtime import (
     GOAL_COMPLETION_TOOL_NAME,
     ActiveRole,
     ChatRuntime,
+    CompletionCriterionKind,
     EffectJournalState,
     EffectJournalStore,
     LongTaskStatus,
     LongTaskStore,
+    LongTaskWorkflow,
     RuntimeBootstrap,
     RuntimeBootstrapInput,
     TaskRuntime,
@@ -38,6 +40,15 @@ from techpilot.runtime.sessions import SessionEvent, SessionStore
 from techpilot.safety.paths import ignored_child_names
 
 BENCHMARK_ROOT = Path(__file__).parents[2] / "benchmarks" / "cli_data_tool"
+
+
+def goal_setup_response(*, constraints=(), criteria=None, plan=None):
+    return LLMResponse(tool_calls=[ToolCall("setup-proposal", "propose_goal_setup", {
+        "summary": "检查目标产物及运行证据",
+        "constraints": list(constraints),
+        "criteria": criteria or [{"kind": "file_exists", "path": "src/cli_data_tool/cli.py"}],
+        "plan": plan,
+    })])
 
 
 def copy_benchmark(destination: Path) -> Path:
@@ -75,6 +86,9 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     console = Console(file=output, force_terminal=False, color_system=None)
     repository = copy_benchmark(tmp_path / "repository")
     provider = FakeProvider([
+        goal_setup_response(),
+        LLMResponse(content="验收约定已提出"),
+        LLMResponse(tool_calls=[ToolCall("first-evidence", "glob", {"pattern": "**/*.py"})]),
         LLMResponse(content="first Goal step"),
         LLMResponse(tool_calls=[ToolCall("completion-evidence", "glob", {"pattern": "**/*.py"})]),
         LLMResponse(tool_calls=[ToolCall(
@@ -87,12 +101,8 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
     inputs = iter([
         "/goal inspect the project in two steps",
-        "/goal criterion file-exists src/cli_data_tool/cli.py",
-        "/goal criteria",
-        "/goal start",
-        "continue the Goal",
-        "/goal status",
-        "/goal complete",
+        "确认",
+        "/goal",
         "/exit",
     ])
 
@@ -109,7 +119,9 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     assert "Goal started:" in rendered
     assert "Goal completed:" in rendered
     assert "second Goal step" in rendered
-    assert "Goal completion criteria" in rendered
+    assert "Goal 验收约定（待确认）" in rendered
+    assert "file_exists" in rendered
+    assert {tool["function"]["name"] for tool in provider.requests[0]["tools"]}.isdisjoint({"bash", "write_file", "edit_file"})
 
 
 def test_chat_goal_complete_requires_a_verified_completion_claim(tmp_path, monkeypatch):
@@ -118,21 +130,115 @@ def test_chat_goal_complete_requires_a_verified_completion_claim(tmp_path, monke
     console = Console(file=output, force_terminal=False, color_system=None)
     runtime = make_runtime(
         copy_benchmark(tmp_path / "repository"),
-        FakeProvider([LLMResponse(content="Goal step without evidence")]),
+        FakeProvider([goal_setup_response(), LLMResponse(content="约定已提出"), LLMResponse(content="Goal step without evidence")]),
         console,
         session_directory=tmp_path / "sessions",
     )
     chat = ChatSession(runtime, console=console)
     chat._start_goal("inspect the project")
-    chat._goal("criterion file-exists src/cli_data_tool/cli.py")
-    chat._goal("start")
-
-    chat._goal("complete")
+    chat._run_user_turn("确认")
 
     assert chat._goal_workflow is not None
     rendered = output.getvalue()
-    assert "requires a fresh, Runtime-verified" in rendered
-    assert "completion claim before finishing" in rendered
+    assert "没有新的工具证据" in rendered
+    assert chat._goal_workflow.store.replay(chat._goal_workflow.task_id).status is LongTaskStatus.RUNNING
+
+
+def test_chat_goal_autoselects_and_assesses_confirmed_stages(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    check = {"kind": "file_exists", "path": "src/cli_data_tool/cli.py"}
+    def stage(step_id, dependencies):
+        return {
+            "id": step_id, "goal": f"Inspect {step_id}", "dependencies": dependencies,
+            "expected_output": "source inspection", "work_scope": ["src/cli_data_tool/cli.py"],
+            "evidence": "successful glob result", "check": check, "next_action": "Continue inspection",
+        }
+    provider = FakeProvider([
+        goal_setup_response(plan={"reason": "Two source checks", "steps": [stage("first", []), stage("second", ["first"])]}),
+        LLMResponse(content="约定已提出"),
+        LLMResponse(tool_calls=[ToolCall("stage-one", "glob", {"pattern": "**/*.py"})]),
+        LLMResponse(content="first stage done"),
+        LLMResponse(tool_calls=[ToolCall("stage-two", "glob", {"pattern": "**/*.py"})]),
+        LLMResponse(tool_calls=[ToolCall("stage-complete", GOAL_COMPLETION_TOOL_NAME, {
+            "summary": "both stages checked", "evidence_tool_call_ids": ["stage-two"],
+        })]),
+        LLMResponse(content="second stage done"),
+    ])
+    runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("Inspect project in two stages")
+    chat._run_user_turn("确认")
+
+    task_id = next((repository / ".techpilot" / "tasks").glob("goal-*")).name
+    task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_id)
+    assert task.status is LongTaskStatus.SUCCEEDED
+    assert task.verified_step_ids == ("first", "second")
+    assert len(task.checkpoints) == 2
+    assert "Goal stage assessed: second → verified" in output.getvalue()
+
+
+def test_chat_goal_clear_cancels_and_legacy_subcommands_do_not_mutate(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    runtime = make_runtime(
+        repository, FakeProvider([LLMResponse(content="请补充验收方式")]), console,
+        session_directory=tmp_path / "sessions",
+    )
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("Inspect project")
+    workflow = chat._goal_workflow
+    assert workflow is not None
+    for command in ("start", "complete", "criterion file-exists fake.txt", "plan show", "evaluate", "cancel"):
+        chat._goal(command)
+    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.SETUP
+    assert not workflow.store.replay(workflow.task_id).active_completion_criteria
+
+    chat._goal("clear")
+    assert chat._goal_workflow is None
+    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.CANCELLED
+    chat._goal(f"resume {workflow.task_id}")
+    assert chat._goal_workflow is None
+    assert "Goal 已结束，不能恢复" in output.getvalue()
+
+
+def test_chat_goal_resume_finishes_a_checkpointed_claim_without_another_model_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    repository = copy_benchmark(tmp_path / "repository")
+    session_directory = tmp_path / "sessions"
+    first_console = Console(file=StringIO(), force_terminal=False, color_system=None)
+    first_provider = FakeProvider([
+        LLMResponse(tool_calls=[ToolCall("evidence", "glob", {"pattern": "**/*.py"})]),
+        LLMResponse(tool_calls=[ToolCall("claim", GOAL_COMPLETION_TOOL_NAME, {
+            "summary": "source inspected", "evidence_tool_call_ids": ["evidence"],
+        })]),
+        LLMResponse(content="done"),
+    ])
+    first = make_runtime(repository, first_provider, first_console, session_directory=session_directory)
+    workflow = LongTaskWorkflow(first, task_id="goal-crash-after-claim", goal="Inspect project")
+    workflow.create_for_setup()
+    workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path="src/cli_data_tool/cli.py")
+    workflow.start()
+    workflow.run_step("Inspect project")
+    assert workflow.store.replay(workflow.task_id).active_completion_claim is not None
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    provider = FakeProvider([])
+    resumed = make_runtime(
+        repository, provider, console, session_directory=session_directory,
+        resume_session_id=first.agent.session_id,
+    )
+    chat = ChatSession(resumed, console=console)
+    chat._goal("resume")
+
+    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.SUCCEEDED
+    assert provider.requests == []
+    assert "Goal completed:" in output.getvalue()
 
 
 def test_chat_goal_constraint_is_durable_and_visible_to_later_goal_step(tmp_path, monkeypatch):
@@ -140,14 +246,16 @@ def test_chat_goal_constraint_is_durable_and_visible_to_later_goal_step(tmp_path
     output = StringIO()
     console = Console(file=output, force_terminal=False, color_system=None)
     repository = copy_benchmark(tmp_path / "repository")
-    provider = FakeProvider([LLMResponse(content="first Goal step"), LLMResponse(content="constrained step")])
+    provider = FakeProvider([
+        goal_setup_response(constraints=("Only modify formatter.py",)),
+        LLMResponse(content="约定已提出"),
+        LLMResponse(content="first Goal step"),
+        LLMResponse(content="constrained step"),
+    ])
     runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
     inputs = iter([
         "/goal update the formatter",
-        "/goal constraint Only modify formatter.py",
-        "/goal constraints",
-        "/goal criterion file-exists src/cli_data_tool/cli.py",
-        "/goal start",
+        "确认",
         "continue the Goal",
         "/exit",
     ])
@@ -157,27 +265,25 @@ def test_chat_goal_constraint_is_durable_and_visible_to_later_goal_step(tmp_path
     task_directory = next((repository / ".techpilot" / "tasks").glob("goal-*"))
     task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_directory.name)
     assert [constraint.text for constraint in task.active_constraints] == ["Only modify formatter.py"]
-    assert "Only modify formatter.py" in provider.requests[1]["messages"][0]["content"]
+    assert "Only modify formatter.py" in provider.requests[2]["messages"][0]["content"]
     rendered = output.getvalue()
-    assert "Goal constraint recorded:" in rendered
-    assert "Goal hard constraints" in rendered
+    assert "硬约束" in rendered
 
 
-def test_chat_goal_recover_records_operator_fact_and_resumes_goal(tmp_path, monkeypatch):
+def test_chat_goal_recover_cannot_write_an_operator_fact(tmp_path, monkeypatch):
     monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
     output = StringIO()
     console = Console(file=output, force_terminal=False, color_system=None)
     repository = copy_benchmark(tmp_path / "repository")
     runtime = make_runtime(
         repository,
-        FakeProvider([LLMResponse(content="first Goal step")]),
+        FakeProvider([goal_setup_response(), LLMResponse(content="约定已提出"), LLMResponse(content="first Goal step")]),
         console,
         session_directory=tmp_path / "sessions",
     )
     chat = ChatSession(runtime, console=console)
     chat._start_goal("inspect the project")
-    chat._goal("criterion file-exists src/cli_data_tool/cli.py")
-    chat._goal("start")
+    chat._run_user_turn("确认")
     workflow = chat._goal_workflow
     assert workflow is not None
     journal = EffectJournalStore.for_session_directory(runtime.session_store.directory)
@@ -193,10 +299,47 @@ def test_chat_goal_recover_records_operator_fact_and_resumes_goal(tmp_path, monk
     chat._goal("recover write-1 completed operator verified the target contents")
 
     effect = journal.replay(runtime.agent.session_id).entries["write-1"]
-    assert effect.state is EffectJournalState.FINISHED
-    assert effect.reconciliation_reason == "operator verified the target contents"
-    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.RUNNING
-    assert "Goal effect reconciled: write-1 (finished); Goal running." in output.getvalue()
+    assert effect.state is EffectJournalState.STARTED
+    assert effect.reconciliation_reason is None
+    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.RECOVERY_REQUIRED
+    assert "Goal state cannot be resolved by a user command" in output.getvalue()
+    chat._show_goal_status()
+    assert "effect_outcome_unknown" in output.getvalue()
+    assert "write-1 (write_file)" in output.getvalue()
+    resumed_chat = ChatSession(runtime, console=console)
+    resumed_chat._goal(f"resume {workflow.task_id}")
+    assert workflow.store.replay(workflow.task_id).status is LongTaskStatus.RECOVERY_REQUIRED
+    assert "Goal attached:" in output.getvalue()
+
+
+def test_chat_goal_status_distinguishes_session_evidence_blocker(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=180)
+    repository = copy_benchmark(tmp_path / "repository")
+    runtime = make_runtime(
+        repository,
+        FakeProvider([]),
+        console,
+        session_directory=tmp_path / "sessions",
+    )
+    chat = ChatSession(runtime, console=console)
+    chat._goal_workflow = LongTaskWorkflow(runtime, task_id="goal-status-test", goal="inspect the project")
+    chat._goal_workflow.create_for_setup()
+    workflow = chat._goal_workflow
+    assert workflow is not None
+    workflow.store.require_recovery(
+        workflow.task_id,
+        reason="Checkpoint Session cursor is missing",
+        code="session_evidence_invalid",
+    )
+
+    chat._show_goal_status()
+
+    rendered = output.getvalue()
+    assert "session_evidence_invalid" in rendered
+    assert "Checkpoint Session cursor is missing" in rendered
+    assert "Restore trustworthy Session evidence before continuing" in rendered
 
 
 def test_chat_exit_keeps_an_unstarted_goal_in_setup(tmp_path, monkeypatch):
@@ -206,7 +349,7 @@ def test_chat_exit_keeps_an_unstarted_goal_in_setup(tmp_path, monkeypatch):
     repository = copy_benchmark(tmp_path / "repository")
     runtime = make_runtime(
         repository,
-        FakeProvider([LLMResponse(content="Goal step complete")]),
+        FakeProvider([LLMResponse(content="请补充验收方式")]),
         console,
         session_directory=tmp_path / "sessions",
     )
@@ -217,7 +360,7 @@ def test_chat_exit_keeps_an_unstarted_goal_in_setup(tmp_path, monkeypatch):
     task_directory = next((repository / ".techpilot" / "tasks").glob("goal-*"))
     task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_directory.name)
     assert task.status is LongTaskStatus.SETUP
-    assert not runtime.agent.llm.requests
+    assert len(runtime.agent.llm.requests) == 1
     assert "Goal setup saved:" in output.getvalue()
 
 
@@ -228,14 +371,13 @@ def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, mo
     first_console = Console(file=StringIO(), force_terminal=False, color_system=None)
     first = make_runtime(
         repository,
-        FakeProvider([LLMResponse(content="first Goal step")]),
+        FakeProvider([goal_setup_response(), LLMResponse(content="约定已提出"), LLMResponse(content="first Goal step")]),
         first_console,
         session_directory=session_directory,
     )
     first_inputs = iter([
         "/goal inspect the project",
-        "/goal criterion file-exists src/cli_data_tool/cli.py",
-        "/goal start",
+        "确认",
         "/exit",
     ])
     assert ChatSession(first, console=first_console, input_fn=lambda _prompt: next(first_inputs)).run() == 0
@@ -260,8 +402,6 @@ def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, mo
     )
     resumed_inputs = iter([
         f"/goal resume {task_directory.name}",
-        "continue the Goal",
-        "/goal complete",
         "/exit",
     ])
 
@@ -886,6 +1026,26 @@ def test_chat_read_only_inspects_benchmark_without_modifying_files(tmp_path, mon
     assert (repository / read_path).read_bytes() == original
     assert "工具调用已折叠：read_file × 1（1 项完成" in output.getvalue()
     assert len(provider.requests) == 2
+
+
+def test_save_command_does_not_claim_success_when_session_save_fails(tmp_path):
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    runtime = SimpleNamespace(
+        agent=SimpleNamespace(session_id="session-1"),
+        session_store=SimpleNamespace(directory=tmp_path / "sessions"),
+    )
+
+    def fail_to_persist() -> None:
+        raise OSError("simulated session write failure")
+
+    runtime.ensure_persisted = fail_to_persist
+    ChatSession(runtime, console=console)._show_save()
+
+    rendered = output.getvalue()
+    assert "Session autosave error: simulated session write failure" in rendered
+    assert "Current Session could not be confirmed as saved." in rendered
+    assert "自动保存已开启" not in rendered
 
 
 def test_chat_reads_dependency_manifest_directly_without_prompting_or_isolating(tmp_path, monkeypatch):

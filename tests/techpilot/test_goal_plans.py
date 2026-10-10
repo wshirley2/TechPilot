@@ -19,6 +19,7 @@ from techpilot.runtime import (
     LongTaskStateError,
     LongTaskStatus,
     LongTaskStore,
+    LongTaskWorkflow,
     RuntimeBootstrap,
     RuntimeBootstrapInput,
 )
@@ -167,20 +168,21 @@ def test_chat_goal_plan_resume_shows_same_version_and_next_action(tmp_path, monk
     repository = tmp_path / "repo"
     repository.mkdir()
     (repository / "README.md").write_text("fixture\n", encoding="utf-8")
-    plan_file = repository / "goal-plan.json"
-    plan_file.write_text(json.dumps(_document(_step("inspect"), _step("fix", ["inspect"]))), encoding="utf-8")
     session_directory = tmp_path / "sessions"
     first_output = StringIO()
     first_console = Console(file=first_output, force_terminal=False, color_system=None, width=180)
     first_provider = _Provider([LLMResponse(content="inspection recorded")])
     first = _runtime(repository, first_provider, first_console, session_directory)
     first_chat = ChatSession(first, console=first_console)
-    first_chat._start_goal("Inspect and fix the fixture")
-    task_id = first_chat._goal_workflow.task_id
-    first_chat._goal("criterion file-exists README.md")
-    first_chat._goal("plan load goal-plan.json")
-    first_chat._goal("plan select inspect")
-    first_chat._goal("start")
+    first_chat._goal_workflow = LongTaskWorkflow(first, task_id="goal-plan-resume", goal="Inspect and fix the fixture")
+    workflow = first_chat._goal_workflow
+    workflow.create_for_setup()
+    task_id = workflow.task_id
+    workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path="README.md")
+    workflow.store.record_goal_plan(task_id, _document(_step("inspect"), _step("fix", ["inspect"])))
+    workflow.store.select_goal_step(task_id, "inspect")
+    workflow.start()
+    workflow.run_step("Inspect and fix the fixture")
     first_chat._goal("pause")
     assert len(first_provider.requests) == 1
 
@@ -198,18 +200,17 @@ def test_chat_goal_plan_resume_shows_same_version_and_next_action(tmp_path, monk
     chat._goal(f"resume {task_id}")
     rendered = output.getvalue()
     assert "Stage plan" in rendered and "v1 (2 stages)" in rendered
-    assert "inspect (needs_evaluation)" in rendered
+    assert "inspect (blocked)" in rendered
     assert "fix ← inspect" in rendered
-    assert "Run /goal evaluate to assess the saved checkpoint without rerunning the turn" in rendered
-    with pytest.raises(LongTaskStateError, match="needs evaluation"):
-        chat._run_user_turn("continue the same stage")
+    assert "Stage check has no structured Runtime verifier" in rendered
     assert resumed_provider.requests == []
 
     old_output = StringIO()
     old_console = Console(file=old_output, force_terminal=False, color_system=None)
     old = _runtime(repository, _Provider([]), old_console, session_directory)
     old_chat = ChatSession(old, console=old_console)
-    old_chat._start_goal("Legacy Goal without a plan")
+    old_chat._goal_workflow = LongTaskWorkflow(old, task_id="goal-legacy", goal="Legacy Goal without a plan")
+    old_chat._goal_workflow.create_for_setup()
     old_chat._show_goal_status()
     assert "unplanned" in old_output.getvalue()
 
@@ -231,7 +232,7 @@ from pathlib import Path
 from rich.console import Console
 from techpilot.chat.session import ChatSession, TerminalEventSink
 from techpilot.engine.llm import LLMResponse
-from techpilot.runtime import RuntimeBootstrap, RuntimeBootstrapInput
+from techpilot.runtime import CompletionCriterionKind, LongTaskWorkflow, RuntimeBootstrap, RuntimeBootstrapInput
 
 class Provider:
     model = 'fake-goal-provider'
@@ -252,11 +253,14 @@ runtime = RuntimeBootstrap(provider_factory=lambda _config: Provider()).build(Ru
     session_directory=Path(sys.argv[2]),
 ))
 chat = ChatSession(runtime, console=console)
-chat._start_goal('Inspect and fix the fixture')
-chat._goal('criterion file-exists README.md')
-chat._goal('plan load goal-plan.json')
-chat._goal('plan select inspect')
-chat._goal('start')
+chat._goal_workflow = LongTaskWorkflow(runtime, task_id='goal-process-resume', goal='Inspect and fix the fixture')
+workflow = chat._goal_workflow
+workflow.create_for_setup()
+workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path='README.md')
+workflow.store.record_goal_plan(workflow.task_id, json.loads((repository / 'goal-plan.json').read_text()))
+workflow.store.select_goal_step(workflow.task_id, 'inspect')
+workflow.start()
+workflow.run_step('Inspect and fix the fixture')
 chat._goal('pause')
 print(json.dumps({'session_id': runtime.agent.session_id, 'task_id': chat._goal_workflow.task_id}))
 """
@@ -278,5 +282,5 @@ print(json.dumps({'session_id': runtime.agent.session_id, 'task_id': chat._goal_
     ChatSession(resumed, console=console)._goal(f"resume {identities['task_id']}")
     rendered = output.getvalue()
     assert "v1 (2 stages)" in rendered
-    assert "inspect (needs_evaluation)" in rendered
+    assert "inspect (blocked)" in rendered
     assert "fix ← inspect" in rendered
