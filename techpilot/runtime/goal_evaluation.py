@@ -53,8 +53,12 @@ def evaluate_goal_stage(
         raise GoalStageEvidenceError("Checkpoint Session cursor is missing or ambiguous")
     cursor_index = indices[0]
     terminal = session.events[cursor_index]
-    if terminal.event_type != RuntimeEventType.TURN_COMPLETED.value or not terminal.turn_id:
+    if terminal.event_type not in {
+        RuntimeEventType.TURN_COMPLETED.value, RuntimeEventType.TURN_LIMIT_REACHED.value,
+    } or not terminal.turn_id:
         raise GoalStageEvidenceError("Checkpoint does not reference a completed Runtime turn")
+    if terminal.event_type == RuntimeEventType.TURN_LIMIT_REACHED.value and terminal.payload.get("pending_tool_call_ids") != []:
+        raise GoalStageEvidenceError("Limited Runtime turn has unfinished Tool Calls")
     previous_count = task.selected_checkpoint_count or 0
     if previous_count:
         prior_cursor = task.checkpoints[previous_count - 1].session_event_cursor
@@ -89,6 +93,8 @@ def evaluate_goal_stage(
     completion_ids = [event.tool_call_id for event in completed]
     if len(requests) != len(request_ids) or len(set(completion_ids)) != len(completion_ids):
         raise GoalStageEvidenceError("Runtime turn has duplicate Tool Call IDs")
+    if set(request_ids) != set(completion_ids):
+        raise GoalStageEvidenceError("Runtime turn has unfinished Tool Calls")
     if any(
         event.tool_call_id not in requests or request_positions[event.tool_call_id] >= index
         for index, event in enumerate(turn_events)

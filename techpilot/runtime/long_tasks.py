@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 import threading
@@ -27,6 +28,11 @@ from .goal_plans import GoalPlan, GoalStageAssessment, GoalStageAssessmentStatus
 from .sessions import SessionStore
 
 LONG_TASK_SCHEMA_VERSION = 1
+_CONTINUOUS_STOP_REASONS = frozenset({
+    "completed", "stage_blocked", "dependency_blocked", "planning_boundary",
+    "recovery_required", "no_progress", "round_limit", "interrupted", "error",
+    "budget_exhausted", "attempt_limit",
+})
 _SAFE_TASK_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -254,6 +260,7 @@ class LongTaskProjection:
     recovery_blockers: list[str] = field(default_factory=list)
     active_recovery_code: str | None = None
     active_recovery_reason: str | None = None
+    last_continuous_stop: dict[str, Any] | None = None
 
     @property
     def effects_used(self) -> int:
@@ -1184,6 +1191,20 @@ class LongTaskStore:
         self.append(LongTaskEvent(task_id=projection.task_id, event_type="task_paused", payload={"reason": reason or "paused"}))
         return self.replay(projection.task_id)
 
+    def record_goal_run_stop(
+        self, task_id: str, *, reason: str, turns: int,
+        tokens: int | None, cost_usd: float | None,
+    ) -> LongTaskProjection:
+        """Save the boundary of one explicitly started continuous Goal run."""
+
+        projection = self.replay(task_id)
+        if projection.recovery_blockers:
+            raise LongTaskStateError("Cannot record a Goal run stop in a damaged Task log")
+        payload = {"reason": reason, "turns": turns, "tokens": tokens, "cost_usd": cost_usd}
+        self._validate_goal_run_stop(payload)
+        self.append(LongTaskEvent(task_id=projection.task_id, event_type="goal_run_stopped", payload=payload))
+        return self.replay(projection.task_id)
+
     def complete_action(self, task_id: str, action_id: str, *, result: str = "") -> LongTaskProjection:
         """Complete a non-effect action such as one durable Agent turn."""
 
@@ -1377,15 +1398,18 @@ class LongTaskStore:
                 "step_selected", "step_assessed",
                 "goal_change_proposed", "goal_change_accepted", "goal_change_rejected",
                 "goal_input_started", "goal_input_resolved",
+                "goal_run_stopped",
             }:
                 try:
                     self._apply_event(projection, event)
                 except (TypeError, ValueError) as error:
                     is_contract_event = event.event_type.startswith(("goal_change_", "goal_input_"))
-                    label = "contract" if is_contract_event else "plan"
+                    is_run_event = event.event_type == "goal_run_stopped"
+                    label = "contract" if is_contract_event else "run" if is_run_event else "plan"
                     projection.warnings.append(f"Invalid Goal {label} event: {error}")
                     projection.recovery_blockers.append(
-                        "goal_contract_event_invalid" if is_contract_event else "goal_plan_event_invalid"
+                        "goal_contract_event_invalid" if is_contract_event else
+                        "goal_run_event_invalid" if is_run_event else "goal_plan_event_invalid"
                     )
                     projection.status = LongTaskStatus.RECOVERY_REQUIRED
                     break
@@ -1684,6 +1708,9 @@ class LongTaskStore:
             )
         elif event.event_type == "task_paused":
             projection.status = LongTaskStatus.PAUSED
+        elif event.event_type == "goal_run_stopped":
+            self._validate_goal_run_stop(payload)
+            projection.last_continuous_stop = dict(payload)
         elif event.event_type == "task_started" or event.event_type == "task_resumed":
             projection.status = LongTaskStatus.RUNNING
             projection.active_recovery_code = None
@@ -1760,6 +1787,23 @@ class LongTaskStore:
         return events, warnings
 
     @staticmethod
+    def _validate_goal_run_stop(payload: dict[str, Any]) -> None:
+        if set(payload) != {"reason", "turns", "tokens", "cost_usd"}:
+            raise LongTaskStateError("Goal run stop has invalid fields")
+        if payload["reason"] not in _CONTINUOUS_STOP_REASONS:
+            raise LongTaskStateError("Goal run stop has an invalid reason")
+        if isinstance(payload["turns"], bool) or not isinstance(payload["turns"], int) or not 0 <= payload["turns"] <= 4:
+            raise LongTaskStateError("Goal run stop has an invalid turn count")
+        tokens = payload["tokens"]
+        if tokens is not None and (isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0):
+            raise LongTaskStateError("Goal run stop has an invalid token count")
+        cost = payload["cost_usd"]
+        if cost is not None and (
+            isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0
+        ):
+            raise LongTaskStateError("Goal run stop has an invalid cost")
+
+    @staticmethod
     def _require_running(projection: LongTaskProjection) -> None:
         if projection.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Task is not running: {projection.status.value}")
@@ -1812,8 +1856,30 @@ class LongTaskStore:
             if checkpoint is None or checkpoint.session_event_cursor != assessment.session_event_cursor or cursor_index is None:
                 raise LongTaskStateError("Goal stage assessment cites a missing checkpoint or Session cursor")
             terminal = session.events[cursor_index]
-            if terminal.event_type != RuntimeEventType.TURN_COMPLETED.value or not terminal.turn_id:
+            if terminal.event_type not in {
+                RuntimeEventType.TURN_COMPLETED.value, RuntimeEventType.TURN_LIMIT_REACHED.value,
+            } or not terminal.turn_id:
                 raise LongTaskStateError("Goal stage assessment cursor is not a completed Runtime turn")
+            if terminal.event_type == RuntimeEventType.TURN_LIMIT_REACHED.value and terminal.payload.get("pending_tool_call_ids") != []:
+                raise LongTaskStateError("Goal stage assessment cites a limited turn with unfinished Tool Calls")
+            turn_events = [
+                event for event in session.events[:cursor_index + 1]
+                if event.turn_id == terminal.turn_id
+            ]
+            requested = [
+                event.tool_call_id for event in turn_events
+                if event.event_type == RuntimeEventType.TOOL_REQUESTED.value and event.tool_call_id
+            ]
+            completed = [
+                event.tool_call_id for event in turn_events
+                if event.event_type == RuntimeEventType.TOOL_COMPLETED.value and event.tool_call_id
+            ]
+            if (
+                len(set(requested)) != len(requested)
+                or len(set(completed)) != len(completed)
+                or set(requested) != set(completed)
+            ):
+                raise LongTaskStateError("Goal stage assessment cites an incomplete Runtime Tool Call chain")
             cited = []
             for event_id in assessment.evidence_event_ids:
                 position = positions.get(event_id)

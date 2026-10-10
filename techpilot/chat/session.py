@@ -22,12 +22,14 @@ from rich.text import Text
 
 from techpilot.engine.context import estimate_tokens
 from techpilot.engine.events import RuntimeEvent, RuntimeEventType
+from techpilot.engine.runtime_control import RuntimeCancelled, RuntimeLimitExceeded
 from techpilot.engine.tool_results import display_tool_status
 from techpilot.engine.tools.edit import _changed_files
 
 from ..runtime import (
     GOAL_COMPLETION_TOOL_NAME,
     EffectJournalStore,
+    LongTaskRecoveryRequired,
     LongTaskStateError,
     LongTaskStatus,
     LongTaskStore,
@@ -263,6 +265,7 @@ class ChatSession:
         self.input_fn = input_fn
         self._prompt_session: PromptSession[str] | None = None
         self._goal_workflow: LongTaskWorkflow | None = None
+        self._goal_run_stop_reason = "error"
 
     def run(self) -> int:
         self.show_startup()
@@ -377,6 +380,7 @@ class ChatSession:
             "/goal <outcome>  Create a durable Goal and prepare its acceptance contract",
             "/goal  Show Goal status, evidence and blockers",
             "/goal pause  Stop Goal progression without discarding it",
+            "/goal run  Explicitly advance up to four checked Goal work turns",
             "/goal resume [id]  Verify recovery and continue a paused Goal",
             "/goal clear  End and detach the active Goal; keep its history",
             "/clear   Clear conversation messages",
@@ -542,6 +546,9 @@ class ChatSession:
         if not value:
             self._show_goal_status()
             return
+        if normalized == "run" and not separator:
+            self._run_continuous_goal()
+            return
         if normalized == "pause" and not separator:
             self._pause_active_goal("Paused by user")
             return
@@ -618,12 +625,98 @@ class ChatSession:
         lines.extend(("", "确认符合你的要求后，回复「确认」开始；否则直接说要修改哪里。"))
         self.console.print(Panel("\n".join(lines), title="Goal 验收约定（待确认）"))
 
-    def _advance_goal(self, user_input: str) -> str:
+    def _run_continuous_goal(self) -> None:
+        workflow = self._require_goal()
+        if workflow is None:
+            return
+        task = workflow.store.replay(workflow.task_id)
+        if task.status is not LongTaskStatus.RUNNING or task.pending_goal_input or task.pending_goal_change:
+            self.console.print("[yellow]Goal 当前不能连续执行；请先处理状态卡中的暂停、恢复或待确认事项。[/yellow]")
+            self._show_goal_status()
+            return
+        if task.plan is None or not task.active_completion_criteria:
+            self.console.print("[yellow]连续执行需要已确认的结构化阶段计划和最终验收条件。[/yellow]")
+            return
+        if task.selected_step_assessment is not None and task.selected_step_assessment.status.value == "blocked":
+            self.console.print("[yellow]当前阶段已阻塞；请先在普通聊天中处理失败原因，不会自动重试。[/yellow]")
+            self._show_goal_status()
+            return
+        before_turns = len(task.checkpoints)
+        before_tokens, before_cost = self._goal_usage_snapshot()
+        self._goal_run_stop_reason = "error"
+        response = ""
+        turns = 0
+        try:
+            response = self._advance_goal("Continue the confirmed Goal stage plan.", continuous=True)
+        except (KeyboardInterrupt, RuntimeCancelled):
+            self._goal_run_stop_reason = "interrupted"
+            self.console.print("[yellow]连续执行已中断；恢复前请查看 Goal 状态。[/yellow]")
+        except RuntimeLimitExceeded as error:
+            self._goal_run_stop_reason = "budget_exhausted"
+            self.console.print(f"[yellow]连续执行已触及 Runtime 预算：{error}[/yellow]")
+        except LongTaskRecoveryRequired as error:
+            self._goal_run_stop_reason = "recovery_required"
+            self.console.print(f"[yellow]连续执行因恢复证据不足而停止：{error}[/yellow]")
+        except Exception as error:
+            self._goal_run_stop_reason = "error"
+            self.console.print(f"[yellow]连续执行在安全边界停止：{error}[/yellow]")
+        finally:
+            try:
+                after = workflow.store.replay(workflow.task_id)
+                after_tokens, after_cost = self._goal_usage_snapshot()
+                tokens = max(0, after_tokens - before_tokens) if before_tokens is not None and after_tokens is not None else None
+                cost = max(0.0, after_cost - before_cost) if before_cost is not None and after_cost is not None else None
+                turns = max(0, len(after.checkpoints) - before_turns)
+                workflow.store.record_goal_run_stop(
+                    workflow.task_id, reason=self._goal_run_stop_reason, turns=turns,
+                    tokens=tokens, cost_usd=cost,
+                )
+            except (OSError, LongTaskStateError, ValueError) as error:
+                self.console.print(f"[yellow]无法记录连续执行停止原因：{error}[/yellow]")
+            self._ensure_session_persisted()
+        if response and not getattr(self.runtime.agent.event_sink, "last_turn_streamed", False):
+            self.console.print(Markdown(response))
+        self.console.print(f"[dim]连续执行停止：{self._goal_run_stop_reason}；工作回合 {turns}/4。[/dim]")
+        if self._goal_workflow is not None:
+            self._show_goal_status()
+
+    def _goal_usage_snapshot(self) -> tuple[int | None, float | None]:
+        llm = self.runtime.agent.llm
+        prompt = getattr(llm, "total_prompt_tokens", None)
+        completion = getattr(llm, "total_completion_tokens", None)
+        tokens = prompt + completion if isinstance(prompt, int) and isinstance(completion, int) else None
+        cost = getattr(llm, "estimated_cost", None)
+        if callable(cost):
+            cost = cost()
+        return tokens, float(cost) if isinstance(cost, (int, float)) else None
+
+    @staticmethod
+    def _goal_stage_attempts(task, step_id: str) -> int:
+        return sum(
+            event.event_type == "step_selected" and event.payload.get("step_id") == step_id
+            for event in task.events[:task.applied_event_count]
+        )
+
+    def _goal_turn_limited(self, cursor: str | None) -> bool:
+        if cursor is None:
+            return False
+        session = self.runtime.session_store.replay(self.runtime.agent.session_id)
+        return any(
+            event.event_id == cursor and event.event_type == RuntimeEventType.TURN_LIMIT_REACHED.value
+            for event in session.events
+        )
+
+    def _goal_latest_turn_limited(self) -> bool:
+        session = self.runtime.session_store.replay(self.runtime.agent.session_id)
+        return bool(session.events and session.events[-1].event_type == RuntimeEventType.TURN_LIMIT_REACHED.value)
+
+    def _advance_goal(self, user_input: str, *, continuous: bool = False) -> str:
         """Run bounded Goal turns and settle durable checks at each boundary."""
 
         workflow = self._require_goal()
         if workflow is None:
             return ""
+        self._goal_run_stop_reason = "error"
         current = workflow.store.replay(workflow.task_id)
         if current.pending_goal_change is not None:
             return "Goal 有待确认修订，已阻止自动续跑。请回复「确认」或「取消」。"
@@ -631,69 +724,126 @@ class ChatSession:
             return "Goal 输入尚未完成分类，已阻止自动续跑。请回复「重试」或「取消」。"
         next_input = user_input
         latest_response = ""
-        for index in range(4):
+        max_turns = 4 if continuous else 1
+        for index in range(max_turns):
             task = workflow.store.replay(workflow.task_id)
             if task.status is not LongTaskStatus.RUNNING:
+                self._goal_run_stop_reason = "recovery_required" if task.status is LongTaskStatus.RECOVERY_REQUIRED else "error"
                 self._show_goal_status()
                 return latest_response
             if task.plan is not None and task.selected_step_needs_evaluation and len(task.verified_step_ids) < len(task.plan.steps):
                 task, assessment = workflow.evaluate_selected_step()
                 self.console.print(f"[dim]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/dim]")
+                if self._goal_turn_limited(task.checkpoints[-1].session_event_cursor):
+                    self._goal_run_stop_reason = "budget_exhausted"
+                    self._show_goal_status()
+                    return latest_response
                 if assessment.status.value != "verified":
+                    self._goal_run_stop_reason = "stage_blocked"
                     task, planning_note = workflow.replan_if_triggered()
                     if planning_note:
                         self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
+                    if self._goal_latest_turn_limited():
+                        self._goal_run_stop_reason = "budget_exhausted"
+                        self._show_goal_status()
+                        return latest_response
                     self._show_goal_status()
                     return latest_response
             task, planning_note = workflow.replan_if_triggered()
             if planning_note:
                 self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
+                if self._goal_latest_turn_limited():
+                    self._goal_run_stop_reason = "budget_exhausted"
+                    self._show_goal_status()
+                    return latest_response
+                if continuous and planning_note.startswith("plan_auto_revised:"):
+                    self._goal_run_stop_reason = "planning_boundary"
+                    self._show_goal_status()
+                    return latest_response
             completion = self._settle_goal_completion(workflow, task)
             if completion != "pending":
+                self._goal_run_stop_reason = "completed" if completion == "completed" else "error"
                 return latest_response
             if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
                 if task.selected_step_assessment is not None and task.selected_step_assessment.status.value == "blocked":
                     # A new user message may retry a failed, fully known check;
                     # automatic continuation never retries it without new input.
                     if index or not user_input:
+                        self._goal_run_stop_reason = "stage_blocked"
                         self._show_goal_status()
                         return latest_response
                     task = workflow.store.select_goal_step(workflow.task_id, task.selected_step_id)
                 elif task.selected_step_id is None or task.selected_step_id in task.verified_step_ids:
                     if not task.ready_step_ids:
+                        self._goal_run_stop_reason = "dependency_blocked"
+                        self._show_goal_status()
+                        return latest_response
+                    if continuous and self._goal_stage_attempts(task, task.ready_step_ids[0]) >= 2:
+                        self._goal_run_stop_reason = "attempt_limit"
                         self._show_goal_status()
                         return latest_response
                     task = workflow.store.select_goal_step(workflow.task_id, task.ready_step_ids[0])
+                if continuous and task.selected_step_id and self._goal_stage_attempts(task, task.selected_step_id) > 2:
+                    self._goal_run_stop_reason = "attempt_limit"
+                    self._show_goal_status()
+                    return latest_response
                 next_input = user_input if index == 0 else f"Continue the current Goal stage {task.selected_step_id}."
             result = workflow.run_step(next_input)
             latest_response = result.response
             task = result.task
+            limited = self._goal_turn_limited(result.checkpoint.session_event_cursor)
             if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
                 task, assessment = workflow.evaluate_selected_step()
                 self.console.print(f"[dim]Goal stage assessed: {assessment.step_id} → {assessment.status.value}[/dim]")
+                if limited:
+                    self._goal_run_stop_reason = "budget_exhausted"
+                    self._show_goal_status()
+                    return latest_response
                 task, planning_note = workflow.replan_if_triggered()
                 if planning_note:
                     self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
+                    if self._goal_latest_turn_limited():
+                        self._goal_run_stop_reason = "budget_exhausted"
+                        self._show_goal_status()
+                        return latest_response
                 if assessment.status.value != "verified":
+                    self._goal_run_stop_reason = "stage_blocked"
+                    self._show_goal_status()
+                    return latest_response
+                if continuous and planning_note and planning_note.startswith("plan_auto_revised:"):
+                    self._goal_run_stop_reason = "planning_boundary"
                     self._show_goal_status()
                     return latest_response
             elif task.plan is None:
+                if limited:
+                    self._goal_run_stop_reason = "budget_exhausted"
+                    self._show_goal_status()
+                    return latest_response
                 task, planning_note = workflow.replan_if_triggered()
                 if planning_note:
+                    self._goal_run_stop_reason = "planning_boundary"
                     self.console.print(f"[dim]Goal planning: {planning_note}[/dim]")
+                    if self._goal_latest_turn_limited():
+                        self._goal_run_stop_reason = "budget_exhausted"
                     self._show_goal_status()
                     return latest_response
             completion = self._settle_goal_completion(workflow, task)
             if completion != "pending":
+                self._goal_run_stop_reason = "completed" if completion == "completed" else "error"
                 return latest_response
             if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
                 next_input = "Continue with the next verified-ready Goal stage."
                 continue
             if not self._goal_turn_used_tools(result.checkpoint.session_event_cursor):
+                self._goal_run_stop_reason = "no_progress"
                 self.console.print("[dim]本轮没有新的工具证据，已停止自动续跑；Goal 保持可继续。[/dim]")
                 return latest_response
             next_input = "Continue the current Goal using the recorded evidence; stop if no concrete progress is possible."
-        self.console.print("[dim]已到本次有界续跑上限；Goal 已保存，可在普通聊天中继续。[/dim]")
+        self._goal_run_stop_reason = "round_limit"
+        if continuous:
+            self.console.print("[dim]已到本次有界续跑上限；Goal 已保存，可在普通聊天中继续。[/dim]")
+        else:
+            self.console.print("[dim]本次工作回合已保存；用 /goal 查看下一步，或 /goal run 连续推进。[/dim]")
         return latest_response
 
     def _settle_goal_completion(self, workflow: LongTaskWorkflow, task) -> str:
@@ -820,19 +970,7 @@ class ChatSession:
                 and refreshed.pending_goal_change is None
                 and refreshed.pending_goal_input is None
             ):
-                completion = self._settle_goal_completion(workflow, refreshed)
-                if (
-                    completion == "pending"
-                    and not (refreshed.selected_step_assessment is not None
-                             and refreshed.selected_step_assessment.status.value != "verified")
-                ):
-                    try:
-                        response = self._advance_goal("Continue the saved Goal from its verified boundary.")
-                    except (OSError, LongTaskStateError, ValueError) as error:
-                        self.console.print(f"[yellow]Goal 在安全边界停止：{error}[/yellow]")
-                    else:
-                        if response and not getattr(self.runtime.agent.event_sink, "last_turn_streamed", False):
-                            self.console.print(Markdown(response))
+                self._settle_goal_completion(workflow, refreshed)
         self._show_goal_status()
 
     def _show_goal_status(self) -> None:
@@ -892,6 +1030,11 @@ class ChatSession:
         table.add_row("Pending actions", str(len(task.pending_action_ids)))
         table.add_row("Completed effects", str(len(task.completed_effect_ids)))
         table.add_row("Checkpoints", str(len(task.checkpoints)))
+        if task.last_continuous_stop is not None:
+            stop = task.last_continuous_stop
+            token_text = str(stop["tokens"]) if stop["tokens"] is not None else "unknown"
+            cost_text = f"${stop['cost_usd']:.6f}" if stop["cost_usd"] is not None else "unknown"
+            table.add_row("Last continuous stop", f"{stop['reason']} ({stop['turns']} turns; {token_text} tokens; {cost_text})")
         if task.checkpoints:
             latest_checkpoint = task.checkpoints[-1]
             table.add_row("Latest checkpoint", latest_checkpoint.checkpoint_id)
@@ -939,6 +1082,21 @@ class ChatSession:
                     f"Continue in ordinary Chat to retry revised stage {task.selected_step_id}; "
                     "the previous failed attempt will not be rerun automatically"
                 )
+        if (
+            blocker_next_action is None and task.status is LongTaskStatus.RUNNING
+            and task.last_continuous_stop and task.applied_event_count
+            and task.events[task.applied_event_count - 1].event_type == "goal_run_stopped"
+        ):
+            stop_reason = task.last_continuous_stop["reason"]
+            stop_actions = {
+                "budget_exhausted": "Inspect the reached Runtime limit and saved evidence; adjust the limit before /goal run",
+                "round_limit": "Review saved stage progress, then use /goal run for another bounded batch",
+                "planning_boundary": "Review the revised stage plan before using /goal run again",
+                "no_progress": "Provide new evidence or revise the stage plan in ordinary Chat before retrying",
+                "attempt_limit": "Review repeated stage attempts and revise the plan in ordinary Chat",
+                "interrupted": "Review the saved checkpoint and Session state before using /goal run again",
+            }
+            blocker_next_action = stop_actions.get(stop_reason)
         if blocker_type:
             table.add_row("Blocker type", blocker_type)
             table.add_row("Blocker detail", blocker_detail or "No verified outcome")

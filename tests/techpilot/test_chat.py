@@ -104,6 +104,7 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     inputs = iter([
         "/goal inspect the project in two steps",
         "确认",
+        "继续",
         "/goal",
         "/exit",
     ])
@@ -423,6 +424,8 @@ os._exit(0)
         assert task.pending_goal_input is None
         assert task.pending_goal_change is None
         assert [item.text for item in task.active_constraints] == ["Never edit marker.txt again"]
+        assert provider.requests == []
+        chat._run_user_turn("继续")
         assert len(provider.requests) == 3
         assert "Never edit marker.txt again" in provider.requests[0]["messages"][0]["content"]
         planning_tools = {tool["function"]["name"] for tool in provider.requests[0]["tools"]}
@@ -477,6 +480,7 @@ def test_chat_goal_autoselects_and_assesses_confirmed_stages(tmp_path, monkeypat
     chat = ChatSession(runtime, console=console)
     chat._start_goal("Inspect project in two stages")
     chat._run_user_turn("确认")
+    chat._goal("run")
 
     task_id = next((repository / ".techpilot" / "tasks").glob("goal-*")).name
     task = LongTaskStore.for_repository(repository, session_directory=tmp_path / "sessions").replay(task_id)
@@ -708,6 +712,7 @@ def test_chat_resumes_a_paused_goal_only_after_resuming_its_session(tmp_path, mo
     )
     resumed_inputs = iter([
         f"/goal resume {task_directory.name}",
+        "继续",
         "/exit",
     ])
 
