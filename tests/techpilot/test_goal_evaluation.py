@@ -190,6 +190,41 @@ def test_failed_file_check_stays_blocked_until_explicit_same_stage_retry(tmp_pat
     assert runtime.agent.tool_executor.calls == 2
 
 
+def test_confirmed_plan_revision_reworks_blocked_stage_without_erasing_evidence(tmp_path):
+    provider = FixedProvider([
+        _write_call("write-wrong", "wrong\n"), LLMResponse(content="first attempt"),
+        _write_call("write-correct", "correct\n"), LLMResponse(content="reworked"),
+    ])
+    runtime = _runtime(tmp_path, provider)
+    workflow = _planned(
+        runtime,
+        _step("write", {"kind": "file_contains", "path": "result.txt", "text": "expected"}),
+    )
+    workflow.run_step("first attempt")
+    _task, failed = workflow.evaluate_selected_step()
+    assert failed.status is GoalStageAssessmentStatus.BLOCKED
+
+    workflow.store.begin_goal_input(workflow.task_id, "Replan the blocked write stage")
+    revised_step = _step("write", {"kind": "file_contains", "path": "result.txt", "text": "correct"})
+    proposal = workflow.store.propose_goal_change(
+        workflow.task_id, kind="plan_replace", summary="Revise the blocked write stage",
+        data={"plan": {"reason": "Use a corrected file check", "steps": [revised_step]}},
+    )
+    assert proposal.plan.version == 1
+    revised = workflow.store.resolve_goal_change(workflow.task_id, accept=True)
+    assert revised.plan.version == 2
+    assert revised.stage_assessments[0] == failed
+    assert revised.selected_step_assessment == failed
+    workflow.store.select_goal_step(workflow.task_id, "write")
+    workflow.run_step("write the corrected file")
+    completed, assessment = workflow.evaluate_selected_step()
+    assert assessment.status is GoalStageAssessmentStatus.VERIFIED
+    assert completed.verified_step_ids == ("write",)
+    assert [item.status for item in completed.stage_assessments] == [
+        GoalStageAssessmentStatus.BLOCKED, GoalStageAssessmentStatus.VERIFIED,
+    ]
+
+
 @pytest.mark.parametrize(
     ("requested", "expected", "accepted"),
     [

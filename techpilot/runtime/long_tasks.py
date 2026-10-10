@@ -246,6 +246,8 @@ class LongTaskProjection:
     selected_step_id: str | None = None
     selected_checkpoint_count: int | None = None
     stage_assessments: list[GoalStageAssessment] = field(default_factory=list)
+    pending_goal_input: dict[str, str] | None = None
+    pending_goal_change: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
     recovery_blockers: list[str] = field(default_factory=list)
     active_recovery_code: str | None = None
@@ -278,6 +280,13 @@ class LongTaskProjection:
         if not self.completion_claims or not self.checkpoints:
             return None
         latest = self.completion_claims[-1]
+        claim_event_index = next((
+            index for index in range(len(self.events) - 1, -1, -1)
+            if self.events[index].event_type == "completion_claimed"
+            and self.events[index].payload.get("claim_id") == latest.claim_id
+        ), -1)
+        if any(event.event_type == "goal_change_accepted" for event in self.events[claim_event_index + 1:]):
+            return None
         checkpoint = self.checkpoints[-1]
         if (
             latest.checkpoint_id != checkpoint.checkpoint_id
@@ -458,9 +467,18 @@ class LongTaskStore:
             next_version = len(projection.plans) + 1
             plan = GoalPlan.from_payload({**document, "version": next_version})
             if projection.selected_step_id is not None:
-                old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
-                if plan.step(projection.selected_step_id) != old_step:
-                    raise LongTaskStateError("A revision must retain the selected step unchanged")
+                selected = plan.step(projection.selected_step_id)
+                blocked = (
+                    projection.selected_step_assessment is not None
+                    and projection.selected_step_assessment.status is GoalStageAssessmentStatus.BLOCKED
+                )
+                if blocked:
+                    if selected is None or not set(selected.dependencies).issubset(set(projection.verified_step_ids)):
+                        raise LongTaskStateError("A revision must retain a ready blocked stage ID")
+                else:
+                    old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
+                    if selected != old_step:
+                        raise LongTaskStateError("A revision must retain the selected step unchanged")
             for verified_id in projection.verified_step_ids:
                 old_step = projection.plan.step(verified_id) if projection.plan else None
                 if plan.step(verified_id) != old_step:
@@ -640,6 +658,149 @@ class LongTaskStore:
             payload={"constraint_id": safe_id, "text": normalized_text, "source": normalized_source, "version": 1},
         ))
         return self.replay(projection.task_id)
+
+    def propose_goal_change(
+        self, task_id: str, *, kind: str, summary: str, data: dict[str, Any],
+    ) -> LongTaskProjection:
+        """Persist one unaccepted change so restart cannot silently run past it."""
+
+        from .goal_change import GoalChangeTool
+
+        decision = GoalChangeTool.validate(kind, summary, data)
+        if decision.kind in {"continue", "clarify"}:
+            raise ValueError("Only contract changes can be proposed")
+        with self.acquire_lease(task_id):
+            projection = self.replay(task_id)
+            self._require_running(projection)
+            if projection.pending_goal_change is not None:
+                raise LongTaskStateError("A Goal change already awaits user confirmation")
+            if projection.pending_goal_input is None:
+                raise LongTaskStateError("A Goal change requires a durable human-input preflight")
+            payload = {
+                "change_id": uuid4().hex, "kind": decision.kind,
+                "summary": decision.summary, "data": decision.data,
+            }
+            self._validate_goal_change(projection, payload)
+            self.append(LongTaskEvent(
+                task_id=projection.task_id, event_type="goal_change_proposed", payload=payload,
+            ))
+            return self.replay(projection.task_id)
+
+    def begin_goal_input(self, task_id: str, text: str) -> LongTaskProjection:
+        """Save the unclassified human turn before making a provider call."""
+
+        if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
+            raise ValueError("Goal input must contain 1–20,000 characters")
+        with self.acquire_lease(task_id):
+            projection = self.replay(task_id)
+            self._require_running(projection)
+            if projection.pending_goal_input is not None or projection.pending_goal_change is not None:
+                raise LongTaskStateError("A previous Goal input still awaits resolution")
+            self.append(LongTaskEvent(
+                task_id=projection.task_id, event_type="goal_input_started",
+                payload={"input_id": uuid4().hex, "text": text.strip()},
+            ))
+            return self.replay(projection.task_id)
+
+    def resolve_goal_input(self, task_id: str, *, reason: str) -> LongTaskProjection:
+        """Clear the preflight boundary after a classified continuation or cancellation."""
+
+        if reason not in {"continue", "clarify", "cancelled"}:
+            raise ValueError("Goal input resolution reason is invalid")
+        with self.acquire_lease(task_id):
+            projection = self.replay(task_id)
+            self._require_running(projection)
+            pending = projection.pending_goal_input
+            if pending is None:
+                raise LongTaskStateError("No Goal input awaits classification")
+            self.append(LongTaskEvent(
+                task_id=projection.task_id, event_type="goal_input_resolved",
+                payload={"input_id": pending["input_id"], "reason": reason},
+            ))
+            return self.replay(projection.task_id)
+
+    def resolve_goal_change(self, task_id: str, *, accept: bool) -> LongTaskProjection:
+        """Accept a proposed mutation in one durable event, or reject it."""
+
+        with self.acquire_lease(task_id):
+            projection = self.replay(task_id)
+            self._require_running(projection)
+            pending = projection.pending_goal_change
+            if pending is None:
+                raise LongTaskStateError("No Goal change awaits confirmation")
+            event = LongTaskEvent(
+                task_id=projection.task_id,
+                event_type="goal_change_accepted" if accept else "goal_change_rejected",
+                payload={"change_id": pending["change_id"]},
+            )
+            self._apply_event(copy.deepcopy(projection), event)
+            self.append(event)
+            return self.replay(projection.task_id)
+
+    def _validate_goal_change(self, projection: LongTaskProjection, payload: dict[str, Any]) -> None:
+        """Apply the candidate to a copy using the same replay rules."""
+
+        from .goal_change import GoalChangeTool
+
+        _required_string(payload, "change_id")
+        decision = GoalChangeTool.validate(
+            _required_string(payload, "kind"),
+            _required_string(payload, "summary"), payload.get("data"),
+        )
+        if decision.kind in {"continue", "clarify"}:
+            raise LongTaskStateError("A Goal change must mutate the contract")
+        if decision.kind == "constraint_add" and any(
+            item.text == decision.data["text"].strip() for item in projection.active_constraints
+        ):
+            raise LongTaskStateError("This hard constraint is already active")
+        if decision.kind == "criterion_remove" and len(projection.active_completion_criteria) <= 1:
+            raise LongTaskStateError("A Goal must retain at least one completion criterion")
+        if decision.kind == "plan_replace" and projection.selected_step_id is not None:
+            replacement = GoalPlan.from_payload({
+                **decision.data["plan"], "version": len(projection.plans) + 1,
+            })
+            selected = replacement.step(projection.selected_step_id)
+            if selected is None:
+                raise LongTaskStateError("Plan revision must retain the selected stage ID")
+            if not set(selected.dependencies).issubset(set(projection.verified_step_ids)):
+                raise LongTaskStateError("Plan revision blocked the selected stage with new dependencies")
+        candidate = copy.deepcopy(projection)
+        event_type, event_payload = self._goal_change_mutation(candidate, payload)
+        self._apply_event(candidate, LongTaskEvent(
+            task_id=projection.task_id, event_type=event_type, payload=event_payload,
+        ))
+
+    @staticmethod
+    def _goal_change_mutation(
+        projection: LongTaskProjection, proposal: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        kind = proposal["kind"]
+        data = proposal["data"]
+        change_id = _required_string(proposal, "change_id")
+        if kind == "constraint_add":
+            return "constraint_recorded", {
+                "constraint_id": change_id, "text": data["text"],
+                "source": "user_confirmed_goal_change", "version": 1,
+            }
+        if kind == "constraint_remove":
+            return "constraint_removed", {
+                "constraint_id": data["constraint_id"], "reason": proposal["summary"],
+            }
+        if kind == "criterion_add":
+            criterion = data["criterion"]
+            return "completion_criterion_recorded", {
+                "criterion_id": change_id, "kind": criterion["kind"],
+                "path": criterion.get("path"), "expected_text": criterion.get("expected_text"),
+                "command": criterion.get("command"),
+            }
+        if kind == "criterion_remove":
+            return "completion_criterion_removed", {
+                "criterion_id": data["criterion_id"], "reason": proposal["summary"],
+            }
+        if kind == "plan_replace":
+            event_type = "plan_recorded" if projection.plan is None else "plan_revised"
+            return event_type, {**data["plan"], "version": len(projection.plans) + 1}
+        raise LongTaskStateError(f"Unknown Goal change kind: {kind}")
 
     def remove_constraint(self, task_id: str, constraint_id: str, *, reason: str) -> LongTaskProjection:
         """Explicitly retire a rule while preserving its audit trail."""
@@ -1046,12 +1207,20 @@ class LongTaskStore:
             if event.task_id != safe_id:
                 projection.warnings.append("Ignored Task event for a different task id")
                 continue
-            if event.event_type in {"plan_recorded", "plan_revised", "step_selected", "step_assessed"}:
+            if event.event_type in {
+                "plan_recorded", "plan_revised", "step_selected", "step_assessed",
+                "goal_change_proposed", "goal_change_accepted", "goal_change_rejected",
+                "goal_input_started", "goal_input_resolved",
+            }:
                 try:
                     self._apply_event(projection, event)
                 except (TypeError, ValueError) as error:
-                    projection.warnings.append(f"Invalid Goal plan event: {error}")
-                    projection.recovery_blockers.append("goal_plan_event_invalid")
+                    is_contract_event = event.event_type.startswith(("goal_change_", "goal_input_"))
+                    label = "contract" if is_contract_event else "plan"
+                    projection.warnings.append(f"Invalid Goal {label} event: {error}")
+                    projection.recovery_blockers.append(
+                        "goal_contract_event_invalid" if is_contract_event else "goal_plan_event_invalid"
+                    )
                     projection.status = LongTaskStatus.RECOVERY_REQUIRED
                     break
             else:
@@ -1102,14 +1271,58 @@ class LongTaskStore:
             if event.event_type != expected_type or plan.version != expected_version:
                 raise LongTaskStateError("Goal plan versions must be sequential")
             if projection.selected_step_id is not None:
-                old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
-                if plan.step(projection.selected_step_id) != old_step:
-                    raise LongTaskStateError("Goal plan revision changed the selected step")
+                selected = plan.step(projection.selected_step_id)
+                blocked = (
+                    projection.selected_step_assessment is not None
+                    and projection.selected_step_assessment.status is GoalStageAssessmentStatus.BLOCKED
+                )
+                if blocked:
+                    if selected is None or not set(selected.dependencies).issubset(set(projection.verified_step_ids)):
+                        raise LongTaskStateError("Goal plan revision removed or blocked the selected stage")
+                else:
+                    old_step = projection.plan.step(projection.selected_step_id) if projection.plan else None
+                    if selected != old_step:
+                        raise LongTaskStateError("Goal plan revision changed the selected step")
             for verified_id in projection.verified_step_ids:
                 old_step = projection.plan.step(verified_id) if projection.plan else None
                 if plan.step(verified_id) != old_step:
                     raise LongTaskStateError("Goal plan revision changed a verified step")
             projection.plans.append(plan)
+        elif event.event_type == "goal_change_proposed":
+            self._require_running(projection)
+            if projection.pending_goal_change is not None:
+                raise LongTaskStateError("Goal change proposal already pending")
+            if projection.pending_goal_input is None:
+                raise LongTaskStateError("Goal change proposal has no human-input preflight")
+            self._validate_goal_change(projection, payload)
+            projection.pending_goal_change = copy.deepcopy(payload)
+            projection.pending_goal_input = None
+        elif event.event_type == "goal_input_started":
+            self._require_running(projection)
+            if projection.pending_goal_input is not None or projection.pending_goal_change is not None:
+                raise LongTaskStateError("Goal input started before the prior input was resolved")
+            projection.pending_goal_input = {
+                "input_id": _required_string(payload, "input_id"),
+                "text": _required_string(payload, "text"),
+            }
+        elif event.event_type == "goal_input_resolved":
+            pending = projection.pending_goal_input
+            if pending is None or _required_string(payload, "input_id") != pending["input_id"]:
+                raise LongTaskStateError("Goal input resolution has no matching input")
+            if _required_string(payload, "reason") not in {"continue", "clarify", "cancelled"}:
+                raise ValueError("Goal input resolution reason is invalid")
+            projection.pending_goal_input = None
+        elif event.event_type in {"goal_change_accepted", "goal_change_rejected"}:
+            pending = projection.pending_goal_change
+            if pending is None or _required_string(payload, "change_id") != pending["change_id"]:
+                raise LongTaskStateError("Goal change resolution has no matching proposal")
+            if event.event_type == "goal_change_accepted":
+                self._validate_goal_change(projection, pending)
+                event_type, event_payload = self._goal_change_mutation(projection, pending)
+                self._apply_event(projection, LongTaskEvent(
+                    task_id=projection.task_id, event_type=event_type, payload=event_payload,
+                ))
+            projection.pending_goal_change = None
         elif event.event_type == "step_selected":
             self._require_plan_editable(projection)
             plan = projection.plan

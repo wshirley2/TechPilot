@@ -20,6 +20,7 @@ from techpilot.engine.tools.base import Tool
 
 from .bootstrap import TaskRuntime
 from .effect_journal import EffectJournalStore
+from .goal_change import GOAL_CHANGE_TOOL_NAME, GoalChangeDecision, GoalChangeTool
 from .goal_completion import GOAL_COMPLETION_TOOL_NAME, GoalCompletionProposal, GoalCompletionTool
 from .goal_evaluation import GoalStageEvidenceError, evaluate_goal_stage
 from .goal_plans import GoalStageAssessment
@@ -81,6 +82,8 @@ class LongTaskWorkflow:
         )
         self._completion_proposal: GoalCompletionProposal | None = None
         self._setup_proposal: GoalSetupProposal | None = None
+        self._change_decision: GoalChangeDecision | None = None
+        self._change_decision_invalid = False
 
     def start_or_resume(self, *, reason: str = "continue explicit long Task") -> LongTaskProjection:
         """Create once, or re-evaluate a prior Task before another controlled turn."""
@@ -168,6 +171,46 @@ class LongTaskWorkflow:
             raise ValueError("only one Goal setup proposal is allowed per turn")
         self._setup_proposal = proposal
 
+    def classify_goal_input(self, user_input: str, *, retry: bool = False) -> tuple[str, GoalChangeDecision | None]:
+        """Read-only preflight for a human turn before exposing effectful Tools."""
+
+        task = self.store.replay(self.task_id)
+        if task.status is not LongTaskStatus.RUNNING or task.pending_goal_change is not None:
+            raise LongTaskStateError("Goal input cannot be classified at this boundary")
+        if retry:
+            if task.pending_goal_input is None or task.pending_goal_input["text"] != user_input:
+                raise LongTaskStateError("No matching Goal input is available for retry")
+        else:
+            task = self.store.begin_goal_input(self.task_id, user_input)
+        self._change_decision = None
+        self._change_decision_invalid = False
+        context = "\n".join((
+            self._goal_context(task),
+            "## Human-turn preflight (read-only)",
+            "No work or write tools are available. Classify this exact user message before Goal execution.",
+            "Call propose_goal_change exactly once: continue for ordinary work; clarify if ambiguous;",
+            "otherwise propose exactly one change to a hard constraint, completion criterion, or stage plan.",
+            "Never infer a change merely from old conversation. Never treat a proposal as confirmed.",
+            "For removals use an existing ID from the Goal facts. If several changes are requested, clarify which to apply first.",
+            "For a blocked stage, a plan replacement must keep verified stages unchanged and keep the blocked stage ID.",
+            "Active constraint IDs: " + ", ".join(item.constraint_id for item in task.active_constraints),
+            "Active criterion IDs: " + ", ".join(item.criterion_id for item in task.active_completion_criteria),
+        ))
+        read_tools = frozenset({"read_file", "glob", "grep", "now", GOAL_CHANGE_TOOL_NAME})
+        with self.runtime.goal_scope(
+            context,
+            tools=(GoalChangeTool(self._submit_change_decision),),
+            allowed_tool_names=read_tools,
+        ):
+            response = self.runtime.run_turn(user_input)
+        return response, None if self._change_decision_invalid else self._change_decision
+
+    def _submit_change_decision(self, decision: GoalChangeDecision) -> None:
+        if self._change_decision is not None:
+            self._change_decision_invalid = True
+            raise ValueError("only one Goal input classification is allowed per turn")
+        self._change_decision = decision
+
     def accept_setup(self, proposal: GoalSetupProposal) -> LongTaskProjection:
         """Persist a user-confirmed contract, then leave SETUP."""
 
@@ -219,6 +262,8 @@ class LongTaskWorkflow:
         """Execute one Runtime turn and checkpoint it while keeping the Task running."""
 
         task = self.start_or_resume()
+        if task.pending_goal_change is not None or task.pending_goal_input is not None:
+            raise LongTaskStateError("Goal input awaits classification or confirmation; do not run work Tools")
         self._require_effect_recovery_clear(task)
         if task.status is LongTaskStatus.RECOVERY_REQUIRED:
             raise LongTaskRecoveryRequired(
@@ -229,6 +274,8 @@ class LongTaskWorkflow:
         self._completion_proposal = None
         with self.store.acquire_lease(self.task_id):
             task = self.store.replay(self.task_id)
+            if task.pending_goal_change is not None or task.pending_goal_input is not None:
+                raise LongTaskStateError("Goal input awaits classification or confirmation; do not run work Tools")
             self._require_effect_recovery_clear(task)
             task = self.store.replay(self.task_id)
             if task.status is not LongTaskStatus.RUNNING:
@@ -357,6 +404,8 @@ class LongTaskWorkflow:
         task = self.store.replay(self.task_id)
         if task.status is not LongTaskStatus.RUNNING:
             raise LongTaskStateError(f"Long Task cannot finish: {task.status.value}")
+        if task.pending_goal_change is not None or task.pending_goal_input is not None:
+            raise LongTaskStateError("Long Task cannot finish while a Goal input or change is pending")
         if task.plan is not None:
             unverified = [step.step_id for step in task.plan.steps if step.step_id not in task.verified_step_ids]
             if unverified:

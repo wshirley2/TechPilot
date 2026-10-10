@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from techpilot.runtime import (
     CompletionCriterionKind,
     EffectJournalState,
     EffectJournalStore,
+    LongTaskStateError,
     LongTaskStatus,
     LongTaskStore,
     LongTaskWorkflow,
@@ -142,6 +144,232 @@ def test_chat_goal_complete_requires_a_verified_completion_claim(tmp_path, monke
     rendered = output.getvalue()
     assert "没有新的工具证据" in rendered
     assert chat._goal_workflow.store.replay(chat._goal_workflow.task_id).status is LongTaskStatus.RUNNING
+
+
+def test_running_goal_change_requires_confirmation_and_survives_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([
+        goal_setup_response(), LLMResponse(content="约定已提出"),
+        LLMResponse(content="first Goal step without evidence"),
+        LLMResponse(tool_calls=[ToolCall("change-1", "propose_goal_change", {
+            "kind": "constraint_add", "summary": "只修改 calculator.py",
+            "data": {"text": "Only modify calculator.py"},
+        })]),
+        LLMResponse(content="change proposed"),
+    ])
+    runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("Inspect project")
+    chat._run_user_turn("确认")
+    workflow = chat._goal_workflow
+    assert workflow is not None
+
+    response = chat._run_user_turn("以后只能改 calculator.py")
+    assert "待确认 Goal 修订" in response
+    pending = workflow.store.replay(workflow.task_id)
+    assert pending.pending_goal_change is not None
+    assert pending.active_constraints == ()
+    assert {tool["function"]["name"] for tool in provider.requests[3]["tools"]}.isdisjoint({
+        "bash", "write_file", "edit_file",
+    })
+
+    resumed_provider = FakeProvider([])
+    resumed_runtime = make_runtime(
+        repository, resumed_provider, console, session_directory=tmp_path / "sessions",
+        resume_session_id=runtime.agent.session_id,
+    )
+    resumed_chat = ChatSession(resumed_runtime, console=console)
+    resumed_chat._goal(f"resume {workflow.task_id}")
+    assert resumed_provider.requests == []
+    assert "不会自动续跑" in output.getvalue()
+    assert "修订已生效" in resumed_chat._run_user_turn("确认")
+    assert [item.text for item in workflow.store.replay(workflow.task_id).active_constraints] == [
+        "Only modify calculator.py",
+    ]
+    assert resumed_provider.requests == []
+
+
+def test_unclassified_goal_input_blocks_resume_until_cancelled(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    runtime = make_runtime(
+        repository,
+        FakeProvider([goal_setup_response(), LLMResponse(content="约定已提出"), LLMResponse(content="first step")]),
+        console,
+        session_directory=tmp_path / "sessions",
+    )
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("Inspect project")
+    chat._run_user_turn("确认")
+    workflow = chat._goal_workflow
+    assert workflow is not None
+    workflow.store.begin_goal_input(workflow.task_id, "Do not use network")
+
+    resumed_provider = FakeProvider([])
+    resumed_runtime = make_runtime(
+        repository, resumed_provider, console, session_directory=tmp_path / "sessions",
+        resume_session_id=runtime.agent.session_id,
+    )
+    resumed_chat = ChatSession(resumed_runtime, console=console)
+    resumed_chat._goal(f"resume {workflow.task_id}")
+    assert resumed_provider.requests == []
+    assert "尚未完成只读分类" in resumed_chat._run_user_turn("继续工作")
+    assert "已取消" in resumed_chat._run_user_turn("取消")
+    assert workflow.store.replay(workflow.task_id).pending_goal_input is None
+
+
+def test_running_goal_continuation_clears_read_only_preflight_before_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([
+        goal_setup_response(), LLMResponse(content="setup proposed"),
+        LLMResponse(content="first Goal step without evidence"),
+        LLMResponse(tool_calls=[ToolCall("classify-continue", "propose_goal_change", {
+            "kind": "continue", "summary": "Continue work", "data": {},
+        })]),
+        LLMResponse(content="classified"),
+        LLMResponse(content="continued Goal work"),
+    ])
+    runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("Inspect project")
+    chat._run_user_turn("确认")
+    workflow = chat._goal_workflow
+    assert workflow is not None
+
+    assert chat._run_user_turn("继续检查项目") == "continued Goal work"
+    task = workflow.store.replay(workflow.task_id)
+    assert task.pending_goal_input is None
+    assert task.pending_goal_change is None
+    assert [event.event_type for event in task.events][-2:] == [
+        "goal_input_resolved", "checkpoint_recorded",
+    ]
+    assert len(provider.requests) == 6
+
+
+@pytest.mark.parametrize("crash_boundary", ["input_started", "change_proposed", "change_accepted"])
+def test_goal_change_process_exit_recovers_without_reexecuting_prior_write(tmp_path, monkeypatch, crash_boundary):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    child_code = """
+import json
+import os
+import sys
+from pathlib import Path
+
+from techpilot.engine.events import CallbackEventSink
+from techpilot.engine.llm import LLMResponse, ToolCall
+from techpilot.engine.permissions import PermissionDecision
+from techpilot.engine.tools import WriteFileTool
+from techpilot.runtime import CompletionCriterionKind, LongTaskWorkflow, RuntimeBootstrap, RuntimeBootstrapInput
+
+class Provider:
+    model = 'fake-coder'
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    estimated_cost = None
+
+    def __init__(self):
+        self.responses = iter([
+            LLMResponse(tool_calls=[ToolCall('initial-write', 'write_file', {
+                'file_path': 'marker.txt', 'content': 'once\\n',
+            })]),
+            LLMResponse(content='marker written'),
+        ])
+
+    def chat(self, messages, tools=None, on_token=None):
+        return next(self.responses)
+
+class AllowPrompt:
+    def decide(self, request):
+        return PermissionDecision.allow('fault-injection fixture')
+
+root = Path(sys.argv[1])
+phase = sys.argv[2]
+runtime = RuntimeBootstrap(provider_factory=lambda _config: Provider()).build(RuntimeBootstrapInput(
+    repository=root,
+    event_sink=CallbackEventSink(lambda _event: None),
+    tools=[WriteFileTool()],
+    model='fake-coder',
+    permission_prompt=AllowPrompt(),
+    session_directory=root / 'sessions',
+))
+workflow = LongTaskWorkflow(runtime, task_id='fault-goal', goal='Write a marker once')
+workflow.start_or_resume()
+workflow.store.record_completion_criterion(
+    workflow.task_id, kind=CompletionCriterionKind.FILE_EXISTS, path='marker.txt',
+)
+workflow.run_step('Write marker.txt once')
+workflow.store.begin_goal_input(workflow.task_id, 'Never edit marker.txt again')
+if phase != 'input_started':
+    workflow.store.propose_goal_change(
+        workflow.task_id, kind='constraint_add', summary='Do not rewrite marker.txt',
+        data={'text': 'Never edit marker.txt again'},
+    )
+if phase == 'change_accepted':
+    workflow.store.resolve_goal_change(workflow.task_id, accept=True)
+print(json.dumps({'session_id': runtime.agent.session_id}), flush=True)
+os._exit(0)
+"""
+    child = subprocess.run(
+        [sys.executable, "-B", "-c", child_code, str(tmp_path), crash_boundary],
+        cwd=Path.cwd(), capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    session_id = json.loads(child.stdout)["session_id"]
+    assert (tmp_path / "marker.txt").read_text(encoding="utf-8") == "once\n"
+    sessions = SessionStore.for_repository(tmp_path, tmp_path / "sessions")
+    completed_before = [
+        event for event in sessions.replay(session_id).events
+        if event.event_type == RuntimeEventType.TOOL_COMPLETED.value
+        and event.tool_call_id == "initial-write"
+    ]
+    assert len(completed_before) == 1
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    provider = FakeProvider([LLMResponse(content="continued without another write")])
+    runtime = make_runtime(
+        tmp_path, provider, console, session_directory=tmp_path / "sessions",
+        resume_session_id=session_id,
+    )
+    chat = ChatSession(runtime, console=console)
+    chat._goal("resume fault-goal")
+    task = LongTaskStore.for_repository(tmp_path, session_directory=tmp_path / "sessions").replay("fault-goal")
+
+    if crash_boundary == "input_started":
+        assert task.pending_goal_input is not None
+        assert task.pending_goal_change is None
+        assert "重试" in output.getvalue()
+        assert "确认" not in output.getvalue()
+    elif crash_boundary == "change_proposed":
+        assert task.pending_goal_input is None
+        assert task.pending_goal_change is not None
+        assert task.active_constraints == ()
+        assert "确认" in output.getvalue()
+    else:
+        assert task.pending_goal_input is None
+        assert task.pending_goal_change is None
+        assert [item.text for item in task.active_constraints] == ["Never edit marker.txt again"]
+        assert len(provider.requests) == 1
+        assert "Never edit marker.txt again" in provider.requests[0]["messages"][0]["content"]
+
+    if crash_boundary != "change_accepted":
+        assert provider.requests == []
+        assert chat._goal_workflow is not None
+        with pytest.raises(LongTaskStateError, match="awaits classification or confirmation"):
+            chat._goal_workflow.run_step("unsafe automatic retry")
+    completed_after = [
+        event for event in sessions.replay(session_id).events
+        if event.event_type == RuntimeEventType.TOOL_COMPLETED.value
+        and event.tool_call_id == "initial-write"
+    ]
+    assert len(completed_after) == 1
+    assert (tmp_path / "marker.txt").read_text(encoding="utf-8") == "once\n"
 
 
 def test_chat_goal_autoselects_and_assesses_confirmed_stages(tmp_path, monkeypatch):

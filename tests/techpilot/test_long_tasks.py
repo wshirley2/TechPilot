@@ -115,6 +115,130 @@ def test_confirmed_constraint_is_append_only_and_removal_survives_replay(tmp_pat
     assert [event.event_type for event in replayed.events][-2:] == ["constraint_recorded", "constraint_removed"]
 
 
+def test_goal_change_is_pending_until_one_atomic_confirmation_event(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+
+    started = store.begin_goal_input("repair-task", "Only modify calculator.py")
+    assert started.pending_goal_input["text"] == "Only modify calculator.py"
+    with pytest.raises(LongTaskStateError, match="previous Goal input"):
+        store.begin_goal_input("repair-task", "continue")
+    proposed = store.propose_goal_change(
+        "repair-task", kind="constraint_add", summary="只改 calculator.py",
+        data={"text": "Only modify calculator.py"},
+    )
+    assert proposed.pending_goal_input is None
+    assert proposed.pending_goal_change is not None
+    assert proposed.active_constraints == ()
+    assert LongTaskStore.for_repository(tmp_path).replay("repair-task").pending_goal_change == proposed.pending_goal_change
+
+    accepted = store.resolve_goal_change("repair-task", accept=True)
+    assert accepted.pending_goal_change is None
+    assert [item.text for item in accepted.active_constraints] == ["Only modify calculator.py"]
+    assert [event.event_type for event in accepted.events][-3:] == [
+        "goal_input_started", "goal_change_proposed", "goal_change_accepted",
+    ]
+    assert not any(event.event_type == "constraint_recorded" for event in accepted.events)
+    assert [item.text for item in LongTaskStore.for_repository(tmp_path).replay("repair-task").active_constraints] == [
+        "Only modify calculator.py",
+    ]
+
+
+def test_goal_input_and_rejected_change_survive_replay_without_mutating_contract(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+    store.begin_goal_input("repair-task", "change the rule")
+    assert LongTaskStore.for_repository(tmp_path).replay("repair-task").pending_goal_input is not None
+    store.propose_goal_change(
+        "repair-task", kind="constraint_add", summary="Add a rule", data={"text": "Do not use network"},
+    )
+    rejected = store.resolve_goal_change("repair-task", accept=False)
+    assert rejected.pending_goal_change is None
+    assert rejected.active_constraints == ()
+
+
+def test_goal_change_rejects_invalid_removal_before_recording_proposal(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+    store.begin_goal_input("repair-task", "remove missing rule")
+    with pytest.raises(LongTaskStateError, match="Unknown constraint"):
+        store.propose_goal_change(
+            "repair-task", kind="constraint_remove", summary="Remove old rule",
+            data={"constraint_id": "missing"},
+        )
+    replayed = store.replay("repair-task")
+    assert replayed.pending_goal_input is not None
+    assert replayed.pending_goal_change is None
+
+
+def test_invalid_goal_change_event_requires_recovery_instead_of_running(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+    store.append(LongTaskEvent(
+        task_id="repair-task", event_type="goal_change_accepted",
+        payload={"change_id": "never-proposed"},
+    ))
+    replayed = store.replay("repair-task")
+    assert replayed.status is LongTaskStatus.RECOVERY_REQUIRED
+    assert replayed.recovery_blockers == ["goal_contract_event_invalid"]
+
+
+def test_goal_change_can_add_criterion_but_cannot_remove_the_last_one(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+    store.record_completion_criterion(
+        "repair-task", kind=CompletionCriterionKind.FILE_EXISTS,
+        path="README.md", criterion_id="original",
+    )
+    store.begin_goal_input("repair-task", "Use a test command too")
+    proposed = store.propose_goal_change(
+        "repair-task", kind="criterion_add", summary="Add test check",
+        data={"criterion": {"kind": "test_command", "command": "pytest -q"}},
+    )
+    criterion_id = proposed.pending_goal_change["change_id"]
+    accepted = store.resolve_goal_change("repair-task", accept=True)
+    assert accepted.completion_criteria[criterion_id].command == "pytest -q"
+    store.begin_goal_input("repair-task", "Remove original check")
+    store.propose_goal_change(
+        "repair-task", kind="criterion_remove", summary="Remove old file check",
+        data={"criterion_id": "original"},
+    )
+    assert len(store.resolve_goal_change("repair-task", accept=True).active_completion_criteria) == 1
+    store.begin_goal_input("repair-task", "Remove the last check")
+    with pytest.raises(LongTaskStateError, match="at least one completion criterion"):
+        store.propose_goal_change(
+            "repair-task", kind="criterion_remove", summary="Remove final check",
+            data={"criterion_id": criterion_id},
+        )
+
+
+def test_goal_plan_change_keeps_selected_stage_and_records_next_version(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+
+    def stage(step_id: str, dependencies: list[str]) -> dict:
+        return {
+            "id": step_id, "goal": f"Finish {step_id}", "dependencies": dependencies,
+            "expected_output": "checked output", "work_scope": ["README.md"],
+            "evidence": "successful check", "check": {"kind": "file_exists", "path": "README.md"},
+            "next_action": "Continue work",
+        }
+
+    original = stage("first", [])
+    store.record_goal_plan("repair-task", {"reason": "Initial", "steps": [original]})
+    store.select_goal_step("repair-task", "first")
+    store.begin_goal_input("repair-task", "Add second stage")
+    proposed = store.propose_goal_change(
+        "repair-task", kind="plan_replace", summary="Add a second stage",
+        data={"plan": {"reason": "Expanded scope", "steps": [original, stage("second", ["first"])]}},
+    )
+    assert proposed.plan.version == 1
+    accepted = store.resolve_goal_change("repair-task", accept=True)
+    assert accepted.plan.version == 2
+    assert accepted.selected_step_id == "first"
+    assert [step.step_id for step in accepted.plan.steps] == ["first", "second"]
+
+
 def test_resume_skips_a_durably_completed_effect_without_calling_it_again(tmp_path):
     store = LongTaskStore.for_repository(tmp_path)
     _create(store, tmp_path)
@@ -245,6 +369,33 @@ def test_completion_claim_is_durable_only_for_its_latest_checkpoint(tmp_path):
         checkpoint_id="after-continuing",
     )
     assert store.replay("repair-task").active_completion_claim is None
+
+
+def test_accepted_goal_change_invalidates_an_older_completion_claim(tmp_path):
+    store = LongTaskStore.for_repository(tmp_path)
+    _create(store, tmp_path)
+    checkpoint = store.checkpoint(
+        "repair-task", message_projection=[], recovery_reason="before change",
+        session_event_cursor=_session_cursor(tmp_path),
+    )
+    store.record_completion_claim(
+        "repair-task", summary="Old outcome", checkpoint_id=checkpoint.checkpoint_id,
+        session_event_cursor=checkpoint.session_event_cursor or "",
+        evidence=(TaskCompletionEvidence(
+            tool_call_id="test-old", session_event_id="session-old",
+            tool_name="bash", tool_status="completed",
+        ),),
+    )
+    assert store.replay("repair-task").active_completion_claim is not None
+    store.begin_goal_input("repair-task", "Do not use network")
+    store.propose_goal_change(
+        "repair-task", kind="constraint_add", summary="Do not use network",
+        data={"text": "Do not use network"},
+    )
+    assert store.replay("repair-task").active_completion_claim is not None
+    accepted = store.resolve_goal_change("repair-task", accept=True)
+    assert accepted.active_completion_claim is None
+    assert LongTaskStore.for_repository(tmp_path).replay("repair-task").active_completion_claim is None
 
 
 def test_completion_criteria_are_append_only_and_survive_replay(tmp_path):

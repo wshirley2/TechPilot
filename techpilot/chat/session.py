@@ -443,7 +443,82 @@ class ChatSession:
         if task.status is LongTaskStatus.RECOVERY_REQUIRED:
             self._show_goal_status()
             return "Goal 恢复证据尚不充分，已阻止继续执行。"
-        return self._advance_goal(user_input)
+        pending = task.pending_goal_change
+        if pending is not None:
+            choice = user_input.strip().lower()
+            if choice not in {"确认", "同意", "可以", "confirm", "yes", "取消", "不要", "reject", "no"}:
+                return "Goal 有一项待确认修订。回复「确认」使它生效，或回复「取消」放弃；此时不会执行工作工具。"
+            accepted = choice in {"确认", "同意", "可以", "confirm", "yes"}
+            task = workflow.store.resolve_goal_change(workflow.task_id, accept=accepted)
+            self._show_goal_status()
+            return (
+                f"Goal 修订已生效：{pending['summary']}。请继续说明下一步工作。"
+                if accepted else "Goal 修订已取消；原约束不变。请继续说明下一步工作。"
+            )
+        pending_input = task.pending_goal_input
+        if pending_input is not None:
+            choice = user_input.strip().lower()
+            if choice in {"取消", "不要", "cancel"}:
+                workflow.store.resolve_goal_input(workflow.task_id, reason="cancelled")
+                return "未完成分类的 Goal 输入已取消；原约束不变。"
+            if choice not in {"重试", "retry"}:
+                return "上一条 Goal 输入尚未完成只读分类。回复「重试」重新分类，或回复「取消」放弃；不会自动续跑。"
+            classified_input = pending_input["text"]
+        else:
+            classified_input = user_input
+        _response, decision = workflow.classify_goal_input(
+            classified_input, retry=pending_input is not None,
+        )
+        if decision is None:
+            return "Goal 输入尚未完成只读分类；本轮没有执行工作工具。请回复「重试」或「取消」。"
+        if decision.kind == "clarify":
+            workflow.store.resolve_goal_input(workflow.task_id, reason="clarify")
+            return decision.summary
+        if decision.kind != "continue":
+            task = workflow.store.propose_goal_change(
+                workflow.task_id, kind=decision.kind, summary=decision.summary, data=decision.data,
+            )
+            return (
+                f"待确认 Goal 修订：\n{self._describe_goal_change(task)}\n"
+                "回复「确认」使它生效，或回复「取消」放弃；确认前不会执行工作工具。"
+            )
+        workflow.store.resolve_goal_input(workflow.task_id, reason="continue")
+        return self._advance_goal("Continue the Goal based on the immediately preceding user request.")
+
+    @staticmethod
+    def _describe_goal_change(task) -> str:
+        pending = task.pending_goal_change
+        if pending is None:
+            return "无待确认修订"
+        kind = pending["kind"]
+        data = pending["data"]
+        if kind == "constraint_add":
+            detail = f"新增硬约束：{data['text']}"
+        elif kind == "constraint_remove":
+            existing = task.constraints.get(data["constraint_id"])
+            detail = f"移除硬约束：{data['constraint_id']} — {existing.text if existing else '未知'}"
+        elif kind == "criterion_add":
+            detail = "新增验收条件：" + json.dumps(data["criterion"], ensure_ascii=False, sort_keys=True)
+        elif kind == "criterion_remove":
+            existing = task.completion_criteria.get(data["criterion_id"])
+            existing_detail = (
+                json.dumps({
+                    "kind": existing.kind.value,
+                    "path": existing.path,
+                    "expected_text": existing.expected_text,
+                    "command": existing.command,
+                }, ensure_ascii=False, sort_keys=True)
+                if existing else "未知"
+            )
+            detail = f"移除验收条件：{data['criterion_id']} — {existing_detail}"
+        else:
+            steps = data["plan"]["steps"]
+            detail = "替换阶段计划：\n" + "\n".join(
+                f"- {step['id']}: {step['goal']}；依赖 {', '.join(step['dependencies']) or '无'}；"
+                f"验收 {json.dumps(step['check'], ensure_ascii=False)}"
+                for step in steps
+            )
+        return f"{pending['summary']}\n{detail}"
 
     def _goal(self, value: str) -> None:
         """Expose an explicit, Codex-like Goal lifecycle inside ordinary Chat."""
@@ -475,7 +550,7 @@ class ChatSession:
         if normalized in {"status", "start", "complete", "cancel", "constraint", "constraints", "criterion", "criteria", "plan", "evaluate"}:
             self.console.print(
                 "[yellow]此 Goal 命令已移除。用 /goal 查看状态；新目标在准备阶段以普通聊天确认验收约定。"
-                "运行中的约定修订尚未开放，不能把一句聊天内容当成已保存的硬约束。[/yellow]"
+                "运行中的约定修订请直接在普通聊天中提出并确认。[/yellow]"
             )
             return
         if normalized in {"review", "recover"}:
@@ -536,6 +611,11 @@ class ChatSession:
         workflow = self._require_goal()
         if workflow is None:
             return ""
+        current = workflow.store.replay(workflow.task_id)
+        if current.pending_goal_change is not None:
+            return "Goal 有待确认修订，已阻止自动续跑。请回复「确认」或「取消」。"
+        if current.pending_goal_input is not None:
+            return "Goal 输入尚未完成分类，已阻止自动续跑。请回复「重试」或「取消」。"
         next_input = user_input
         latest_response = ""
         for index in range(4):
@@ -695,6 +775,10 @@ class ChatSession:
                     self._show_setup_proposal()
                     if response and not getattr(self.runtime.agent.event_sink, "last_turn_streamed", False):
                         self.console.print(Markdown(response))
+        elif current.status is LongTaskStatus.RUNNING and current.pending_goal_change is not None:
+            self.console.print("[yellow]Goal 有待确认修订；回复「确认」或「取消」，不会自动续跑。[/yellow]")
+        elif current.status is LongTaskStatus.RUNNING and current.pending_goal_input is not None:
+            self.console.print("[yellow]Goal 输入尚未完成分类；回复「重试」或「取消」，不会自动续跑。[/yellow]")
         elif current.status is LongTaskStatus.RUNNING and current.selected_step_needs_evaluation:
             try:
                 _task, assessment = workflow.evaluate_selected_step()
@@ -703,7 +787,11 @@ class ChatSession:
                 self.console.print(f"[yellow]Goal 暂停在评估边界：{error}[/yellow]")
         if self._goal_workflow is not None:
             refreshed = workflow.store.replay(workflow.task_id)
-            if refreshed.status is LongTaskStatus.RUNNING:
+            if (
+                refreshed.status is LongTaskStatus.RUNNING
+                and refreshed.pending_goal_change is None
+                and refreshed.pending_goal_input is None
+            ):
                 completion = self._settle_goal_completion(workflow, refreshed)
                 if (
                     completion == "pending"
@@ -756,6 +844,10 @@ class ChatSession:
         table.add_row("Outcome", task.goal)
         table.add_row("Hard constraints", "; ".join(item.text for item in task.active_constraints) or "none")
         table.add_row("Completion criteria", str(len(task.active_completion_criteria)))
+        if task.pending_goal_change is not None:
+            table.add_row("Pending change", self._describe_goal_change(task))
+        if task.pending_goal_input is not None:
+            table.add_row("Pending input", "Needs read-only classification (retry or cancel)")
         claim = task.active_completion_claim
         table.add_row("Completion claim", f"ready ({claim.claim_id})" if claim else "not ready")
         verification = task.last_completion_verification
