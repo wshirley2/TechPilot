@@ -252,6 +252,57 @@ def test_running_goal_continuation_clears_read_only_preflight_before_work(tmp_pa
     assert len(provider.requests) == 6
 
 
+@pytest.mark.parametrize("continuation", ["继续", "continue"])
+def test_exact_goal_continuation_uses_one_model_turn_without_preflight(tmp_path, monkeypatch, continuation):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([
+        goal_setup_response(), LLMResponse(content="setup proposed"),
+        LLMResponse(content="first Goal step without evidence"),
+        LLMResponse(content="continued Goal work"),
+    ])
+    runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("Inspect project")
+    chat._run_user_turn("确认")
+    workflow = chat._goal_workflow
+    assert workflow is not None
+
+    assert chat._run_user_turn(continuation) == "continued Goal work"
+    task = workflow.store.replay(workflow.task_id)
+    assert task.pending_goal_input is None
+    assert not any(event.event_type == "goal_input_started" for event in task.events)
+    assert len(provider.requests) == 4
+
+
+def test_goal_continuation_with_a_new_rule_still_requires_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([
+        goal_setup_response(), LLMResponse(content="setup proposed"),
+        LLMResponse(content="first Goal step without evidence"),
+        LLMResponse(tool_calls=[ToolCall("classify-rule", "propose_goal_change", {
+            "kind": "constraint_add", "summary": "No network",
+            "data": {"text": "Do not use network"},
+        })]),
+        LLMResponse(content="change proposed"),
+    ])
+    runtime = make_runtime(repository, provider, console, session_directory=tmp_path / "sessions")
+    chat = ChatSession(runtime, console=console)
+    chat._start_goal("Inspect project")
+    chat._run_user_turn("确认")
+    workflow = chat._goal_workflow
+    assert workflow is not None
+
+    assert "待确认 Goal 修订" in chat._run_user_turn("继续，但不能联网")
+    task = workflow.store.replay(workflow.task_id)
+    assert task.pending_goal_change is not None
+    assert task.active_constraints == ()
+    assert len(provider.requests) == 5
+
+
 @pytest.mark.parametrize("crash_boundary", ["input_started", "change_proposed", "change_accepted"])
 def test_goal_change_process_exit_recovers_without_reexecuting_prior_write(tmp_path, monkeypatch, crash_boundary):
     monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
@@ -361,6 +412,8 @@ os._exit(0)
     if crash_boundary != "change_accepted":
         assert provider.requests == []
         assert chat._goal_workflow is not None
+        assert "Goal" in chat._run_user_turn("继续")
+        assert provider.requests == []
         with pytest.raises(LongTaskStateError, match="awaits classification or confirmation"):
             chat._goal_workflow.run_step("unsafe automatic retry")
     completed_after = [

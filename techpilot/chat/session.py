@@ -37,6 +37,7 @@ from ..runtime import (
 
 InputFunction = Callable[[str], str]
 _DETAIL_PAGE_SIZE = 8_000
+_GOAL_EXACT_CONTINUATIONS = frozenset({"继续", "continue"})
 
 
 @dataclass
@@ -465,6 +466,10 @@ class ChatSession:
                 return "上一条 Goal 输入尚未完成只读分类。回复「重试」重新分类，或回复「取消」放弃；不会自动续跑。"
             classified_input = pending_input["text"]
         else:
+            # Only an exact, content-free continuation can bypass the model
+            # preflight. Prefix matching could silently miss a new hard rule.
+            if user_input.strip().casefold() in _GOAL_EXACT_CONTINUATIONS:
+                return self._advance_goal(user_input)
             classified_input = user_input
         _response, decision = workflow.classify_goal_input(
             classified_input, retry=pending_input is not None,
