@@ -19,6 +19,47 @@ _KINDS = frozenset({
     "criterion_add", "criterion_remove", "plan_replace",
 })
 
+_TEXT_SCHEMA = {"type": "string", "minLength": 1}
+_EMPTY_DATA_SCHEMA = {"type": "object", "properties": {}, "additionalProperties": False}
+_CRITERION_SCHEMA = {
+    "type": "object",
+    "oneOf": [
+        {
+            "properties": {"kind": {"enum": ["file_exists"]}, "path": _TEXT_SCHEMA},
+            "required": ["kind", "path"], "additionalProperties": False,
+        },
+        {
+            "properties": {
+                "kind": {"enum": ["file_contains"]}, "path": _TEXT_SCHEMA,
+                "expected_text": _TEXT_SCHEMA,
+            },
+            "required": ["kind", "path", "expected_text"], "additionalProperties": False,
+        },
+        {
+            "properties": {"kind": {"enum": ["test_command"]}, "command": _TEXT_SCHEMA},
+            "required": ["kind", "command"], "additionalProperties": False,
+        },
+    ],
+}
+_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {"reason": _TEXT_SCHEMA, "steps": {"type": "array", "minItems": 1, "maxItems": 12}},
+    "required": ["reason", "steps"],
+    "additionalProperties": False,
+}
+
+
+def _variant(kind: str, data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "properties": {
+            "kind": {"type": "string", "enum": [kind]},
+            "summary": _TEXT_SCHEMA,
+            "data": data,
+        },
+        "required": ["kind", "summary", "data"],
+        "additionalProperties": False,
+    }
+
 
 @dataclass(frozen=True, slots=True)
 class GoalChangeDecision:
@@ -32,8 +73,11 @@ class GoalChangeTool(Tool):
 
     name = GOAL_CHANGE_TOOL_NAME
     description = (
-        "Classify a user message for a running Goal. Use continue for ordinary work, "
-        "clarify if intent is ambiguous, or propose exactly one contract change. "
+        "Classify a user message for a running Goal. Call exactly once. "
+        "Use continue only for ordinary work and data={}; use clarify for ambiguity or multiple changes and data={}. "
+        "For constraint_add data MUST be {text}; for constraint_remove it MUST be {constraint_id}; "
+        "for criterion_add it MUST be {criterion}; for criterion_remove it MUST be {criterion_id}; "
+        "for plan_replace it MUST be {plan}. Never invent fields such as rule, reason, id, scope, or question. "
         "This tool never executes work or changes the Goal; changes need user confirmation."
     )
     parameters = {
@@ -45,6 +89,30 @@ class GoalChangeTool(Tool):
         },
         "required": ["kind", "summary", "data"],
         "additionalProperties": False,
+        "oneOf": [
+            _variant("continue", _EMPTY_DATA_SCHEMA),
+            _variant("clarify", _EMPTY_DATA_SCHEMA),
+            _variant("constraint_add", {
+                "type": "object", "properties": {"text": _TEXT_SCHEMA},
+                "required": ["text"], "additionalProperties": False,
+            }),
+            _variant("constraint_remove", {
+                "type": "object", "properties": {"constraint_id": _TEXT_SCHEMA},
+                "required": ["constraint_id"], "additionalProperties": False,
+            }),
+            _variant("criterion_add", {
+                "type": "object", "properties": {"criterion": _CRITERION_SCHEMA},
+                "required": ["criterion"], "additionalProperties": False,
+            }),
+            _variant("criterion_remove", {
+                "type": "object", "properties": {"criterion_id": _TEXT_SCHEMA},
+                "required": ["criterion_id"], "additionalProperties": False,
+            }),
+            _variant("plan_replace", {
+                "type": "object", "properties": {"plan": _PLAN_SCHEMA},
+                "required": ["plan"], "additionalProperties": False,
+            }),
+        ],
     }
     execution_effect = ToolEffect.READ
     execution_concurrency = ToolConcurrency.EXCLUSIVE
