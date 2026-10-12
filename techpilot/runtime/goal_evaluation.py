@@ -133,8 +133,17 @@ def evaluate_goal_stage(
         passed, detail = _check_file(task.repository_root, check)
         if not successful:
             passed = False
-            detail += "; this turn has no successful Tool evidence"
-        failed_tools = [event for event in completed if not _successful_tool(event)]
+            detail += (
+                "; provider output token budget ended before any successful Tool evidence"
+                if terminal.event_type == RuntimeEventType.TURN_LIMIT_REACHED.value
+                and terminal.payload.get("limit") == "output_tokens"
+                else "; this turn has no successful Tool evidence"
+            )
+        failed_tools = [
+            event for event in completed
+            if not _successful_tool(event)
+            and requests[event.tool_call_id].payload.get("tool_name") != "submit_goal_completion"
+        ]
         if passed and failed_tools:
             supporting = completed[-31:]
             status = GoalStageAssessmentStatus.BLOCKED

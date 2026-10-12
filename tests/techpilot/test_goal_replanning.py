@@ -90,6 +90,10 @@ def test_replan_tool_requires_two_to_seven_structured_stages():
     tool = GoalReplanTool(accepted.append)
     valid = {"reason": "Evidence changed", "steps": [_step("first", "a.txt"), _step("second", "b.txt", ["first"])]}
 
+    assert tool.parameters["properties"]["summary"] == {
+        "type": "string", "minLength": 1, "maxLength": 500,
+    }
+    assert tool.execute("keep", "x" * 501, None).status.value == "error"
     assert tool.execute("replace", "New evidence", valid).status.value == "completed"
     assert accepted[0].plan == valid
     assert tool.execute("replace", "Too short", {"reason": "Short", "steps": [_step("first", "a.txt")]}).status.value == "error"
@@ -222,6 +226,9 @@ def test_blocked_stage_can_be_revised_without_automatic_retry(tmp_path):
     revised, note = workflow.replan_if_triggered()
 
     assert note is not None and note.startswith("plan_auto_revised:")
+    planning_messages = provider.requests[2]["messages"]
+    assert "Selected stage assessment: first is blocked" in str(planning_messages)
+    assert "keep leaves it blocked" in str(planning_messages)
     assert revised.plan.version == 2
     assert revised.selected_step_id == "first"
     assert revised.selected_step_assessment == assessment

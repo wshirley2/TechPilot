@@ -155,6 +155,46 @@ def test_file_check_verifies_durable_evidence_and_resume_does_not_rerun_tool(tmp
     assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "verified result\n"
 
 
+def test_rejected_completion_proposal_does_not_block_proven_file_stage(tmp_path):
+    provider = FixedProvider([
+        _write_call("write-good", "verified result\n"),
+        LLMResponse(tool_calls=[ToolCall(
+            "invalid-claim", "submit_goal_completion",
+            {"summary": "Finished", "evidence_tool_call_ids": ["invented-id"]},
+        )]),
+        LLMResponse(content="The completion proposal was rejected; the file is still written."),
+    ])
+    runtime = _runtime(tmp_path, provider)
+    workflow = _planned(
+        runtime,
+        _step("write", {"kind": "file_contains", "path": "result.txt", "text": "verified result"}),
+    )
+
+    workflow.run_step("write the file")
+    task, assessment = workflow.evaluate_selected_step()
+
+    assert assessment.status is GoalStageAssessmentStatus.VERIFIED
+    assert assessment.tool_call_ids == ("write-good",)
+    assert task.verified_step_ids == ("write",)
+    assert task.active_completion_claim is None
+
+
+def test_output_budget_without_tool_evidence_explains_blocked_stage(tmp_path):
+    provider = FixedProvider([LLMResponse(completion_tokens=4, finish_reason="length")])
+    runtime = _runtime(tmp_path, provider)
+    workflow = _planned(
+        runtime,
+        _step("write", {"kind": "file_contains", "path": "result.txt", "text": "expected"}),
+    )
+
+    workflow.run_step("write the file")
+    task, assessment = workflow.evaluate_selected_step()
+
+    assert assessment.status is GoalStageAssessmentStatus.BLOCKED
+    assert "provider output token budget ended" in assessment.detail
+    assert task.verified_step_ids == ()
+
+
 def test_failed_file_check_stays_blocked_until_explicit_same_stage_retry(tmp_path):
     provider = FixedProvider([
         _write_call("write-wrong", "wrong\n"), LLMResponse(content="I finished"),

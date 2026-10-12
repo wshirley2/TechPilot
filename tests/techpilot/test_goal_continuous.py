@@ -121,6 +121,15 @@ def test_explicit_run_finishes_two_verified_stages_and_records_stop(tmp_path):
     assert task.last_continuous_stop == {
         "reason": "completed", "turns": 2, "tokens": 0, "cost_usd": None,
     }
+    assert any(
+        "Execute the next action of confirmed Goal stage first now" in message.get("content", "")
+        and "Next action: Read first.txt" in message.get("content", "")
+        for message in provider.requests[0]["messages"]
+    )
+    assert any(
+        "Execute the next action of confirmed Goal stage second now" in message.get("content", "")
+        for request in provider.requests for message in request["messages"]
+    )
     assert "连续执行停止：completed" in output.getvalue()
 
 

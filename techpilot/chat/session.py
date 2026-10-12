@@ -787,7 +787,16 @@ class ChatSession:
                     self._goal_run_stop_reason = "attempt_limit"
                     self._show_goal_status()
                     return latest_response
-                next_input = user_input if index == 0 else f"Continue the current Goal stage {task.selected_step_id}."
+                if index == 0 and not continuous:
+                    next_input = user_input
+                else:
+                    stage = task.plan.step(task.selected_step_id)
+                    next_input = (
+                        f"Execute the next action of confirmed Goal stage {task.selected_step_id} now "
+                        f"using permitted Tools. Next action: {stage.next_action} "
+                        "Do not wait for confirmation of the already confirmed plan; "
+                        "stop only at a concrete permission, Goal-change, or recovery boundary."
+                    )
             result = workflow.run_step(next_input)
             latest_response = result.response
             task = result.task
@@ -832,7 +841,7 @@ class ChatSession:
                 self._goal_run_stop_reason = "completed" if completion == "completed" else "error"
                 return latest_response
             if task.plan is not None and len(task.verified_step_ids) < len(task.plan.steps):
-                next_input = "Continue with the next verified-ready Goal stage."
+                next_input = "Execute the next verified-ready stage of the confirmed Goal plan."
                 continue
             if not self._goal_turn_used_tools(result.checkpoint.session_event_cursor):
                 self._goal_run_stop_reason = "no_progress"

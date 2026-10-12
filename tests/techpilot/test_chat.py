@@ -127,6 +127,84 @@ def test_chat_goal_keeps_multiple_steps_in_one_durable_task_and_completes(tmp_pa
     assert {tool["function"]["name"] for tool in provider.requests[0]["tools"]}.isdisjoint({"bash", "write_file", "edit_file"})
 
 
+def test_goal_completion_rejects_invented_evidence_and_accepts_exact_retry(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[ToolCall("real-evidence", "glob", {"pattern": "**/*.py"})]),
+        LLMResponse(tool_calls=[ToolCall("invented-proposal", GOAL_COMPLETION_TOOL_NAME, {
+            "summary": "Sources inspected", "evidence_tool_call_ids": ["glob-sources"],
+        })]),
+        LLMResponse(tool_calls=[ToolCall("exact-proposal", GOAL_COMPLETION_TOOL_NAME, {
+            "summary": "Sources inspected", "evidence_tool_call_ids": ["real-evidence"],
+        })]),
+        LLMResponse(content="Evidence submitted"),
+    ])
+    runtime = make_runtime(
+        repository, provider, Console(file=StringIO(), force_terminal=False, color_system=None),
+        session_directory=tmp_path / "sessions",
+    )
+    workflow = LongTaskWorkflow(runtime, task_id="goal-exact-evidence", goal="Inspect project")
+    workflow.create_for_setup()
+    workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path="src/cli_data_tool/cli.py")
+    workflow.start()
+
+    workflow.run_step("Inspect the sources and propose completion")
+    task = workflow.store.replay(workflow.task_id)
+    assert task.active_completion_claim is not None
+    assert [item.tool_call_id for item in task.active_completion_claim.evidence] == ["real-evidence"]
+    session = runtime.session_store.replay(runtime.agent.session_id)
+    rejected = next(
+        event for event in session.events
+        if event.event_type == RuntimeEventType.TOOL_COMPLETED.value
+        and event.tool_call_id == "invented-proposal"
+    )
+    assert rejected.payload["tool_status"] == "error"
+    assert "available completed IDs: real-evidence" in rejected.payload["result"]
+    assert workflow.finish().status is LongTaskStatus.SUCCEEDED
+
+
+def test_goal_completion_rejects_prior_turn_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
+    repository = copy_benchmark(tmp_path / "repository")
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[ToolCall("old-evidence", "glob", {"pattern": "**/*.py"})]),
+        LLMResponse(content="First turn checkpointed"),
+        LLMResponse(tool_calls=[ToolCall("current-evidence", "glob", {"pattern": "**/*.py"})]),
+        LLMResponse(tool_calls=[ToolCall("stale-proposal", GOAL_COMPLETION_TOOL_NAME, {
+            "summary": "Sources inspected", "evidence_tool_call_ids": ["old-evidence"],
+        })]),
+        LLMResponse(tool_calls=[ToolCall("current-proposal", GOAL_COMPLETION_TOOL_NAME, {
+            "summary": "Sources inspected", "evidence_tool_call_ids": ["current-evidence"],
+        })]),
+        LLMResponse(content="Current evidence submitted"),
+    ])
+    runtime = make_runtime(
+        repository, provider, Console(file=StringIO(), force_terminal=False, color_system=None),
+        session_directory=tmp_path / "sessions",
+    )
+    workflow = LongTaskWorkflow(runtime, task_id="goal-current-turn-only", goal="Inspect project")
+    workflow.create_for_setup()
+    workflow.record_completion_criterion(CompletionCriterionKind.FILE_EXISTS, path="src/cli_data_tool/cli.py")
+    workflow.start()
+
+    workflow.run_step("Inspect the sources")
+    assert workflow.store.replay(workflow.task_id).active_completion_claim is None
+    workflow.run_step("Verify with fresh evidence and propose completion")
+    task = workflow.store.replay(workflow.task_id)
+    assert task.active_completion_claim is not None
+    assert [item.tool_call_id for item in task.active_completion_claim.evidence] == ["current-evidence"]
+    session = runtime.session_store.replay(runtime.agent.session_id)
+    rejected = next(
+        event for event in session.events
+        if event.event_type == RuntimeEventType.TOOL_COMPLETED.value
+        and event.tool_call_id == "stale-proposal"
+    )
+    assert rejected.payload["tool_status"] == "error"
+    assert "available completed IDs: current-evidence" in rejected.payload["result"]
+    assert workflow.finish().status is LongTaskStatus.SUCCEEDED
+
+
 def test_chat_goal_complete_requires_a_verified_completion_claim(tmp_path, monkeypatch):
     monkeypatch.setenv("TECHPILOT_LOAD_DOTENV", "0")
     output = StringIO()

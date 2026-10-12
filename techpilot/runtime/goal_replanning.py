@@ -72,13 +72,14 @@ class GoalReplanTool(Tool):
     description = (
         "After inspecting Goal facts, propose exactly one planning outcome: "
         "replace with a complete structured stage plan, keep the current plan, "
-        "or unavailable with a concrete missing fact. This never changes Goal facts or permissions."
+        "or unavailable with a concrete missing fact. Keep the summary within 500 characters. "
+        "This never changes Goal facts or permissions."
     )
     parameters = {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["replace", "keep", "unavailable"]},
-            "summary": {"type": "string", "minLength": 1},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 500},
             "plan": _PLAN,
         },
         "required": ["action", "summary", "plan"],

@@ -342,13 +342,16 @@ class LongTaskWorkflow:
                     f"- Expected evidence: {step.evidence}",
                     f"- Acceptance check: {step.check}",
                     f"- Next action: {step.next_action}",
+                    "- This stage belongs to an already confirmed Goal. When asked to continue, perform its next action now; do not ask to confirm the same plan again.",
+                    "- Tool permissions remain separate. If a specific action needs approval, follow that permission boundary; do not assume it was approved.",
                     "- Work only on this stage. A checkpoint or your own completion claim does not verify the stage.",
                 ))
         lines.extend((
             "",
             "## Completion proposal protocol",
             "- When the required outcome is ready, call submit_goal_completion exactly once after this Goal step has real completed Tool evidence.",
-            "- Supply a concise summary and the completed Tool Call IDs that prove it. Do not emit any special completion markup in your user-facing reply.",
+            "- Supply a concise summary and exact opaque Tool Call IDs from successful Tools in this Goal step; do not invent descriptive IDs or cite earlier turns. One relevant completed call can suffice for a file criterion.",
+            "- If the completion Tool rejects an ID, use the current-turn IDs in its error message and correct the proposal before ending the turn. Do not emit special completion markup in your user-facing reply.",
             "- This is only a proposal. Runtime verifies the referenced raw Session events and every acceptance check before completing the Goal.",
         ))
         return "\n".join(lines)
@@ -432,16 +435,25 @@ class LongTaskWorkflow:
                 f"check {step.check}"
                 for step in task.plan.steps
             ) if task.plan is not None else "none"
+            assessment = task.selected_step_assessment
+            assessment_facts = (
+                f"Selected stage assessment: {assessment.step_id} is {assessment.status.value}; "
+                f"Host detail: {assessment.detail}"
+                if assessment is not None else "Selected stage assessment: none"
+            )
             context = "\n".join((
                 self._goal_context(task),
                 "## Read-only Goal replanning",
                 f"Trigger: {trigger.event_type} ({trigger.event_id})",
                 f"Verified stages (must remain unchanged): {verified}",
                 f"Current plan: {prior}",
+                assessment_facts,
                 "Inspect repository facts if needed. Do not execute commands or change files.",
-                "Call propose_goal_replan exactly once. Use replace only when new evidence justifies a complete 2–7 stage plan.",
+                "Call propose_goal_replan exactly once with a summary of at most 500 characters. Use replace only when new evidence justifies a complete 2–7 stage plan.",
+                "If keep fits, submit that decision briefly. The Host will continue the already confirmed plan; do not request another confirmation for an unchanged plan.",
                 "Keep verified stages unchanged. Keep the active stage unchanged unless its check is blocked;",
                 "a blocked stage may be revised but must retain its ID and verified dependencies.",
+                "If the selected stage is blocked, keep leaves it blocked. Revise that stage with a concrete safe next action only when the recorded evidence supports another attempt; never retry an unresolved effect.",
                 "Use keep if the current plan still fits; use unavailable with the specific missing fact if no sound plan can be formed.",
                 "A proposal cannot change final acceptance criteria, hard constraints, or Tool permissions.",
             ))
@@ -563,6 +575,8 @@ class LongTaskWorkflow:
             event for event in completed_events
             if isinstance(getattr(event, "payload", None), dict)
             and event.payload.get("tool_name") == GOAL_COMPLETION_TOOL_NAME
+            and display_tool_status(str(event.payload.get("result", "")), event.payload.get("tool_status")) == ToolStatus.COMPLETED.value
+            and event.payload.get("interrupted") is not True
         ]
         if len(proposal_events) != 1 or not completed_events or completed_events[-1] is not proposal_events[0]:
             return
@@ -600,6 +614,32 @@ class LongTaskWorkflow:
     def _submit_completion_proposal(self, proposal: GoalCompletionProposal) -> None:
         if self._completion_proposal is not None:
             raise ValueError("only one completion proposal is allowed per Goal step")
+        session = self.runtime.session_store.replay(self.runtime.agent.session_id)
+        current_request = next((
+            event for event in reversed(session.events)
+            if event.event_type == RuntimeEventType.TOOL_REQUESTED.value
+            and event.payload.get("tool_name") == GOAL_COMPLETION_TOOL_NAME
+        ), None)
+        if current_request is None or current_request.turn_id is None:
+            raise ValueError("current Goal step has no durable completion Tool request")
+        available = {
+            event.tool_call_id for event in session.events
+            if event.turn_id == current_request.turn_id
+            and event.event_type == RuntimeEventType.TOOL_COMPLETED.value
+            and event.tool_call_id
+            and event.payload.get("tool_name") != GOAL_COMPLETION_TOOL_NAME
+            and event.payload.get("interrupted") is not True
+            and display_tool_status(str(event.payload.get("result", "")), event.payload.get("tool_status")) == ToolStatus.COMPLETED.value
+        }
+        if not available:
+            raise ValueError("no successful Tool Call evidence exists in this Goal step; run a relevant Tool first")
+        unknown = sorted(set(proposal.evidence_tool_call_ids) - available)
+        if unknown:
+            choices = ", ".join(sorted(available)[:12])
+            raise ValueError(
+                f"unknown current-step Tool Call IDs: {', '.join(unknown[:12])}; "
+                f"available completed IDs: {choices}"
+            )
         self._completion_proposal = proposal
 
     def _verify_completion_criteria(

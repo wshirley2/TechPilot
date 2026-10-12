@@ -30,7 +30,9 @@ class GoalCompletionTool(Tool):
     name = GOAL_COMPLETION_TOOL_NAME
     description = (
         "Propose that the current Goal is ready for Runtime verification. "
-        "Reference completed Tool Call IDs from this Goal step. The proposal alone does not complete the Goal."
+        "Use exact opaque Tool Call IDs from successful Tools in this Goal step, not file names "
+        "or descriptive labels. One relevant completed Tool Call can be enough. "
+        "The proposal alone does not complete the Goal."
     )
     parameters = {
         "type": "object",
@@ -39,7 +41,7 @@ class GoalCompletionTool(Tool):
             "evidence_tool_call_ids": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Completed Tool Call IDs from this Goal step.",
+                "description": "Exact IDs of successful Tool Calls in this Goal step; never invent labels or cite earlier turns.",
             },
         },
         "required": ["summary", "evidence_tool_call_ids"],
