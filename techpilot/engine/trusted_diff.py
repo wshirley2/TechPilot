@@ -42,7 +42,15 @@ class FileWriteProposal:
         exists, content, snapshot = _read_source(path)
         if not exists:
             raise TrustedDiffError(f"{display_path} not found")
-        occurrences = content.count(old_string)
+        matched_old = old_string
+        matched_new = new_string
+        occurrences = content.count(matched_old)
+        if occurrences == 0 and _can_match_crlf_view(content, old_string, new_string):
+            # read_file displays lines joined with LF even when the source is CRLF.
+            # Match that view only for a uniform CRLF file, then preserve its style.
+            matched_old = old_string.replace("\n", "\r\n")
+            matched_new = new_string.replace("\n", "\r\n")
+            occurrences = content.count(matched_old)
         if occurrences == 0:
             raise TrustedDiffError(f"old_string not found in {display_path}")
         if occurrences > 1:
@@ -50,7 +58,7 @@ class FileWriteProposal:
                 f"old_string appears {occurrences} times in {display_path}; "
                 "include more surrounding context"
             )
-        candidate = content.replace(old_string, new_string, 1)
+        candidate = content.replace(matched_old, matched_new, 1)
         return cls._build(path, display_path, True, content, candidate, snapshot)
 
     @classmethod
@@ -126,6 +134,18 @@ def _read_source(path: Path) -> tuple[bool, str, str]:
     except UnicodeDecodeError as error:
         raise TrustedDiffError(f"{path} is not a UTF-8 text file") from error
     return True, content, _content_snapshot(data)
+
+
+def _can_match_crlf_view(content: str, old_string: str, new_string: str) -> bool:
+    remaining = content.replace("\r\n", "")
+    return (
+        "\r\n" in content
+        and "\n" in old_string
+        and "\r" not in old_string
+        and "\r" not in new_string
+        and "\r" not in remaining
+        and "\n" not in remaining
+    )
 
 
 def _source_snapshot(path: Path) -> str:

@@ -196,6 +196,50 @@ def test_trusted_diff_is_built_from_real_content_before_allowing_edit(tmp_path):
     assert len(prompt.requests) == 1
 
 
+def test_multiline_edit_matches_read_file_view_of_uniform_crlf_source(tmp_path):
+    target = tmp_path / "README.md"
+    target.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+
+    def assert_pre_write(request, call_number):
+        assert call_number == 1
+        assert target.read_bytes() == b"alpha\r\nbeta\r\ngamma\r\n"
+        assert "-beta" in request.trusted_preview
+        assert "+updated" in request.trusted_preview
+
+    prompt = RecordingPrompt(PermissionDecision.allow("approved"), on_decide=assert_pre_write)
+    executor = RepositoryToolExecutor(
+        tmp_path, PermissionManager(ChatPermissionPolicy(), prompt),
+    )
+
+    result = executor.execute(
+        EditFileTool(),
+        {"file_path": "README.md", "old_string": "alpha\nbeta\n", "new_string": "alpha\nupdated\n"},
+    )
+
+    assert result.startswith("Edited README.md")
+    assert target.read_bytes() == b"alpha\r\nupdated\r\ngamma\r\n"
+    assert len(prompt.requests) == 1
+
+
+def test_multiline_edit_does_not_infer_newlines_for_mixed_source(tmp_path):
+    target = tmp_path / "README.md"
+    original = b"alpha\r\nbeta\ngamma\r\n"
+    target.write_bytes(original)
+    prompt = RecordingPrompt(PermissionDecision.allow("approved"))
+    executor = RepositoryToolExecutor(
+        tmp_path, PermissionManager(ChatPermissionPolicy(), prompt),
+    )
+
+    result = executor.execute(
+        EditFileTool(),
+        {"file_path": "README.md", "old_string": "alpha\nbeta\n", "new_string": "alpha\nupdated\n"},
+    )
+
+    assert "old_string not found" in result
+    assert target.read_bytes() == original
+    assert not prompt.requests
+
+
 def test_snapshot_change_regenerates_diff_and_requires_new_approval(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("VALUE = old\nMARKER = base\n", encoding="utf-8")
