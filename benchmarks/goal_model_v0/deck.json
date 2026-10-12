@@ -1,0 +1,92 @@
+{
+  "suite": "goal-model-pilot-v0",
+  "schema_version": 1,
+  "fixture": {
+    "directory": "benchmarks/cli_data_tool",
+    "files": [
+      "pyproject.toml",
+      "README.md",
+      "TASK.md",
+      "src/cli_data_tool/__init__.py",
+      "src/cli_data_tool/cli.py",
+      "src/cli_data_tool/exporter.py",
+      "tests/test_export.py",
+      "tests/test_exporter.py"
+    ]
+  },
+  "plan": {
+    "reason": "Separate investigation evidence from implementation and external acceptance.",
+    "steps": [
+      {
+        "id": "inspect",
+        "goal": "Inspect the existing export path and record the current behavior and affected files.",
+        "dependencies": [],
+        "expected_output": "analysis.md explains the present text behavior, the CLI parser, and the proposed change.",
+        "work_scope": ["analysis.md", "src/cli_data_tool/cli.py", "src/cli_data_tool/exporter.py"],
+        "evidence": "A completed read and a saved analysis.md containing a concrete behavior summary.",
+        "check": {"kind": "file_contains", "path": "analysis.md", "text": "Current export behavior"},
+        "next_action": "Read the exporter and CLI, then write analysis.md with a Current export behavior section."
+      },
+      {
+        "id": "implement",
+        "goal": "Implement text/json format selection and document JSON usage without changing the default text behavior.",
+        "dependencies": ["inspect"],
+        "expected_output": "The CLI accepts --format text and --format json, and README shows JSON usage.",
+        "work_scope": ["src/cli_data_tool/cli.py", "src/cli_data_tool/exporter.py", "README.md"],
+        "evidence": "Completed edits plus an independently checked CLI result; the stage check only proves the flag was added.",
+        "check": {"kind": "file_contains", "path": "src/cli_data_tool/cli.py", "text": "--format"},
+        "next_action": "Change the exporter, CLI and README; preserve the default text output and reject unsupported formats."
+      }
+    ]
+  },
+  "completion_criteria": [
+    {"kind": "file_contains", "path": "README.md", "expected_text": "python -m cli_data_tool.cli export --format json"}
+  ],
+  "allowed_paths": [
+    "analysis.md",
+    "README.md",
+    "src/cli_data_tool/cli.py",
+    "src/cli_data_tool/exporter.py"
+  ],
+  "external_acceptance": {
+    "default_text_stdout": "alpha\nbeta\ngamma\n",
+    "explicit_text_stdout": "one\ntwo\n",
+    "json_items": ["one", "two"],
+    "invalid_format": "yaml",
+    "unicode_item": "咖啡",
+    "readme_example": "python -m cli_data_tool.cli export --format json",
+    "unchanged_paths": ["pyproject.toml", "tests/test_export.py", "tests/test_exporter.py"]
+  },
+  "turn_limits": {
+    "max_provider_calls": 8,
+    "max_tool_rounds": 8,
+    "max_turn_seconds": 180
+  },
+  "protocol_limits": {
+    "max_continuous_batches": 2,
+    "max_work_turns": 8
+  },
+  "cases": [
+    {
+      "id": "normal-json-export",
+      "kind": "normal",
+      "goal": "Add --format text/json to the export CLI. Keep default text output unchanged, emit JSON with items and count, reject unsupported formats, and document the JSON example.",
+      "intervention": null
+    },
+    {
+      "id": "restart-json-export",
+      "kind": "restart_after_stage",
+      "goal": "Add --format text/json to the export CLI. Keep default text output unchanged, emit JSON with items and count, reject unsupported formats, and document the JSON example.",
+      "intervention": {"after_stage": "inspect"}
+    },
+    {
+      "id": "constraint-json-export",
+      "kind": "constraint_after_stage",
+      "goal": "Add --format text/json to the export CLI. Keep default text output unchanged, emit JSON with items and count, reject unsupported formats, and document the JSON example.",
+      "intervention": {
+        "after_stage": "inspect",
+        "constraint": "Do not add third-party dependencies. JSON output must preserve non-ASCII characters directly (ensure_ascii=False)."
+      }
+    }
+  ]
+}
