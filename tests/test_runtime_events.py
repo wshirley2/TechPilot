@@ -87,6 +87,21 @@ def test_text_response_emits_one_stable_turn_sequence_and_keeps_on_token():
     assert tokens == ["done"]
 
 
+@pytest.mark.parametrize("finish_reason,use_config_fallback", [("length", False), (None, True)])
+def test_empty_exhausted_output_is_a_limit_not_a_completed_turn(finish_reason, use_config_fallback):
+    events, sink = collect_events()
+    llm = FakeLLM([LLMResponse(completion_tokens=4, finish_reason=finish_reason)])
+    if use_config_fallback:
+        llm.extra = {"max_tokens": 4}
+    agent = Agent(llm=llm, tools=[], event_sink=sink)
+
+    assert agent.chat("continue") == "(runtime limit reached: output_tokens)"
+    assert events[-1].event_type is RuntimeEventType.TURN_LIMIT_REACHED
+    assert events[-1].payload["limit"] == "output_tokens"
+    assert events[-1].payload["pending_tool_call_ids"] == []
+    assert RuntimeEventType.TURN_COMPLETED not in event_types(events)
+
+
 def test_single_tool_events_keep_provider_tool_call_id_and_old_on_tool_callback():
     events, sink = collect_events()
     tool_callbacks = []

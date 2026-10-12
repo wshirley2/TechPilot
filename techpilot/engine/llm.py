@@ -29,11 +29,12 @@ class LLMResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    finish_reason: str | None = None
 
     @property
     def message(self) -> dict:
         """Convert to OpenAI message format for appending to history."""
-        msg: dict = {"role": "assistant", "content": self.content or None}
+        msg: dict = {"role": "assistant", "content": self.content}
         if self.tool_calls:
             msg["tool_calls"] = [
                 {
@@ -140,6 +141,7 @@ class LLM:
         tc_map: dict[int, dict] = {}  # index -> {id, name, arguments_str}
         prompt_tok = 0
         completion_tok = 0
+        finish_reason = None
 
         for chunk in stream:
             # usage info comes in the final chunk
@@ -151,7 +153,10 @@ class LLM:
 
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+            delta = choice.delta
 
             # accumulate text
             if delta.content:
@@ -191,6 +196,7 @@ class LLM:
             tool_calls=parsed,
             prompt_tokens=prompt_tok,
             completion_tokens=completion_tok,
+            finish_reason=finish_reason,
         )
 
     def _call_with_retry(self, params: dict, max_retries: int = 3):
@@ -265,6 +271,7 @@ class LiteLLM(LLM):
         tc_map: dict[int, dict] = {}
         prompt_tok = 0
         completion_tok = 0
+        finish_reason = None
 
         for chunk in stream:
             usage = getattr(chunk, "usage", None)
@@ -274,7 +281,10 @@ class LiteLLM(LLM):
 
             if not getattr(chunk, "choices", None):
                 continue
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+            delta = choice.delta
 
             if getattr(delta, "content", None):
                 content_parts.append(delta.content)
@@ -311,6 +321,7 @@ class LiteLLM(LLM):
             tool_calls=parsed,
             prompt_tokens=prompt_tok,
             completion_tokens=completion_tok,
+            finish_reason=finish_reason,
         )
 
     def _call_with_retry(self, params: dict, max_retries: int = 3):

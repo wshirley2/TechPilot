@@ -20,8 +20,9 @@ class _Delta:
 
 
 class _Choice:
-    def __init__(self, delta):
+    def __init__(self, delta, finish_reason=None):
         self.delta = delta
+        self.finish_reason = finish_reason
 
 
 class _Usage:
@@ -31,8 +32,10 @@ class _Usage:
 
 
 class _Chunk:
-    def __init__(self, content=None, usage=None, tool_calls=None):
-        self.choices = [_Choice(_Delta(content=content, tool_calls=tool_calls))] if content or tool_calls else []
+    def __init__(self, content=None, usage=None, tool_calls=None, finish_reason=None):
+        self.choices = [
+            _Choice(_Delta(content=content, tool_calls=tool_calls), finish_reason)
+        ] if content or tool_calls or finish_reason else []
         self.usage = usage
 
 
@@ -165,6 +168,16 @@ class TestChat:
         result = llm.chat(messages=[{"role": "user", "content": "hi"}])
         assert isinstance(result, LLMResponse)
         assert result.content == "part1part2"
+
+    def test_preserves_stream_finish_reason(self):
+        stream = lambda: iter([_Chunk(finish_reason="length"), _Chunk(usage=_Usage(completion=4096))])
+        self.fake.completion.return_value = stream()
+        lite = LiteLLM(model="openai/gpt-4o", max_tokens=4096)
+        assert lite.chat(messages=[{"role": "user", "content": "hi"}]).finish_reason == "length"
+
+        direct = LLM(model="gpt-4o", api_key="test", max_tokens=4096)
+        direct._call_with_retry = lambda _params: stream()
+        assert direct.chat(messages=[{"role": "user", "content": "hi"}]).finish_reason == "length"
 
     def test_tracks_token_usage(self):
         llm = LiteLLM(model="openai/gpt-4o")

@@ -259,6 +259,22 @@ class Agent:
                 turn_completion_tokens += resp.completion_tokens
                 # no tool calls -> LLM is done, return text
                 if not resp.tool_calls:
+                    configured_output = getattr(self.llm, "extra", None)
+                    configured_output = (
+                        configured_output.get("max_tokens")
+                        if isinstance(configured_output, dict) else None
+                    )
+                    if not resp.content and (
+                        resp.finish_reason == "length"
+                        or (
+                            type(configured_output) is int
+                            and resp.completion_tokens >= configured_output
+                        )
+                    ):
+                        raise RuntimeLimitExceeded(
+                            "output_tokens", resp.completion_tokens,
+                            configured_output if type(configured_output) is int else resp.completion_tokens,
+                        )
                     self._check_runtime_controls(
                         token,
                         started_at,
